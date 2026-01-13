@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ipi-chamber-ctl"
+version = "0.1.0"
+description = "IPI EUVL chamber control system"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "ipi-ecs>=0.1.0",
+  "prompt_toolkit>=3.0",
+]
+
+license = { text = "MIT" }
+authors = [
+  { name = "Illinois Plasma Institute" },
+  { name = "Alp Doganer", email = "doganer2@illinois.edu" },
+]
+maintainers = [
+  { name = "Alp Doganer", email = "doganer2@illinois.edu" },
+]
+
+#[project.scripts]
+#ipi-ecs = "ipi_ecs.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+  "mypy>=1.10",
+]
+
+[tool.pylint.MAIN]
+init-hook = """
+try: import pylint_venv
+except ImportError: pass
+else: pylint_venv.inithook()
+"""
