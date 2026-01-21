@@ -25,6 +25,9 @@ maintainers = [
 #[project.scripts]
 #ipi-ecs = "ipi_ecs.cli.main:main"
 
+[project.scripts]
+chamber-lifecycle-manager = "chamber_ctl.services.lifecycle_manager_service:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
@@ -37,10 +40,3 @@ dev = [
   "ruff>=0.6",
   "mypy>=1.10",
 ]
-
-[tool.pylint.MAIN]
-init-hook = """
-try: import pylint_venv
-except ImportError: pass
-else: pylint_venv.inithook()
-"""
