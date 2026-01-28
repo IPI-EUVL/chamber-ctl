@@ -60,17 +60,17 @@ class TargetMotionProfile:
     def time_at_posion(self, l_pos: float, r_pos: float, segment_num: int):
         (start_l, start_r) = (self.__segments[segment_num - 1].lin_target, self.__segments[segment_num - 1].rot_target) if segment_num > 0 else (0.0, 0.0)
 
-        print("Current positions:", l_pos, r_pos)
-        print("Start positions:", start_l, start_r)
+        #print("Current positions:", l_pos, r_pos)
+        #print("Start positions:", start_l, start_r)
 
         end_l, end_r = self.__segments[segment_num].lin_target, self.__segments[segment_num].rot_target
 
-        print("End positions:", end_l, end_r)
+        #print("End positions:", end_l, end_r)
 
         len_l = abs((end_l - start_l) / self.__segments[segment_num].lin_velocity if self.__segments[segment_num].lin_velocity != 0 else 0.0)
         len_r = abs((end_r - start_r) / self.__segments[segment_num].rot_velocity if self.__segments[segment_num].rot_velocity != 0 else 0.0)
 
-        print("Segment lengths:", len_l, len_r)
+        #print("Segment lengths:", len_l, len_r)
 
         len_t = max(len_l, len_r)        
 
@@ -78,7 +78,7 @@ class TargetMotionProfile:
 
         frac_r = (r_pos - start_r) / (end_r - start_r) if end_r != start_r else 1.0
         
-        print("Fractions:", frac_l, frac_r)
+        #print("Fractions:", frac_l, frac_r)
 
         frac_t = min(frac_l, frac_r)
 
@@ -112,6 +112,9 @@ class TargetMotionProfile:
             len_r = abs((segment.rot_target - c_r) / segment.rot_velocity if segment.rot_velocity != 0 else 0.0)
 
             len_t = max(len_l, len_r)
+
+            #print("Checking segment:", segment.lin_target, segment.rot_target, "length time:", len_t, "current time:", c_t, "target time:", t)
+            #print("Current positions:", c_l, c_r)
 
             if c_t + len_t > t:
                 dt = t - c_t
@@ -259,7 +262,7 @@ class MotionState:
         return self.__current_segment
     
     def get_current_motion_command(self):
-        print("Current segment:", self.__current_segment)
+        #print("Current segment:", self.__current_segment)
         seg = self.__profile.get_segment(self.__current_segment)
 
         return seg.lin_target + self.__current_rep * self.__profile.get_end_position()[0], seg.rot_target + self.__current_rep * self.__profile.get_end_position()[1], seg.lin_velocity, seg.rot_velocity
@@ -268,18 +271,17 @@ class MotionState:
         return self.get_position_at_time(self.__current_position + self.__profile.get_length() * self.__current_rep)
     
     def get_position_at_time(self, time: float):
-        print("Current segment:", self.__current_segment)
-        print("Current time:", time)
+        #print("Current segment:", self.__current_segment)
+        #print("Current time:", time)
 
         reps = int(time // self.__profile.get_length())
         l_pos, r_pos = self.__profile.get_position_at_time(time % self.__profile.get_length())
 
-        print("Current repetition:", reps)
+        #print("Current repetition:", reps)
 
         l, r = l_pos + reps * self.__profile.get_end_position()[0], r_pos + reps * self.__profile.get_end_position()[1]
 
-        print("Calculated position:", l, r)
-
+        #print("Calculated position:", l, r)
         return l, r
 
     def update_position(self, l_pos: float, r_pos: float):
@@ -287,9 +289,9 @@ class MotionState:
 
         off_l, off_r = l_pos - self.__current_rep * self.__profile.get_end_position()[0], r_pos - self.__current_rep * self.__profile.get_end_position()[1]
         segment_time = self.__profile.time_at_posion(off_l, off_r, self.__current_segment)
-        print("Segment time:", segment_time, "positions:", l_pos, r_pos, "current segment:", self.__current_segment)
-        print("Offset positions:", off_l, off_r)
-        print("Current position before update:", self.__current_position)
+        #print("Segment time:", segment_time, "positions:", l_pos, r_pos, "current segment:", self.__current_segment)
+        #print("Offset positions:", off_l, off_r)
+        #print("Current position before update:", self.__current_position)
 
         if segment_time < p_len - 1e-3:
             self.__current_position = segment_time

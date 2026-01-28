@@ -216,7 +216,7 @@ class TargetMotionController:
         l_pos, r_pos = self.__motion.get_position()
         self.__state.update_position(l_pos - self.__start_l, r_pos - self.__start_r)
 
-        print(f"Motion Profile @ time={self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment()} pos=({l_pos:.3f}, {r_pos:.3f})")
+        #print(f"Motion Profile @ time={self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment()} pos=({l_pos:.3f}, {r_pos:.3f})")
 
         if self.__state.get_current_repetition() > self.__state.get_max_repetitions():
             self.__is_running = False
@@ -721,6 +721,7 @@ def main(stop_event: "multiprocessing.Event"):
     try:
         while m_target_controller.ok() and not (stop_event is not None and stop_event.is_set()):
             time.sleep(1)
+
         print("Target Controller stopping...")
     except KeyboardInterrupt:
         pass
