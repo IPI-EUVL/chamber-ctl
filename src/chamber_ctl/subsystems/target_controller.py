@@ -573,8 +573,8 @@ class TargetController:
 
         self.__motion_controller.continue_move()
 
-        self.__start_handle.feedback(OP_OK + b": going to path position and starting target motion.")
         self.__start_handle = handle
+        self.__start_handle.feedback(OP_OK + b": going to path position and starting target motion.")
 
     def __on_set_start_position(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
         print("Set start position event called by:", s_uuid, param)
