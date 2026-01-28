@@ -15,6 +15,7 @@ import ipi_ecs.dds.client as client
 import ipi_ecs.dds.magics as magics
 import ipi_ecs.dds.subsystem as subsystem
 import ipi_ecs.dds.types as types
+from ipi_ecs.cli.captive_cli import CaptiveCLITemplate, wait_for, wait_for_event
 from ipi_ecs.logging.client import LogClient
 from ipi_ecs.cli.commands.keyboard_jog import (
     JogWriteClient,
@@ -141,71 +142,13 @@ class TargetClient:
 
         self.__run = False
 
-def wait_for(awaiter: mt_events.Awaiter, timeout: float = 10.0):
-    done = False
-    r_state, r_reason, r_value = None, None, None
-
-    def on_done(state=None, reason=None, value=None):
-        nonlocal done, r_state, r_reason, r_value
-        r_reason = reason
-        r_state = state
-        r_value = value
-        
-        done = True
-
-    begin = time.monotonic()
-    awaiter.then(lambda h: on_done(value=h)).catch(on_done)
-
-    while not done and (time.monotonic() - begin) < timeout:
-        time.sleep(0.1)
-
-    if done:
-        return r_value, r_state, r_reason
-    
-    raise TimeoutError("Awaiter did not complete in time.")
-
-def wait_for_event(awaiter: mt_events.Awaiter, timeout: float = 10.0):
-    done = False
-    r_state, r_reason, r_value = None, None, None
-
-    def on_done(state=None, reason=None, value=None):
-        nonlocal done, r_state, r_reason, r_value
-        r_reason = reason
-        r_state = state
-        r_value = value
-        
-        done = True
-
-    begin = time.monotonic()
-    awaiter.then(lambda h: on_done(value=h)).catch(on_done)
-
-    while not done and (time.monotonic() - begin) < timeout:
-        time.sleep(0.1)
-
-    if done:
-        if r_value is not None:
-            r_state = r_value.get_state(UUID_TARGET_CONTROLLER)
-            if not r_value.get_result(UUID_TARGET_CONTROLLER).startswith(magics.OP_OK):
-                r_reason = r_value.get_result(UUID_TARGET_CONTROLLER)
-            
-            r_value = r_value.get_result(UUID_TARGET_CONTROLLER)
-        
-        return r_value, r_state, r_reason
-    
-    raise TimeoutError("Awaiter did not complete in time.")
-
-class TargetClientCLI:
+class TargetClientCLI(CaptiveCLITemplate):
     def __init__(self, t_client: TargetClient):
         self.__t_client = t_client
+        super().__init__("TargetClient", "Target Controller Client CLI")
 
-        p = argparse.ArgumentParser(description="Target controller CLI interface.")
+    def _build_parser(self, sub: argparse._SubParsersAction, p: argparse.ArgumentParser):
         p.add_argument("--timeout", type=float, default=10.0, help="Timeout for commands in seconds.")
-
-        sub = p.add_subparsers(dest="cmd", required=True)
-
-        pl = sub.add_parser("help", help="Print this help message.")
-        pl.set_defaults(fn=lambda args: p.print_help())
-
         pl = sub.add_parser("home", help="Home the target controller.")
         pl.set_defaults(fn=self.__home)
 
@@ -238,22 +181,20 @@ class TargetClientCLI:
         ps = sub.add_parser("get_state", help="Get the current state of the target controller.")
         ps.set_defaults(fn=self.__get_state)
 
-        self.__parser = p
-
     def __home(self, args: argparse.Namespace):
         print("Homing target...")
         awaiter = self.__t_client.home()
 
-        r_value, r_state, r_reason = wait_for_event(awaiter, args.timeout)
+        r_value, r_state, r_reason = wait_for_event(awaiter, UUID_TARGET_CONTROLLER, args.timeout)
 
-        if not r_value.startswith(magics.OP_OK):
+        if r_value is None or not r_value.startswith(magics.OP_OK):
             print(f"Failed to home target: {r_reason}")
 
     def __set_start_position(self, args: argparse.Namespace):
         print("Set start position to here...")
         awaiter = self.__t_client.set_start_position()
 
-        r_value, r_state, r_reason = wait_for_event(awaiter, args.timeout)
+        r_value, r_state, r_reason = wait_for_event(awaiter, UUID_TARGET_CONTROLLER, args.timeout)
 
         if not r_value.startswith(magics.OP_OK):
             print(f"Failed to set target start position: {r_reason}")
@@ -261,7 +202,7 @@ class TargetClientCLI:
     def __start_motion(self, args: argparse.Namespace):
         print("Starting motion...")
         awaiter = self.__t_client.start_motion()
-        r_value, r_state, r_reason = wait_for_event(awaiter, args.timeout)
+        r_value, r_state, r_reason = wait_for_event(awaiter, UUID_TARGET_CONTROLLER, args.timeout)
 
         if not r_value.startswith(magics.OP_OK):
             print(f"Failed to start motion: {r_reason}")
@@ -269,7 +210,7 @@ class TargetClientCLI:
     def __stop_motion(self, args: argparse.Namespace):
         print("Stopping motion...")
         awaiter = self.__t_client.stop_motion()
-        r_value, r_state, r_reason = wait_for_event(awaiter, args.timeout)
+        r_value, r_state, r_reason = wait_for_event(awaiter, UUID_TARGET_CONTROLLER, args.timeout)
 
         if not r_value.startswith(magics.OP_OK):
             print(f"Failed to stop motion: {r_reason}")
@@ -281,7 +222,7 @@ class TargetClientCLI:
         position = args.position
         print(f"Setting current position to {position}...")
         awaiter = self.__t_client.set_current_position(position)
-        r_value, r_state, r_reason = wait_for_event(awaiter, args.timeout)
+        r_value, r_state, r_reason = wait_for_event(awaiter, UUID_TARGET_CONTROLLER, args.timeout)
 
         print(f"Set current position result: {r_value}, {r_reason}, {r_state}")
 
@@ -307,13 +248,18 @@ class TargetClientCLI:
         print(f"Current State: {state}, Motion State: {motion_state}")
 
     def __make_profile(self, _: argparse.Namespace):
-        def __read_seg():
-            cmd = input("Enter segment (lin_target rot_target lin_velocity rot_velocity) or 'cancel': ")
-            if cmd.strip().lower() == "cancel":
-                return None
-            parts = cmd.strip().split()
+        def __read_seg(spl_segs: Iterable[str] = None) -> MotionSegment:
+            if spl_segs is not None:
+                parts = spl_segs
+            else:
+                cmd = input("Enter segment (lin_target rot_target lin_velocity rot_velocity) or 'cancel': ")
+                if cmd.strip().lower() == "cancel":
+                    return None
+                parts = cmd.strip().split()
+            
             if len(parts) != 4:
                 print("Invalid segment format. Please enter four values.")
+                print("Enter segment (lin_target rot_target lin_velocity rot_velocity) or 'cancel'. ")
                 return None
             try:
                 lin_target = float(parts[0])
@@ -324,6 +270,7 @@ class TargetClientCLI:
                 return segment
             except ValueError:
                 print("Invalid number format. Please enter valid floats.")
+                print("Enter segment (lin_target rot_target lin_velocity rot_velocity) or 'cancel'. ")
                 return None
             
         profile = self.__t_client.get_profile()
@@ -333,102 +280,86 @@ class TargetClientCLI:
 
         segments = profile.get_segments()
         
-        with contextlib.redirect_stdout(self.__stdout):
-            print("Editing motion profile.")
-            while True:
-                print("Current profile:")
-                self.__print_profile(profile)
-                cmd = input("Choose 'add', 'remove', 'insert', 'done', or 'cancel': ")
+        print("Editing motion profile.")
+        while True:
+            print("Current profile:")
+            self.__print_profile(profile)
+            cmd = input("Choose 'add', 'remove', 'insert', 'done', or 'cancel': ")
+
+            cmd_s = cmd.strip().lower().split()
+            
+            if cmd_s[0] == "done":
+                print("Finished editing profile.")
+                break
                 
-                if cmd.strip().lower() == "done":
-                    break
-                    
-                if cmd.strip().lower() == "cancel":
-                    return
+            if cmd_s[0] == "cancel":
+                print("Cancelling profile edit.")
+                return
+            
+            if cmd_s[0] == "add":
+                segment = __read_seg(cmd_s[1:] if len(cmd_s) > 1 else None)
 
-                if cmd.strip().lower() == "add":
-                    segment = __read_seg()
-                    if segment is not None:
-                        print("Adding segment...")
-                        segments.append(segment)
+                if segment is not None:
+                    print("Adding segment...")
+                    segments.append(segment)
 
-                elif cmd.strip().lower() == "remove":
+            elif cmd_s[0] == "remove":
+                if len(cmd_s) < 2:
                     index_str = input("Enter index of segment to remove: ")
-                    try:
-                        index = int(index_str)
-                        if 0 <= index < len(segments):
-                            print("Removing segment...")
-                            segments.pop(index)
-                        else:
-                            print("Index out of range.")
-                    except ValueError:
-                        print("Invalid index format.")
-                elif cmd.strip().lower() == "insert":
-                    index_str = input("Enter index to insert segment at: ")
-                    try:
-                        index = int(index_str)
-                        if 0 <= index <= len(segments):
-                            segment = __read_seg()
-                            if segment is not None:
-                                print("Inserting segment...")
-                                segments.insert(index, segment)
-                        else:
-                            print("Index out of range.")
-                    except ValueError:
-                        print("Invalid index format.")
-
-
-                profile.set_segments(segments)
-
-            awaiter = self.__t_client.set_profile(profile)
-            v, s, r = wait_for(awaiter, 10.0)
-
-            if v == magics.OP_OK:
-                print("Profile set successfully.")
-            else:
-                print(f"Failed to set profile: {r}")
-
-    def parse_and_execute(self, argstr: Iterable[str]) -> str:
-        captured_output = io.StringIO()
-        captured_output_stderr = io.StringIO()
-
-        self.__stdout = sys.stdout
-        self.__stderr = sys.stderr
-
-        self.__out_stdout = captured_output
-        self.__out_stderr = captured_output_stderr
-
-        with contextlib.redirect_stdout(captured_output):
-            with contextlib.redirect_stderr(captured_output_stderr):
+                else:
+                    index_str = cmd_s[1]
+                
                 try:
-                    m_args = self.__parser.parse_args(argstr)
-                    m_args.fn(m_args)
-                except SystemExit as e:
-                    print(f"Argument parsing failed: {e}")
-                except Exception as e:
-                    print(f"Error executing command: {e}")
-                    raise
+                    index = int(index_str)
+                    if 0 <= index < len(segments):
+                        print("Removing segment...")
+                        segments.pop(index)
+                    else:
+                        print("Index out of range.")
+                except ValueError:
+                    print("Invalid index format.")
+            elif cmd_s[0] == "insert":
+                if len(cmd_s) < 2:
+                    index_str = input("Enter index of segment to insert at: ")
+                else:
+                    index_str = cmd_s[1]
 
-        return captured_output.getvalue() + captured_output_stderr.getvalue()
+                try:
+                    index = int(index_str)
+                    if 0 <= index <= len(segments):
+                        segment = __read_seg()
+                        if segment is not None:
+                            print("Inserting segment...")
+                            segments.insert(index, segment)
+                    else:
+                        print("Index out of range.")
+                except ValueError:
+                    print("Invalid index format.")
+
+
+            profile.set_segments(segments)
+
+        awaiter = self.__t_client.set_profile(profile)
+        v, s, r = wait_for(awaiter, 10.0)
+
+        if v == magics.OP_OK:
+            print("Profile set successfully.")
+        else:
+            print(f"Failed to set profile: {r}")
 
 def main(args: argparse.Namespace):
     m_client = TargetClient()
     m_cli = TargetClientCLI(m_client)
 
     try:
-        while m_client.ok():
-            commands = input("TargetClient> ")
-            if commands.strip().lower() in ("exit", "quit"):
-                print("Exiting...")
-                break
-            output = m_cli.parse_and_execute(commands.strip().split())
-            if output.strip() != "":
-                print("TargetClient> ", output, end="", sep="")
+        while m_client.ok() and m_cli.ok():
+            time.sleep(0.1)
 
     except KeyboardInterrupt:
         pass
     finally:
         print("Exiting...")
+        m_cli.close()
         m_client.close()
 
     return 0
