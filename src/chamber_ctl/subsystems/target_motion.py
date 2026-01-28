@@ -118,8 +118,11 @@ class TargetMotionProfile:
 
             if c_t + len_t > t:
                 dt = t - c_t
-                disp_l = segment.lin_velocity * dt
-                disp_r = segment.rot_velocity * dt
+
+                frac = dt / len_t if len_t != 0 else 1.0
+
+                disp_l = frac * (segment.lin_target - c_l)
+                disp_r = frac * (segment.rot_target - c_r)
 
                 return c_l + disp_l, c_r + disp_r
 
