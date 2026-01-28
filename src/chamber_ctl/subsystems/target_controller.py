@@ -204,9 +204,9 @@ class TargetMotionController:
         v_l *= 0.5
         v_r *= 0.1
         
-        print(f"Running profile command: target=({t_l:.3f}, {t_r:.3f}) velocity=({v_l:.3f}, {v_r:.3f})")
-        print(f"Current position: {self.__motion.get_position()[0] - self.__start_l}, {self.__motion.get_position()[1] - self.__start_r}")
-        print(f"Current time: {self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment():.3f}s until end of segment")
+        #print(f"Running profile command: target=({t_l:.3f}, {t_r:.3f}) velocity=({v_l:.3f}, {v_r:.3f})")
+        #print(f"Current position: {self.__motion.get_position()[0] - self.__start_l}, {self.__motion.get_position()[1] - self.__start_r}")
+        #print(f"Current time: {self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment():.3f}s until end of segment")
         
         self.__motion.move_to_position(t_l + self.__start_l, t_r + self.__start_r, v_l, v_r)
 
