@@ -47,6 +47,7 @@ class TargetClient:
         self.__motion_state = None
 
         self.__status_kv = None
+        self.__profile_kv = None
 
         def _on_ready():
             if self.__did_config:
@@ -257,7 +258,7 @@ class TargetClientCLI(CaptiveCLITemplate):
         print(f"Current State: {state}, Motion State: {motion_state}")
 
     def __make_profile(self, _: argparse.Namespace):
-        def __read_seg(spl_segs: Iterable[str] = None) -> MotionSegment:
+        def __read_seg(spl_segs: Iterable[str] = None, prev_seg: MotionSegment = None) -> MotionSegment:
             if spl_segs is not None:
                 parts = spl_segs
             else:
@@ -266,21 +267,37 @@ class TargetClientCLI(CaptiveCLITemplate):
                     return None
                 parts = cmd.strip().split()
             
-            if len(parts) != 4:
+            if len(parts) != 3 and len(parts) != 4:
                 print("Invalid segment format. Please enter four values.")
                 print("Enter segment (lin_target rot_target lin_velocity rot_velocity) or 'cancel'. ")
                 return None
-            try:
-                lin_target = float(parts[0])
-                rot_target = float(parts[1])
-                lin_velocity = float(parts[2])
-                rot_velocity = float(parts[3])
-                segment = MotionSegment(lin_target, rot_target, lin_velocity, rot_velocity)
-                return segment
-            except ValueError:
-                print("Invalid number format. Please enter valid floats.")
-                print("Enter segment (lin_target rot_target lin_velocity rot_velocity) or 'cancel'. ")
-                return None
+            if len(parts) == 4:
+                try:
+                    lin_target = float(parts[0])
+                    rot_target = float(parts[1])
+                    lin_velocity = float(parts[2])
+                    rot_velocity = float(parts[3])
+                    segment = MotionSegment(lin_target, rot_target, lin_velocity, rot_velocity)
+                    return segment
+                except ValueError:
+                    print("Invalid number format. Please enter valid floats.")
+                    print("Enter segment (lin_target rot_target lin_velocity rot_velocity) or 'cancel'. ")
+                    return None
+            elif len(parts) == 3:
+                try:
+                    lin_target = float(parts[0])
+                    rot_target = float(parts[1])
+                    velocity = float(parts[2])
+
+                    p_l = prev_seg.lin_target if prev_seg is not None else 0.0
+                    p_r = prev_seg.rot_target if prev_seg is not None else 0.0
+
+                    segment = MotionSegment.by_time(lin_target, rot_target, p_l, p_r, velocity)
+                    return segment
+                except ValueError:
+                    print("Invalid number format. Please enter valid floats.")
+                    print("Enter segment (lin_target rot_target lin_velocity rot_velocity) or 'cancel'. ")
+                    return None
             
         profile = self.__t_client.get_profile()
         config = self.__t_client.get_config()
@@ -294,7 +311,7 @@ class TargetClientCLI(CaptiveCLITemplate):
         while True:
             print("Current profile:")
             self.__print_profile(profile)
-            cmd = input("Choose 'add', 'remove', 'insert', 'done', or 'cancel': ")
+            cmd = input("Choose 'add', 'remove', 'insert', 'clear', 'done', or 'cancel': ")
 
             cmd_s = cmd.strip().lower().split()
             
@@ -307,7 +324,7 @@ class TargetClientCLI(CaptiveCLITemplate):
                 return
             
             if cmd_s[0] == "add":
-                segment = __read_seg(cmd_s[1:] if len(cmd_s) > 1 else None)
+                segment = __read_seg(cmd_s[1:] if len(cmd_s) > 1 else None, segments[-1] if segments else None)
 
                 if segment is not None:
                     print("Adding segment...")
@@ -337,7 +354,7 @@ class TargetClientCLI(CaptiveCLITemplate):
                 try:
                     index = int(index_str)
                     if 0 <= index <= len(segments):
-                        segment = __read_seg()
+                        segment = __read_seg(None, segments[index - 1] if index > 0 else None)
                         if segment is not None:
                             print("Inserting segment...")
                             segments.insert(index, segment)
@@ -345,6 +362,10 @@ class TargetClientCLI(CaptiveCLITemplate):
                         print("Index out of range.")
                 except ValueError:
                     print("Invalid index format.")
+
+            elif cmd_s[0] == "clear":
+                print("Clearing all segments...")
+                segments.clear()
 
 
             profile.set_segments(segments)
