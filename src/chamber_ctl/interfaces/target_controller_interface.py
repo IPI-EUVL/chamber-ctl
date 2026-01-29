@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Dict, Iterable, Set
 
-from chamber_ctl.subsystems.target_controller import TargetMotionControllerState, MotionState, TargetMotionProfile, MotionSegment
+from chamber_ctl.subsystems.target_controller import TargetMotionControllerState, MotionState, TargetMotionProfile, MotionSegment, TargetMotionConfig
 import mt_events
 import segment_bytes
 
@@ -90,16 +90,25 @@ class TargetClient:
 
     def get_profile(self) -> TargetMotionProfile:
         if self.__profile_kv is not None:
-            profile_data = self.__profile_kv.value
+            b_profile_data, b_config_data = segment_bytes.decode(self.__profile_kv.value)
 
-            if profile_data is not None:
-                return TargetMotionProfile.decode(profile_data)
+            if b_profile_data is not None:
+                return TargetMotionProfile.decode(b_profile_data)
             
         return None
     
-    def set_profile(self, profile: TargetMotionProfile) -> mt_events.Awaiter:
+    def get_config(self) -> TargetMotionConfig:
         if self.__profile_kv is not None:
-            return self.__profile_kv.try_set(profile.encode())
+            b_profile_data, b_config_data = segment_bytes.decode(self.__profile_kv.value)
+
+            if b_config_data is not None:
+                return TargetMotionConfig.decode(b_config_data)
+            
+        return None
+    
+    def set_profile(self, profile: TargetMotionProfile, config: TargetMotionConfig) -> mt_events.Awaiter:
+        if self.__profile_kv is not None:
+            return self.__profile_kv.try_set(segment_bytes.encode([profile.encode(), config.encode()]))
         
         return None
     
@@ -274,6 +283,7 @@ class TargetClientCLI(CaptiveCLITemplate):
                 return None
             
         profile = self.__t_client.get_profile()
+        config = self.__t_client.get_config()
 
         if profile is None:
             profile = TargetMotionProfile()
@@ -339,7 +349,7 @@ class TargetClientCLI(CaptiveCLITemplate):
 
             profile.set_segments(segments)
 
-        awaiter = self.__t_client.set_profile(profile)
+        awaiter = self.__t_client.set_profile(profile, config)
         v, s, r = wait_for(awaiter, 10.0)
 
         if v == magics.OP_OK:

@@ -345,6 +345,9 @@ class TargetMotionController:
     def is_homing(self):
         return self.__motion.is_homing()
     
+    def get_config(self):
+        return self.__config
+    
 class TargetMotionControllerState:
     def __init__(self, position: tuple[float, float], target_position: tuple[float, float], is_running: bool, is_jogging: bool, is_homing: bool, current_time: float, current_segment: int):
         self.position = position
@@ -677,7 +680,10 @@ class TargetController:
             if not self.__motion_controller.can_modify():
                 return (magics.TRANSOP_STATE_REJ, b"Cannot modify profile while motion is running or not ready.")
             
-            profile = TargetMotionProfile.decode(v)
+            b_profile, b_config = segment_bytes.decode(v)
+            config = TargetMotionConfig.decode(b_config)
+            profile = TargetMotionProfile.decode(b_profile)
+
             self.__motion_controller.set_profile(profile)
             self.__profile = profile
 
@@ -689,7 +695,7 @@ class TargetController:
         return (magics.TRANSOP_STATE_OK, OP_OK)
 
     def __on_profile_read(self, requester):
-        return (magics.TRANSOP_STATE_OK, self.__profile.encode())
+        return (magics.TRANSOP_STATE_OK, segment_bytes.encode([self.__profile.encode(), self.__motion_controller.get_config().encode()]))
 
     def __on_jog_write(self, value: list[float]):
         if not self.__motion_controller.can_jog():
