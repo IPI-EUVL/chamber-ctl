@@ -47,7 +47,7 @@ class LJSerialTargetMotion(TargetMotion):
 
         self.__target_l = float('nan')
         self.__target_r = float('nan')
-        self.__last_l = float('nan')
+        self.__last_l = 0.0
         self.__last_r = float('nan')
 
         self.__jog_l = 0.0
@@ -262,7 +262,7 @@ class LJSerialTargetMotion(TargetMotion):
         #print(f"LIN Last Position: {self.__last_l / float(MM_TO_STEPS)} mm")
     
         if not isnan(self.__target_l):
-            if abs((self.__last_l / float(MM_TO_STEPS)) - self.__target_l) > 1e-3 or isnan(self.__last_l):
+            if (abs((self.__last_l / float(MM_TO_STEPS)) - self.__target_l) > 1e-3 or isnan(self.__last_l)) and self.__l_speed > 0.0:
                 self.__move_lin_to_position(int(self.__target_l * MM_TO_STEPS), int(self.__l_speed * MM_TO_STEPS))
         elif not isnan(self.__jog_l):
             if self.__jog_l != 0.0:
