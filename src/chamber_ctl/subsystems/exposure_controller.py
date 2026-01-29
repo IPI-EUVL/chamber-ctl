@@ -11,7 +11,24 @@ import ipi_ecs.core.tcp as tcp
 
 from ipi_ecs.logging.client import LogClient
 
-from chamber_ctl.subsystems.uuids import UUID_EXPOSURE_CONTROLLER
+from chamber_ctl.subsystems import uuids
+
+class ExposureSettings:
+    target_dose = 0.0
+    target_time = 0.0
+
+    def encode(self):
+        return pickle.dumps(self)
+    
+    @staticmethod
+    def decode(b_data: bytes):
+        return pickle.loads(b_data)
+    
+class ExposureState:
+    def __init__(self, exposure_settings: ExposureSettings):
+        self.exposure_settings = exposure_settings
+        self.__uuid = uuid.uuid4()
+
 
 class ExposureController:
     def __init__(self):
