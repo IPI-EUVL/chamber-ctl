@@ -146,8 +146,8 @@ class TargetMotionController:
         self.__config = TargetMotionConfig(max_l_size=300.0)
 
         self.__state = MotionState()
-        self.__motion = LJSerialTargetMotion(self.__config, logger, port="COM3")
-        #self.__motion = MockTargetMotion(self.__config)
+        #self.__motion = LJSerialTargetMotion(self.__config, logger, port="COM3")
+        self.__motion = MockTargetMotion(self.__config)
         self.__start_l = 0.0
         self.__start_r = 0.0
 
@@ -201,9 +201,6 @@ class TargetMotionController:
             
     def run_profile(self):
         t_l, t_r, v_l, v_r = self.__state.get_current_motion_command()
-        v_l *= 0.5
-        v_r *= 0.1
-        
         #print(f"Running profile command: target=({t_l:.3f}, {t_r:.3f}) velocity=({v_l:.3f}, {v_r:.3f})")
         #print(f"Current position: {self.__motion.get_position()[0] - self.__start_l}, {self.__motion.get_position()[1] - self.__start_r}")
         #print(f"Current time: {self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment():.3f}s until end of segment")
