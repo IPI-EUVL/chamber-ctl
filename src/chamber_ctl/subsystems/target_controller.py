@@ -6,7 +6,6 @@ import struct
 import time
 import uuid
 import sys
-from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 import mt_events
 import segment_bytes
 
@@ -22,10 +21,12 @@ import ipi_ecs.core.tcp as tcp
 import ipi_ecs.db.db_library as db_library
 
 from ipi_ecs.logging.client import LogClient
+from ipi_ecs.subsystems.experiment_client import ExperimentClient
 
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.target_motion import TargetMotion, TargetMotionConfig, TargetMotionProfile, MotionSegment, MotionState
 from chamber_ctl.subsystems.ljs_target_motion import LJSerialTargetMotion
+from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 
 
 class MockTargetMotion(TargetMotion):
@@ -99,7 +100,7 @@ class MockTargetMotion(TargetMotion):
                 if self.__current_r < self.__target_r:
                     self.__current_r = self.__target_r
 
-            if cur_t - last_print_t > 1:
+            if cur_t - last_print_t > 0.025:
                 last_print_t = cur_t
                 print(f"MockTargetMotion @ L={self.__current_l:.3f}/{self.__target_l:.3f} R={self.__current_r:.3f}/{self.__target_r:.3f}")
 
@@ -220,6 +221,9 @@ class TargetMotionController:
 
     def is_running(self):
         return self.__is_running
+    
+    def is_moving(self):
+        return self.__motion.is_moving()
     
     def can_modify(self):
         ret = not self.__is_running and not self.__should_start and not self.__motion.is_jogging() and self.__motion.ready_for_move() and not self.__motion.is_moving()
@@ -367,7 +371,7 @@ class TargetMotionControllerState:
         return f"TargetMotionControllerState(position={self.position}, target_position={self.target_position}, is_running={self.is_running}, is_jogging={self.is_jogging}, is_homing={self.is_homing}, current_time={self.current_time}, current_segment={self.current_segment})"
 
 
-class TargetController:
+class TargetController(ExperimentClient):
     def __init__(self):
         self.__run = True
 
@@ -401,7 +405,9 @@ class TargetController:
         self.__SAVE_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
         self.__library = db_library.Library(self.__SAVE_PATH)
 
-        self.__start_handle = None
+        self.__preinit_handle = None
+        self.__stop_handle = None
+
         self.__home_handle = None
         self.__jog_value = None
 
@@ -417,6 +423,10 @@ class TargetController:
         self.__daemon = daemon.Daemon()
         self.__daemon.add(target=self.__thread)
         self.__daemon.start()
+
+        super().__init__("exposure", "Target Controller", self.__logger)
+        self.register_experiment_settings_type(ExposureSettings)
+        
         print("TargetController initialized.")
 
     def __load_profile(self):
@@ -483,15 +493,20 @@ class TargetController:
         while stop_flag.run() and self.__run:
             e = self.__event_queue.get(timeout=0.5)
 
-            if self.__start_handle is not None:
+            if self.__preinit_handle is not None:
                 # Continue already handles this
                 #if not self.__motion_controller.is_running() and self.__motion_controller.at_path_position():
                 #    self.__motion_controller.continue_move()
                 
                 if self.__motion_controller.is_running():
                     self.__logger.log("Started motion.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="motion_start")
-                    self.__start_handle.ret(b"Motion has started successfully.")
-                    self.__start_handle = None
+                    self._on_did_preinit(OP_OK + b": motion started successfully.")
+                    self.__preinit_handle = None
+
+            if self.__stop_handle is not None and not self.__motion_controller.is_moving():
+                self.__logger.log("Stopped motion.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="motion_stop")
+                self._on_did_stop(OP_OK + b": motion stopped successfully.")
+                self.__stop_handle = None
 
             if self.__home_handle is not None:
                 if not self.__motion_controller.is_homing():
@@ -531,50 +546,47 @@ class TargetController:
             if self.__subsystem.get_status_item_exists(1):
                 self.__subsystem.clear_status_item(1)
 
-    def __can_start_motion(self, exposure_settings: ExposureSettings):
-        t_len = exposure_settings.target_time if exposure_settings.target_time else 0.0
+    def __can_start_motion(self):
+        #if self.__motion_controller.get_start_position() == (0.0, 0.0):
+        #    return False, b"Motion start has not been defined"
+        
+        if not self.__motion_controller.can_modify():
+            return False, b"Motion controller is busy or not ready for motion"
+        
+        return True, b""
+    
+    def _on_continue_state(self):
+        if self.__motion_controller.is_running():
+            return True, ""
+        else:
+            return False, "Motion controller is not running."
+            
+    
+    def _can_preinit(self, settings: ExposureSettings) -> tuple[bool, bytes]:
+        t_len = settings.get_target_time() if settings.get_target_time() else 0.0
         
         if t_len > self.__motion_controller.get_state().get_remaining_time():
-            return False, f"Exposure target time {t_len} exceeds remaining motion time {self.__motion_controller.get_state().get_remaining_time()}"
+            return False, f"Exposure target time {t_len} exceeds remaining motion time {self.__motion_controller.get_state().get_remaining_time()}".encode("utf-8")
         
         # Not sure if we can allow the system to move back to start position by itself or to force operator to do it
         # Will leave this commented out for now
         #if not self.__motion_controller.at_path_position():
         #    return False, "Target motion controller is not at start or path position"
 
-        if self.__motion_controller.get_start_position() == (0.0, 0.0):
-            return False, "Motion start has not been defined"
-        
-        if not self.__motion_controller.can_modify():
-            return False, "Motion controller is busy or not ready for motion"
-        
-        return True, ""
-    
-    def __on_can_start_exposure_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
-        print("Can start exposure event called by:", s_uuid, param)
-        ok, reason = self.__can_start_motion(ExposureSettings.decode(param) if param else None)
+        state, reason = self.__can_start_motion()
+        return state, reason
 
-        if not ok:
-            print("Cannot start target motion:", reason)
-            handle.fail(("Cannot start target motion: " + reason).encode("utf-8"))
-            return
-        
-        handle.ret(b"Target motion can start.")
-
-    def __on_preinit_exposure_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
-        print("Prepare exposure event called by:", s_uuid, param)
-
-        ok, reason = self.__can_start_motion(ExposureSettings.decode(param) if param else None)
-        if not ok:
-            print("Cannot start target motion:", reason)
-            self.__logger.log("Preinit event called but cannot start target motion: " + reason, level="WARN", l_type="CTRL", subsystem="Target Controller")
-            handle.fail(("Cannot start target motion: " + reason).encode("utf-8"))
-            return
-
+    def _on_preinit(self, handle) -> bytes:
         self.__motion_controller.continue_move()
+        self.__preinit_handle = handle
 
-        self.__start_handle = handle
-        self.__start_handle.feedback(OP_OK + b": going to path position and starting target motion.")
+        return b"Continuing motion."
+    
+    def _on_stop(self, handle) -> bytes:
+        self.__motion_controller.stop()
+        self.__stop_handle = handle
+
+        return b"Motion stopping."
 
     def __on_set_start_position(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
         print("Set start position event called by:", s_uuid, param)
@@ -652,8 +664,6 @@ class TargetController:
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):
         self.__subsystem = handle
 
-        handle.add_event_handler(b"can_begin_exposure").on_called(self.__on_can_start_exposure_event)
-        handle.add_event_handler(b"preinit_exposure").on_called(self.__on_preinit_exposure_event)
         handle.add_event_handler(b"start_target_motion").on_called(self.__on_start_move_event)
         handle.add_event_handler(b"stop_target_motion").on_called(self.__on_stop_move_event)
         handle.add_event_handler(b"set_target_start").on_called(self.__on_set_start_position)
@@ -671,6 +681,8 @@ class TargetController:
         self.__profile_publisher.on_set(self.__on_profile_write)
         self.__profile_publisher.on_get(self.__on_profile_read)
         self.__profile_publisher.set_type(types.ByteTypeSpecifier())
+
+        self._setup_subsystem(handle)
 
     def __on_profile_write(self, h, requester, v):
         try:
