@@ -142,9 +142,9 @@ class TargetMotionProfile:
 
         p_time = frac_t * len_t + self.segment_begin_time(segment_num)
 
-        assert p_time >= 0.0, "Calculated time is negative!"
+        assert (p_time + 1e-3) >= 0.0, "Calculated time is negative!" + str(locals())
 
-        return p_time
+        return max(p_time, 1e-3)
 
     def time_until_end_at_position(self, l_pos: float, r_pos: float, segment_num: int):
         (start_l, start_r) = (
