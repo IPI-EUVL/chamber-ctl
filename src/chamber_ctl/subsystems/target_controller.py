@@ -21,7 +21,7 @@ import ipi_ecs.core.tcp as tcp
 import ipi_ecs.db.db_library as db_library
 
 from ipi_ecs.logging.client import LogClient
-from ipi_ecs.subsystems.experiment_client import ExperimentClient
+from ipi_ecs.subsystems.experiment_client import ExperimentClient, RunState
 
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.target_motion import TargetMotion, TargetMotionConfig, TargetMotionProfile, MotionSegment, MotionState
@@ -562,7 +562,7 @@ class TargetController(ExperimentClient):
             return False, "Motion controller is not running."
             
     
-    def _can_preinit(self, settings: ExposureSettings) -> tuple[bool, bytes]:
+    def _can_preinit(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
         t_len = settings.get_target_time() if settings.get_target_time() else 0.0
         
         if t_len > self.__motion_controller.get_state().get_remaining_time():
