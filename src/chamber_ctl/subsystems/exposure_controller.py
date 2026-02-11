@@ -1,3 +1,4 @@
+import json
 import multiprocessing
 import os
 import pickle
@@ -36,20 +37,21 @@ class ExposureSettings(RunSettings):
         return self.data.get("target_dose", 0.0)
     
     @staticmethod
-    def decode(data: bytes) -> "ExposureSettings":
-        obj = pickle.loads(data)
-        exp_settings = ExposureSettings()
-        exp_settings.data = obj.data
+    def decode(data: str) -> "ExposureSettings":
+        data_dict = json.loads(data)
+        obj = ExposureSettings()
+        obj.data = data_dict
 
         assert obj.data.get("target_time") is not None, "Decoded ExposureSettings missing target_time"
         assert obj.data.get("target_dose") is not None, "Decoded ExposureSettings missing target_dose"
 
-        return exp_settings
+        return obj
 
 def main(stop_event: "multiprocessing.Event"):
     __SAVE_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
     m_run_controller = ExperimentController("ExposureController", uuids.UUID_EXPOSURE_CONTROLLER, "exposure", __SAVE_PATH)
-    m_run_controller.add_required_subsystem(uuids.UUID_TARGET_CONTROLLER)
+    #m_run_controller.add_required_subsystem(uuids.UUID_TARGET_CONTROLLER)
+    m_run_controller.add_required_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER)
     m_run_controller.register_experiment_settings_type(ExposureSettings)
 
     try:
