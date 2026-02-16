@@ -581,6 +581,113 @@ class RealtimeDoseCalc:
 
             time.sleep(0.1)
 
+def calculate_dose_of_experiment(e_uuid: uuid.UUID, d_reader: "DataReader"):
+    __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
+    __OFF_NUM = 98
+    __SAMPLE_dT = 10 / 1e9
+    __RESISTOR_OHMS = 50.0
+    __RESP_A_PER_W = 0.14
+    __AREA_CM2 = (5) / 100.0
+    __REP_RATE_HZ = 100.0
+
+    segments = d_reader.get_snapshots(e_uuid)
+
+    running_total = 0
+    running_time = 0
+
+    for uid, (snapshot_file, snapshot_meta) in segments.items():
+        snap_array = np.load(snapshot_file)
+
+        meta = json.load(snapshot_meta)
+        start = meta["start"]
+        end = meta["end"]
+
+        data = snap_array["data"]
+        indexes = snap_array["indexes"]
+        pulse_doses = []
+        pulse_webers = []
+        pulse_size = int(indexes[1, 0] - indexes[0, 0])
+        # print(f"Calculated pulse size: {pulse_size} pts")
+
+        for index, begin_time in indexes:
+            index = int(index)
+            pulse = data[index:index+pulse_size, :]
+            off_avg = np.average(pulse[:__OFF_NUM, 1])
+            pulse -= off_avg
+            pulsetime = pulse[-1, 0] - pulse[0, 0]
+            auc_webers = np.trapezoid(pulse[:, 1], pulse[:, 0])
+            # print(f"nWeber: {auc_webers * 1e9}") 
+            Q_coulombs = auc_webers / __RESISTOR_OHMS
+            E_joules = Q_coulombs / __RESP_A_PER_W
+            E_mJ = E_joules * 1000.0
+            dose_per_pulse_mJ_cm2 = E_mJ / __AREA_CM2
+            #print(f"uJ/cm2: {dose_per_pulse_mJ_cm2 * 1e3}")
+            pulse_doses.append((begin_time, dose_per_pulse_mJ_cm2))
+            pulse_webers.append((begin_time, auc_webers))
+
+            #if dose_per_pulse_mJ_cm2 < -1e-5:
+            #    print("NEGATIVE DOSE: ", dose_per_pulse_mJ_cm2)
+
+        pulse_doses = np.array(pulse_doses)
+        pulse_webers = np.array(pulse_webers)
+        total = np.average(pulse_doses[:, 1])
+        total *= ((end - start) / 1e9) * __REP_RATE_HZ
+
+        running_total += total
+        running_time += (end - start) / 1e9
+
+    return running_total, running_time
+
+def calculate_dose_of_segment(e_uuid: uuid.UUID, s_uuid: uuid.UUID, d_reader: "DataReader"):
+    __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
+    __OFF_NUM = 98
+    __SAMPLE_dT = 10 / 1e9
+    __RESISTOR_OHMS = 50.0
+    __RESP_A_PER_W = 0.14
+    __AREA_CM2 = (5) / 100.0
+    __REP_RATE_HZ = 100.0
+
+    snapshot_file, snapshot_meta = d_reader.get_snapshot(e_uuid, s_uuid)
+
+    snap_array = np.load(snapshot_file)
+
+    meta = json.load(snapshot_meta)
+    start = meta["start"]
+    end = meta["end"]
+
+    data = snap_array["data"]
+    indexes = snap_array["indexes"]
+    pulse_doses = []
+    pulse_webers = []
+    pulse_size = int(indexes[1, 0] - indexes[0, 0])
+    # print(f"Calculated pulse size: {pulse_size} pts")
+
+    for index, begin_time in indexes:
+        index = int(index)
+        pulse = data[index:index+pulse_size, :]
+        off_avg = np.average(pulse[:__OFF_NUM, 1])
+        pulse -= off_avg
+        pulsetime = pulse[-1, 0] - pulse[0, 0]
+        auc_webers = np.trapezoid(pulse[:, 1], pulse[:, 0])
+        # print(f"nWeber: {auc_webers * 1e9}") 
+        Q_coulombs = auc_webers / __RESISTOR_OHMS
+        E_joules = Q_coulombs / __RESP_A_PER_W
+        E_mJ = E_joules * 1000.0
+        dose_per_pulse_mJ_cm2 = E_mJ / __AREA_CM2
+        #print(f"uJ/cm2: {dose_per_pulse_mJ_cm2 * 1e3}")
+        pulse_doses.append((begin_time, dose_per_pulse_mJ_cm2))
+        pulse_webers.append((begin_time, auc_webers))
+
+        #if dose_per_pulse_mJ_cm2 < -1e-5:
+        #    print("NEGATIVE DOSE: ", dose_per_pulse_mJ_cm2)
+
+    pulse_doses = np.array(pulse_doses)
+    pulse_webers = np.array(pulse_webers)
+    total = np.average(pulse_doses[:, 1])
+    total *= ((end - start) / 1e9) * __REP_RATE_HZ
+
+    return total, ((end - start) / 1e9)
+
 class DummyOscilloscope(OscilloscopeStream):
     def __init__(self):
         self.__is_capturing = False
@@ -660,7 +767,7 @@ class DummyOscilloscope(OscilloscopeStream):
                 data = np.vstack((data, values))
 
             print("Dummy oscilloscope generated new data, writing...")
-            self.__out_queue.put((start, data, indexes, uid))
+            self.__out_queue.put((start, time.time_ns(), data, indexes, uid))
        
     def close(self):
         self.__daemon.stop()
@@ -705,8 +812,8 @@ class ScopeWriter:
                 self.__do_get_record()
 
             if not self.__write_queue.empty():
-                start, data, indexes, uid = self.__write_queue.get()
-                self.__write_wf(start, data, indexes, uid)
+                start, end, data, indexes, uid = self.__write_queue.get()
+                self.__write_wf(start, end, data, indexes, uid)
 
             time.sleep(0.1)
 
@@ -717,14 +824,14 @@ class ScopeWriter:
     def __do_get_record(self):
         self.__record = self.__exp_reader.get_run(self.__s_uuid)
 
-    def write_wf(self, start, data: np.ndarray, indexes, uid):
+    def write_wf(self, start, end, data: np.ndarray, indexes, uid):
         if self.__record is None:
             print("No record available for writing, skipping...")
             return
         
-        self.__write_queue.put((start, data, indexes, uid))
+        self.__write_queue.put((start, end, data, indexes, uid))
     
-    def __write_wf(self, start, data: np.ndarray, indexes, uid):
+    def __write_wf(self, start, end, data: np.ndarray, indexes, uid):
         if self.__record is None:
             return
         
@@ -735,6 +842,7 @@ class ScopeWriter:
         file_meta = self.__record.get_record().resource(f"snap_{str(uid)}.json", "snap_meta", "w")
         meta = {
             "start": start,
+            "end": end,
             "num_points": len(data),
             "num_frames": len(indexes),
         }
@@ -751,6 +859,10 @@ class DataReader:
 
     def get_snapshots(self, e_uuid):
         record = self.__exp_reader.get_run(e_uuid)
+        if record.get_record() is None:
+            print(f"No record found for experiment UUID: {e_uuid}")
+            return dict()
+        
         resources = record.get_record().list_resources()
 
         snapshots = dict()
@@ -765,6 +877,31 @@ class DataReader:
                     continue
 
                 snapshots[uid] = (record.get_record().resource(fname, "snapshot", "rb"), record.get_record().resource(f"snap_{uid}.json", "snap_meta", "r"))
+
+        return snapshots
+    
+    def get_snapshot(self, e_uuid, uid):
+        record = self.__exp_reader.get_run(e_uuid)
+        if record.get_record() is None:
+            print(f"No record found for experiment UUID: {e_uuid}")
+            return None
+        
+        resources = record.get_record().list_resources()
+
+        for fname, f_type in resources:
+            if f_type == "snapshot" and fname.endswith(".npz"):
+                uid_str = fname[len("snap_"):-len(".npz")]
+                try:
+                    file_uid = uuid.UUID(uid_str)
+                except ValueError:
+                    print(f"Invalid UUID in filename: {fname}, skipping...")
+                    continue
+
+                if file_uid == uid:
+                    return (record.get_record().resource(fname, "snapshot", "rb"), record.get_record().resource(f"snap_{uid}.json", "snap_meta", "r"))
+        
+        print(f"No snapshot found for UID: {uid} in experiment UUID: {e_uuid}")
+        return None
 
 class OscilloscopeSubsystem(exp_client.ExperimentClient):
     def __init__(self, scope: OscilloscopeStream):
@@ -795,6 +932,11 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
         self.__writer = ScopeWriter()
 
+        self.__exp_reader = None
+        self.__data_reader = None
+
+        self.__dose_queue = queue.Queue()
+
         def _on_ready():
             if self.__did_config:
                 return
@@ -816,6 +958,9 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__daemon.start()
 
     def __thread(self, stop_flag: StopFlag):
+        self.__exp_reader = ExperimentReader(os.path.join(os.environ["EUVL_PATH"], "datasets"), "exposure")
+        self.__data_reader = DataReader(os.path.join(os.environ["EUVL_PATH"], "datasets"))
+
         while stop_flag.run():
             time.sleep(0.1)
 
@@ -831,12 +976,26 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                 self._on_did_preinit()
                 self.__preinit_handle = None
 
-            if not self.__osc_queue.empty():
+            #if self.__exp_id is not None and self._has_timed_out():
+            #    print("Exposure has timed out, resetting state.")
+            #    self.__stop_exp()
+
+            if not self.__osc_queue.empty() and not self.__exp_id is None:
                 print("New oscilloscope data available, writing...")
-                start, data, indexes, uid = self.__osc_queue.get()
-                self.__writer.write_wf(start, data, indexes, uid)
+                start, end, data, indexes, uid = self.__osc_queue.get()
+                self.__writer.write_wf(start, end, data, indexes, uid)
 
                 self.__on_new_segment_publisher.value = segment_bytes.encode([self.__exp_id.bytes, uid.bytes])
+
+            if not self.__dose_queue.empty() and not self.osc.is_capturing():
+                time.sleep(0.5) # wait a moment to ensure all data is written and available for reading
+                exp = self.__dose_queue.get()
+                rec = self.__exp_reader.get_run(exp)
+                dose, runtime = calculate_dose_of_experiment(exp, self.__data_reader)
+
+                rec.add_tag("runtime", runtime)
+                rec.add_tag("dose", dose)
+                print("Saved dose for experiment ", exp, ": ", dose, " mJ/cm2")
 
 
     def __on_got_subsystem(self, sh: client._RegisteredSubsystemHandle):
@@ -873,15 +1032,21 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
         self.__logger.log("Scope stopping recording.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
 
-        self.osc.set_active(False)
+        self.__stop_exp()
 
         return b"Scope stopped recording."
     
+    def __stop_exp(self):
+        self.osc.set_active(False)
+        self.__dose_queue.put(self.__exp_id)
+
+        self.__exp_id = None
+    
     def _on_continue_state(self):
         if self.__exp_id is not None:
-            return True, "Scope is recording"
+            return True, b"Scope is recording"
         
-        return False, "Scope is idle"
+        return False, b"Scope is idle"
     
     def close(self):
         self.__daemon.stop()
