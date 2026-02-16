@@ -81,7 +81,7 @@ class ExperimentDataReader(CaptiveCLITemplate):
             return __open_by_date(today)
         
         def __query_min_dose(dose: float):
-            return {"tags": {"state_dose": {"min": dose, "max": 1e6}}}
+            return {"tags": {"dose": {"min": dose, "max": 1e6}}}
         
         def __query_min_target_dose(dose: float):
             return {"tags": {"target_dose": {"min": dose, "max": 1e6}}}
@@ -170,10 +170,6 @@ class ExperimentDataReader(CaptiveCLITemplate):
             compound_query.update(q_dict)
 
         print("Final compound query:", compound_query)
-
-        if compound_query == {}:
-            print("No valid queries entered.")
-            return
 
         exps = self.__do_lib_thread(self.exp_reader.query, compound_query)
 
