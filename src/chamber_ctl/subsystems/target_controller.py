@@ -406,6 +406,7 @@ class TargetController(ExperimentClient):
         self.__library = db_library.Library(self.__SAVE_PATH)
 
         self.__preinit_handle = None
+        self.__start_handle = None
         self.__stop_handle = None
 
         self.__home_handle = None
@@ -503,6 +504,10 @@ class TargetController(ExperimentClient):
                     self._on_did_preinit(OP_OK + b": motion started successfully.")
                     self.__preinit_handle = None
 
+            if self.__start_handle is not None:
+                self._on_did_start(OP_OK + b": motion is running.")
+                self.__start_handle = None
+
             if self.__stop_handle is not None and not self.__motion_controller.is_moving():
                 self.__logger.log("Stopped motion.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="motion_stop")
                 self._on_did_stop(OP_OK + b": motion stopped successfully.")
@@ -557,9 +562,9 @@ class TargetController(ExperimentClient):
     
     def _on_continue_state(self):
         if self.__motion_controller.is_running():
-            return True, ""
+            return True, b""
         else:
-            return False, "Motion controller is not running."
+            return False, b"Motion controller is not running."
             
     
     def _can_preinit(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
@@ -581,6 +586,10 @@ class TargetController(ExperimentClient):
         self.__preinit_handle = handle
 
         return b"Continuing motion."
+    
+    def _on_start(self, handle):
+        self.__start_handle = handle
+        return super()._on_start(handle)
     
     def _on_stop(self, handle) -> bytes:
         self.__motion_controller.stop()
