@@ -84,8 +84,6 @@ class PhosphorScopeTk:
 
         controls = tk.Frame(master)
         controls.pack(fill="x")
-        tk.Button(controls, text="Clear", command=self.clear).pack(side="left", padx=4, pady=4)
-        tk.Button(controls, text="Pause/Resume", command=self.toggle_pause).pack(side="left", padx=4, pady=4)
 
         # For demo source
         self._demo_phase = 0.0
