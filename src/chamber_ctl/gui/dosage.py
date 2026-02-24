@@ -21,12 +21,11 @@ from chamber_ctl.subsystems import uuids
 from chamber_ctl.interfaces.scope_interface import PhosphorScopeTk
 from chamber_ctl.subsystems.oscilloscope import calculate_dose_of_experiment, DataReader, calculate_dose_of_segment
 
-class ScopeClient:
+class PulseDosageDisplay:
     __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
-    def __init__(self, phosphor: PhosphorScopeTk):
+    def __init__(self, root: tk.Tk):
         self.__run = True
         self.__remote_kv = None
-        self.__phosphor = phosphor
 
         self.__new_segment_kv = None
         c_uuid = uuid.uuid4()
@@ -41,7 +40,14 @@ class ScopeClient:
         self.__did_config = False
         self.__subsystem = None
 
+        self.__total_dose = 0
+        self.__total_time = 0
+
         self.__segment_queue = queue.Queue()
+
+        self.__initialize_component(root)
+
+        self.__root = root
 
         def _on_ready():
             if self.__did_config:
@@ -59,7 +65,35 @@ class ScopeClient:
         self.__daemon = daemon.Daemon()
         self.__daemon.add(self.__calc_thread)
         self.__daemon.start()
-        
+
+        self.__update_values() # start the periodic update of the dose label
+
+    def __initialize_component(self, root: tk.Tk):
+        pulses_frame = tk.LabelFrame(root, text="Pulse Display")
+        pulses_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.__phosphor = PhosphorScopeTk(
+            pulses_frame,
+            tlim=(-0e-6, 10e-6),
+            vlim=(-0.5, 1.0),
+            grid_shape=(200, 500),
+            decay=0.98,
+            gain=0.8,
+            update_ms=20,
+        )
+
+        dose_frame = tk.LabelFrame(root, text="Dose Information")
+        dose_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.__current_dose_label = tk.Label(dose_frame, text="Current dose: N/A mJ/cm^2", font=("Arial", 36))
+        self.__current_dose_label.pack()
+
+    def __update_values(self):
+        if self.__total_dose == 0:
+            self.__current_dose_label.config(text="Current dose: N/A mJ/cm^2")
+        else:
+            self.__current_dose_label.config(text=f"Current dose: {self.__total_dose:.2f} mJ/cm^2")
+        self.__root.after(1000, self.__update_values) # schedule next update
 
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):
         # state has to be named state as it will get passed as a KW argument, stop complaining Pylint!!
@@ -82,31 +116,35 @@ class ScopeClient:
     
     def __calc_thread(self, stop_flag: daemon.StopFlag):
         self.__d_reader = DataReader(self.__PATH)
-        total_dose = 0
-        total_time = 0
+        self.__total_dose = 0
+        self.__total_time = 0
         last_experiment = None
 
         while stop_flag.run():
             exp, segment = self.__segment_queue.get()
             time.sleep(0.1) # wait a bit for the data to be fully written
             if last_experiment is None or exp != last_experiment:
-                print(f"New experiment {exp} detected, resetting total dose.")
-                total_dose, total_time = calculate_dose_of_experiment(exp, self.__d_reader)
-                last_experiment = exp
+                try:
+                    self.__logger.log(f"New experiment {exp} detected, resetting total dose.", level="INFO", l_type="SW", subsystem="Dose GUI")
+                    self.__total_dose, self.__total_time = calculate_dose_of_experiment(exp, self.__d_reader)
+                    last_experiment = exp
+                except (ValueError, TypeError) as e:
+                    self.__logger.log(f"Error calculating dose for experiment {exp}: {e}", level="ERROR", l_type="SW", subsystem="Dose GUI")
+                    last_experiment = None # reset experiment to force recalculation on next segment
                 continue
             
             try:
                 dose, r_time = calculate_dose_of_segment(exp, segment, self.__d_reader)
-                total_dose += dose
-                total_time += r_time
+                self.__total_dose += dose
+                self.__total_time += r_time
 
                 self.__update_phosphor(exp, segment, self.__phosphor)
-            except ValueError as e:
-                print(f"Error calculating dose for experiment {exp}, segment {segment}: {e}")
+            except (ValueError, TypeError) as e:
+                self.__logger.log(f"Error calculating dose for experiment {exp}, segment {segment}: {e}", level="ERROR", l_type="SW", subsystem="Dose GUI")
                 last_experiment = None # reset experiment to force recalculation on next segment
                 continue
 
-            print(f"Calculated dose for experiment {exp} is {total_dose} mJ/cm^2 over {total_time:.2f} seconds.")
+            self.__logger.log(f"Calculated dose for experiment {exp} is {self.__total_dose} mJ/cm^2 over {self.__total_time:.2f} seconds.", level="DEBUG", l_type="EXP", subsystem="Dose GUI")
     
     def __on_new_segment(self, new_data):
         exp, segment = segment_bytes.decode(new_data)
@@ -137,23 +175,13 @@ class ScopeClient:
             #time.sleep(max(0, cur_time - last_time) * 0.95) # sleep a bit less than the actual time to account for processing time, otherwise we might fall behind over time
             #last_time = cur_time
 
-            phosphor.push([pulse])
+            self.__phosphor.push([pulse])
 
 def main(args: argparse.Namespace):
     root = tk.Tk()
     root.title("TkAgg Phosphor Pulse Overlay Demo")
 
-    phosphor = PhosphorScopeTk(
-        root,
-        tlim=(-0e-6, 10e-6),
-        vlim=(-0.5, 1.0),
-        grid_shape=(200, 500),
-        decay=0.98,
-        gain=0.8,
-        update_ms=20,
-    )
-
-    m_client = ScopeClient(phosphor)
+    m_client = PulseDosageDisplay(root)
 
     try:
         root.mainloop()
