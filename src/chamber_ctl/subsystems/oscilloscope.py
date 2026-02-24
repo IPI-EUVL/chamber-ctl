@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import random
 import time, struct, os, signal, re, sys, threading, numpy as np
 import uuid
@@ -747,9 +748,9 @@ class DummyOscilloscope(OscilloscopeStream):
 
             self.__is_capturing = True
             self.__state = "CAPTURING"
-            print("Dummy oscilloscope capturing...")
+            #print("Dummy oscilloscope capturing...")
             t, V, meta, timestamps, uid = self.dummy_wfs(100)
-            print("Dummy oscilloscope finished capturing.")
+            #print("Dummy oscilloscope finished capturing.")
 
             self.__is_capturing = False
             self.__state = "IDLE"
@@ -766,7 +767,7 @@ class DummyOscilloscope(OscilloscopeStream):
                 values = np.column_stack((t[nv], V[nv]))
                 data = np.vstack((data, values))
 
-            print("Dummy oscilloscope generated new data, writing...")
+            #print("Dummy oscilloscope generated new data, writing...")
             self.__out_queue.put((start, time.time_ns(), data, indexes, uid))
        
     def close(self):
@@ -822,14 +823,18 @@ class ScopeWriter:
         self.__record = None
 
     def __do_get_record(self):
-        self.__record = self.__exp_reader.get_run(self.__s_uuid)
+        try:
+            self.__record = self.__exp_reader.get_run(self.__s_uuid)
+        except ValueError:
+            self.__record = None
 
     def write_wf(self, start, end, data: np.ndarray, indexes, uid):
         if self.__record is None:
             print("No record available for writing, skipping...")
-            return
+            return False
         
         self.__write_queue.put((start, end, data, indexes, uid))
+        return True
     
     def __write_wf(self, start, end, data: np.ndarray, indexes, uid):
         if self.__record is None:
@@ -981,9 +986,13 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
             #    self.__stop_exp()
 
             if not self.__osc_queue.empty() and not self.__exp_id is None:
-                print("New oscilloscope data available, writing...")
+                #print("New oscilloscope data available, writing...")
                 start, end, data, indexes, uid = self.__osc_queue.get()
-                self.__writer.write_wf(start, end, data, indexes, uid)
+                ok = self.__writer.write_wf(start, end, data, indexes, uid)
+                self.__logger.log(f"Saved snapshot {uid}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
+                if not ok:
+                    print("Failed to write oscilloscope data")
+                    self.osc.set_active(False)
 
                 self.__on_new_segment_publisher.value = segment_bytes.encode([self.__exp_id.bytes, uid.bytes])
 
@@ -995,7 +1004,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
                 rec.add_tag("runtime", runtime)
                 rec.add_tag("dose", dose)
-                print("Saved dose for experiment ", exp, ": ", dose, " mJ/cm2")
+                self.__logger.log(f"Saved dose for experiment {exp}: {dose} mJ/cm2", level="INFO", l_type="EXP", subsystem="Oscilloscope")
 
 
     def __on_got_subsystem(self, sh: client._RegisteredSubsystemHandle):
@@ -1053,21 +1062,28 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__writer.close()
 
 
-def main():
+    def ok(self):
+        return self.__daemon.is_ok() and self.osc.ok()
+
+
+def main(stop_event: "multiprocessing.Event"):
     osc = DummyOscilloscope() #ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
     subsystem = OscilloscopeSubsystem(osc)
+    print("Oscilloscope subsystem initializing...")
     #proc = RealtimeDoseCalc(osc)
 
     try:
         osc.start()
-        while osc.ok():
+        time.sleep(1) # wait for oscilloscope to be ready
+        while subsystem.ok() and not stop_event.is_set():
             time.sleep(0.1)
 
     except KeyboardInterrupt:
         pass
     finally:
+        print("Shutting down oscilloscope subsystem...")
         osc.close()
         subsystem.close()
 
 if __name__ == "__main__":
-    main()
+    main(multiprocessing.Event())
