@@ -25,13 +25,25 @@ from ipi_ecs.subsystems.experiment_controller import ExperimentController, RunSe
 from chamber_ctl.subsystems import uuids
 
 class ExposureSettings(RunSettings):
-    def __init__(self, target_time: float = 0.0, target_dose: float = 0.0):
+    def __init__(self, target_time: float = 0.0, target_dose: float = 0.0, operator: str = "", zr_filter: str = "", sample: str = ""):
         super().__init__()
         self.data["target_time"] = target_time
         self.data["target_dose"] = target_dose
+        self.data["operator"] = operator
+        self.data["zr_filter"] = zr_filter
+        self.data["sample"] = sample
 
     def get_target_time(self) -> float:
         return self.data.get("target_time", 0.0)
+    
+    def get_operator(self) -> str:
+        return self.data.get("operator", "")
+    
+    def get_zr_filter(self) -> str:
+        return self.data.get("zr_filter", "")
+    
+    def get_sample(self) -> str:
+        return self.data.get("sample", "")
     
     def get_target_dose(self) -> float:
         return self.data.get("target_dose", 0.0)
@@ -44,7 +56,10 @@ class ExposureSettings(RunSettings):
 
         assert obj.data.get("target_time") is not None, "Decoded ExposureSettings missing target_time"
         assert obj.data.get("target_dose") is not None, "Decoded ExposureSettings missing target_dose"
-
+        assert obj.data.get("operator") is not None, "Decoded ExposureSettings missing operator"
+        assert obj.data.get("zr_filter") is not None, "Decoded ExposureSettings missing zr_filter"
+        assert obj.data.get("sample") is not None, "Decoded ExposureSettings missing sample"
+        
         return obj
 
 def main(stop_event: "multiprocessing.Event"):
