@@ -1,24 +1,24 @@
 import json
 import multiprocessing
 import random
-import time, struct, os, signal, re, sys, threading, numpy as np
+import time, struct, os, signal, re, sys, threading
 import uuid
 from datetime import date
-from pyvisa import ResourceManager, errors as visa_errors
+
+try:
+    from pyvisa import ResourceManager, errors as visa_errors
+except ImportError:
+    pass
+
 import socket
 import csv
 import queue
 import math
 import tkinter as tk
 import numpy as np
-import matplotlib
+#import matplotlib
 import segment_bytes
-matplotlib.use("TkAgg")
-
-from matplotlib.figure import Figure
-from matplotlib import colors as mpl_colors
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.ticker import FuncFormatter
+#matplotlib.use("TkAgg")
 
 from scipy import signal
 from datetime import datetime
