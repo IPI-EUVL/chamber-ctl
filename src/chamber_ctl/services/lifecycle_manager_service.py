@@ -7,14 +7,18 @@ import win32event
 import servicemanager
 
 from ipi_ecs.services.lifecycle_manager_service import LifecycleManagerService
-from chamber_ctl.subsystems import exposure_controller
+from chamber_ctl.subsystems import exposure_controller, oscilloscope, target_controller
 from chamber_ctl.subsystems import uuids
 
 class ChamberLifecycleManagerService(LifecycleManagerService):
+    _svc_name_ = "chamber-ctl-LifecycleManagerService"
+    _svc_display_name_ = "chamber-ctl Lifecycle Manager Service"
+    _svc_description_ = "Lifecycle Manager Service for Chamber Control"
     def add_subsystems(self):
         # Add chamber-specific subsystems here.
         self._lifecycle_manager.add_subsystem(uuids.UUID_EXPOSURE_CONTROLLER, exposure_controller.main)
-        print("Added ExposureController subsystem.")
+        self._lifecycle_manager.add_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER, oscilloscope.main)
+        self._lifecycle_manager.add_subsystem(uuids.UUID_TARGET_CONTROLLER, target_controller.main)
 
 def main():
     if len(sys.argv) == 1:
