@@ -11,6 +11,9 @@ from chamber_ctl.subsystems import exposure_controller, oscilloscope, target_con
 from chamber_ctl.subsystems import uuids
 
 class ChamberLifecycleManagerService(LifecycleManagerService):
+    def __init__(self, args):
+        super().__init__(args, uuid=uuids.UUID_LIFECYCLE_MANAGER)
+        
     _svc_name_ = "chamber-ctl-LifecycleManagerService"
     _svc_display_name_ = "chamber-ctl Lifecycle Manager Service"
     _svc_description_ = "Lifecycle Manager Service for Chamber Control"
