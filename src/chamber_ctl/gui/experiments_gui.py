@@ -24,6 +24,7 @@ class ExperimentReaderThread:
 
     def __init__(self, data_path: str, exp_name: str):
         self.__data_path = data_path
+        print(f"ExperimentReaderThread: data_path={data_path}, exp_name={exp_name}")
         self.__exp_name = exp_name
         self.__reader: ExperimentReader = None
         self.__in_queue: Queue = Queue()
@@ -583,6 +584,9 @@ class ExperimentsGUI:
         self.__dose_info_var = tk.StringVar(value="")
         self.__dose_cancel_btn = None
 
+        self.__loading_dialog = None
+        self.__loading_progressbar = None
+
         self.__status_var = tk.StringVar(value="Ready.")
         ttk.Label(root, textvariable=self.__status_var, anchor=tk.W, relief=tk.SUNKEN, padding=(4, 2)).pack(
             side=tk.BOTTOM, fill=tk.X)
@@ -623,11 +627,44 @@ class ExperimentsGUI:
 
     def __on_search(self, query: dict):
         self.__pending_query = self.__reader.query_async(query)
+        self.__show_loading_dialog("Searching experiments...")
         self.__status_var.set("Searching...")
 
     def __on_list_all(self):
         self.__pending_query = self.__reader.list_all_async()
+        self.__show_loading_dialog("Loading all experiments...")
         self.__status_var.set("Loading all experiments...")
+
+    def __show_loading_dialog(self, message: str):
+        if self.__loading_dialog is not None and self.__loading_dialog.winfo_exists():
+            self.__hide_loading_dialog()
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Please Wait")
+        dialog.geometry("320x90")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text=message).pack(anchor=tk.W, pady=(0, 6))
+        self.__loading_progressbar = ttk.Progressbar(frame, mode="indeterminate")
+        self.__loading_progressbar.pack(fill=tk.X)
+        self.__loading_progressbar.start(10)
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.__loading_dialog = dialog
+
+    def __hide_loading_dialog(self):
+        if self.__loading_progressbar is not None:
+            self.__loading_progressbar.stop()
+        if self.__loading_dialog is not None and self.__loading_dialog.winfo_exists():
+            self.__loading_dialog.grab_release()
+            self.__loading_dialog.destroy()
+        self.__loading_dialog = None
+        self.__loading_progressbar = None
 
     def __on_selection_changed(self, record: RunRecord):
         self.__detail_frame.load_record(record)
@@ -739,6 +776,7 @@ class ExperimentsGUI:
             try:
                 status, result = self.__pending_query.get_nowait()
                 self.__pending_query = None
+                self.__hide_loading_dialog()
                 if status == "ok":
                     self.__results_frame.populate(result)
                     n = len(result)
@@ -801,6 +839,7 @@ class ExperimentsGUI:
         self.__dose_dialog = None
 
     def on_close(self):
+        self.__hide_loading_dialog()
         self.__reader.close()
         self.root.destroy()
 
