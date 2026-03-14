@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import os
 import time
 import threading
@@ -8,6 +8,7 @@ from queue import Queue, Empty
 from ipi_ecs.core import daemon
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader, RunRecord
 from chamber_ctl.subsystems.oscilloscope import DataReader, calculate_dose_of_experiment
+from ipi_ecs.util.export_experiment import export_experiment_data
 
 
 def _fmt_timestamp(ts) -> str:
@@ -244,7 +245,7 @@ class ResultsFrame(ttk.LabelFrame):
             show="headings",
             yscrollcommand=vsb.set,
             xscrollcommand=hsb.set,
-            selectmode="browse",
+            selectmode="extended",
         )
         vsb.config(command=self.__tree.yview)
         hsb.config(command=self.__tree.xview)
@@ -333,6 +334,14 @@ class ResultsFrame(ttk.LabelFrame):
         if not sel:
             return None
         return self.__records.get(sel[0])
+
+    def get_selected_records(self) -> list:
+        selected = []
+        for iid in self.__tree.selection():
+            rec = self.__records.get(iid)
+            if rec is not None:
+                selected.append(rec)
+        return selected
 
     def __on_select(self, _event):
         sel = self.__tree.selection()
@@ -571,6 +580,7 @@ class ExperimentsGUI:
         root.minsize(800, 500)
 
         self.__data_path = data_path
+        self.__exp_name = exp_name
         self.__reader = ExperimentReaderThread(data_path, exp_name)
         self.__pending_query: Queue = None
         self.__dose_recalc_queue: Queue = Queue()
@@ -583,6 +593,9 @@ class ExperimentsGUI:
         self.__dose_status_var = tk.StringVar(value="")
         self.__dose_info_var = tk.StringVar(value="")
         self.__dose_cancel_btn = None
+
+        self.__export_queue: Queue = Queue()
+        self.__export_worker = None
 
         self.__loading_dialog = None
         self.__loading_progressbar = None
@@ -602,6 +615,11 @@ class ExperimentsGUI:
 
         self.__actions_frame = ttk.Frame(left)
         self.__actions_frame.pack(fill=tk.X, padx=2, pady=(0, 4))
+        ttk.Button(
+            self.__actions_frame,
+            text="Export Experiments To...",
+            command=self.__on_export_selected_experiments,
+        ).pack(side=tk.LEFT, padx=2)
         ttk.Button(
             self.__actions_frame,
             text="Recalculate Selected Dose",
@@ -671,6 +689,51 @@ class ExperimentsGUI:
 
     def __on_record_saved(self, record: RunRecord):
         self.__results_frame.refresh_record(record)
+
+    def __on_export_selected_experiments(self):
+        records = self.__results_frame.get_selected_records()
+        if not records:
+            messagebox.showinfo("Export Experiments", "Select one or more experiments from the list first.")
+            return
+
+        if self.__export_worker is not None and self.__export_worker.is_alive():
+            messagebox.showinfo("Export Experiments", "An export is already in progress.")
+            return
+
+        target_dir = filedialog.askdirectory(title="Export Experiments To")
+        if not target_dir:
+            return
+
+        overwrite = messagebox.askyesno(
+            "Overwrite Existing?",
+            "Overwrite existing experiment folders if they already exist?",
+        )
+
+        run_ids = [record.get_state().get_uuid() for record in records]
+        self.__show_loading_dialog(f"Exporting {len(run_ids)} experiment(s)...")
+        self.__status_var.set(f"Exporting {len(run_ids)} experiment(s)...")
+
+        self.__export_worker = threading.Thread(
+            target=self.__export_selected_thread,
+            args=(run_ids, target_dir, overwrite),
+            daemon=True,
+        )
+        self.__export_worker.start()
+
+    def __export_selected_thread(self, run_ids: list, target_dir: str, overwrite: bool):
+        reader = ExperimentReader(self.__data_path, self.__exp_name)
+        errors = []
+        total = len(run_ids)
+
+        for idx, run_uuid in enumerate(run_ids, start=1):
+            try:
+                export_experiment_data(run_uuid, target_dir, reader, overwrite)
+                self.__export_queue.put(("progress", idx, total, run_uuid))
+            except Exception as e:
+                errors.append((run_uuid, str(e)))
+                self.__export_queue.put(("error", idx, total, run_uuid, str(e)))
+
+        self.__export_queue.put(("done", total, errors))
 
     def __on_recalculate_listed_doses(self):
         records = self.__results_frame.get_records()
@@ -828,6 +891,36 @@ class ExperimentsGUI:
                     if self.__dose_cancel_btn is not None and self.__dose_cancel_btn.winfo_exists():
                         self.__dose_cancel_btn.config(text="Close", state=tk.NORMAL)
                         self.__dose_cancel_btn.configure(command=self.__close_dose_dialog)
+        except Empty:
+            pass
+
+        try:
+            while True:
+                msg = self.__export_queue.get_nowait()
+                m_type = msg[0]
+
+                if m_type == "progress":
+                    _t, done, total, run_uuid = msg
+                    self.__status_var.set(f"Exported {done}/{total} experiments...")
+
+                elif m_type == "error":
+                    _t, done, total, run_uuid, err = msg
+                    self.__status_var.set(f"Export {done}/{total}: failed ...{str(run_uuid)[-8:]} ({err})")
+
+                elif m_type == "done":
+                    _t, total, errors = msg
+                    self.__hide_loading_dialog()
+                    if errors:
+                        self.__status_var.set(f"Export complete with errors: {total - len(errors)}/{total} succeeded.")
+                        first_uuid, first_err = errors[0]
+                        messagebox.showwarning(
+                            "Export Complete",
+                            f"Exported {total - len(errors)}/{total} experiments. "
+                            f"First error (...{str(first_uuid)[-8:]}): {first_err}",
+                        )
+                    else:
+                        self.__status_var.set(f"Export complete: {total}/{total} succeeded.")
+                        messagebox.showinfo("Export Complete", f"Exported {total} experiment(s).")
         except Empty:
             pass
 
