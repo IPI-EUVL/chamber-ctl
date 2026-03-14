@@ -7,7 +7,7 @@ import win32event
 import servicemanager
 
 from ipi_ecs.services.lifecycle_manager_service import LifecycleManagerService
-from chamber_ctl.subsystems import exposure_controller, oscilloscope, target_controller
+from chamber_ctl.subsystems import exposure_controller, laser, oscilloscope, target_controller
 from chamber_ctl.subsystems import uuids
 
 class ChamberLifecycleManagerService(LifecycleManagerService):
@@ -22,6 +22,7 @@ class ChamberLifecycleManagerService(LifecycleManagerService):
         self._lifecycle_manager.add_subsystem(uuids.UUID_EXPOSURE_CONTROLLER, exposure_controller.main)
         self._lifecycle_manager.add_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER, oscilloscope.main)
         self._lifecycle_manager.add_subsystem(uuids.UUID_TARGET_CONTROLLER, target_controller.main)
+        self._lifecycle_manager.add_subsystem(uuids.UUID_LASER_CONTROLLER, laser.main)
 
 def main():
     if len(sys.argv) == 1:
