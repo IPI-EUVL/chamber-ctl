@@ -15,7 +15,7 @@ import ipi_ecs.dds.magics as magics
 import ipi_ecs.dds.subsystem as subsystem
 import ipi_ecs.dds.types as types
 from ipi_ecs.logging.client import LogClient
-from ipi_ecs.cli.captive_cli import wait_for, wait_for_event
+from ipi_ecs.cli.captive_cli import wait_for
 
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.laser import LaserSyncStatus
@@ -35,12 +35,21 @@ class LaserSyncTestGUI:
 
         self.__preinit_phase_kv = None
         self.__target_phase_kv = None
+        self.__initial_phase_kv = None
+        self.__skew_rate_kv = None
+        self.__laser_warmup_time_kv = None
+        self.__chopper_startup_time_kv = None
         self.__status_kv = None
         self.__exp_state_kv = None
 
         self.__preinit_event = None
         self.__init_event = None
         self.__stop_event = None
+        self.__laser_on_event = None
+        self.__laser_off_event = None
+        self.__chopper_on_event = None
+        self.__chopper_off_event = None
+        self.__set_phase_event = None
 
         self.__current_status = None
         self.__ui_queue = queue.Queue()
@@ -48,6 +57,13 @@ class LaserSyncTestGUI:
 
         self.__preinit_phase_value = 0.0
         self.__target_phase_value = 0.0
+        self.__initial_phase_value = 0.0
+        self.__skew_rate_value = 1.0
+        self.__laser_warmup_time_value = 5.0
+        self.__chopper_startup_time_value = 5.0
+
+        self.__progress_dialog = None
+        self.__progress_text = None
 
         self.__build_ui(root)
         self.__setup_client()
@@ -92,12 +108,54 @@ class LaserSyncTestGUI:
 
         tk.Button(phase_frame, text="Set Target Phase", command=self.__on_set_target_phase).grid(row=1, column=2, padx=8, pady=8)
 
+        tk.Label(phase_frame, text="Initial Phase", font=("Arial", 11)).grid(row=2, column=0, padx=8, pady=8, sticky="w")
+        self.__initial_phase_entry = tk.Entry(phase_frame, width=16)
+        self.__initial_phase_entry.insert(0, "0.0")
+        self.__initial_phase_entry.grid(row=2, column=1, padx=8, pady=8, sticky="w")
+
+        tk.Button(phase_frame, text="Set Initial Phase", command=self.__on_set_initial_phase).grid(row=2, column=2, padx=8, pady=8)
+
+        tuning_frame = tk.LabelFrame(frame, text="Timing / Motion Config")
+        tuning_frame.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(tuning_frame, text="Skew Rate (deg/s)", font=("Arial", 11)).grid(row=0, column=0, padx=8, pady=8, sticky="w")
+        self.__skew_rate_entry = tk.Entry(tuning_frame, width=16)
+        self.__skew_rate_entry.insert(0, "1.0")
+        self.__skew_rate_entry.grid(row=0, column=1, padx=8, pady=8, sticky="w")
+        tk.Button(tuning_frame, text="Set Skew Rate", command=self.__on_set_skew_rate).grid(row=0, column=2, padx=8, pady=8)
+
+        tk.Label(tuning_frame, text="Laser Warmup (s)", font=("Arial", 11)).grid(row=1, column=0, padx=8, pady=8, sticky="w")
+        self.__laser_warmup_entry = tk.Entry(tuning_frame, width=16)
+        self.__laser_warmup_entry.insert(0, "5.0")
+        self.__laser_warmup_entry.grid(row=1, column=1, padx=8, pady=8, sticky="w")
+        tk.Button(tuning_frame, text="Set Laser Warmup", command=self.__on_set_laser_warmup_time).grid(row=1, column=2, padx=8, pady=8)
+
+        tk.Label(tuning_frame, text="Chopper Startup (s)", font=("Arial", 11)).grid(row=2, column=0, padx=8, pady=8, sticky="w")
+        self.__chopper_startup_entry = tk.Entry(tuning_frame, width=16)
+        self.__chopper_startup_entry.insert(0, "5.0")
+        self.__chopper_startup_entry.grid(row=2, column=1, padx=8, pady=8, sticky="w")
+        tk.Button(tuning_frame, text="Set Chopper Startup", command=self.__on_set_chopper_startup_time).grid(row=2, column=2, padx=8, pady=8)
+
         control_frame = tk.LabelFrame(frame, text="Isolated Control")
         control_frame.pack(fill=tk.X, pady=(8, 8))
 
         tk.Button(control_frame, text="Preinit", width=14, command=self.__on_preinit).grid(row=0, column=0, padx=8, pady=8)
         tk.Button(control_frame, text="Init", width=14, command=self.__on_init).grid(row=0, column=1, padx=8, pady=8)
         tk.Button(control_frame, text="Stop", width=14, command=self.__on_stop).grid(row=0, column=2, padx=8, pady=8)
+
+        manual_frame = tk.LabelFrame(frame, text="Manual Test Control")
+        manual_frame.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Button(manual_frame, text="Laser ON", width=14, command=self.__on_laser_on).grid(row=0, column=0, padx=8, pady=8)
+        tk.Button(manual_frame, text="Laser OFF", width=14, command=self.__on_laser_off).grid(row=0, column=1, padx=8, pady=8)
+        tk.Button(manual_frame, text="Chopper ON", width=14, command=self.__on_chopper_on).grid(row=0, column=2, padx=8, pady=8)
+        tk.Button(manual_frame, text="Chopper OFF", width=14, command=self.__on_chopper_off).grid(row=0, column=3, padx=8, pady=8)
+
+        tk.Label(manual_frame, text="Manual Target Phase", font=("Arial", 11)).grid(row=1, column=0, padx=8, pady=8, sticky="w")
+        self.__manual_phase_entry = tk.Entry(manual_frame, width=16)
+        self.__manual_phase_entry.insert(0, "0.0")
+        self.__manual_phase_entry.grid(row=1, column=1, padx=8, pady=8, sticky="w")
+        tk.Button(manual_frame, text="Set Manual Target", command=self.__on_set_manual_phase).grid(row=1, column=2, padx=8, pady=8)
 
         status_frame = tk.LabelFrame(frame, text="Laser Status")
         status_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -111,8 +169,11 @@ class LaserSyncTestGUI:
         self.__phase_label = tk.Label(status_frame, text="Phase: current=N/A target=N/A", font=("Arial", 12))
         self.__phase_label.pack(anchor="w", padx=8, pady=(4, 0))
 
-        self.__configured_label = tk.Label(status_frame, text="Configured: preinit=0.0 target=0.0", font=("Arial", 12))
+        self.__configured_label = tk.Label(status_frame, text="Configured: preinit=0.0 target=0.0 initial=0.0", font=("Arial", 12))
         self.__configured_label.pack(anchor="w", padx=8, pady=(4, 0))
+
+        self.__timing_label = tk.Label(status_frame, text="Timing: skew=1.000 warmup=5.000 startup=5.000", font=("Arial", 12))
+        self.__timing_label.pack(anchor="w", padx=8, pady=(4, 0))
 
         self.__result_label = tk.Label(status_frame, text="Last action: none", font=("Arial", 11))
         self.__result_label.pack(anchor="w", padx=8, pady=(12, 8))
@@ -147,6 +208,22 @@ class LaserSyncTestGUI:
             uuids.UUID_LASER_CONTROLLER,
             subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"target_phase", False, True, True),
         )
+        self.__initial_phase_kv = handle.add_remote_kv(
+            uuids.UUID_LASER_CONTROLLER,
+            subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"initial_phase", False, True, True),
+        )
+        self.__skew_rate_kv = handle.add_remote_kv(
+            uuids.UUID_LASER_CONTROLLER,
+            subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"skew_rate", False, True, True),
+        )
+        self.__laser_warmup_time_kv = handle.add_remote_kv(
+            uuids.UUID_LASER_CONTROLLER,
+            subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"laser_warmup_time", False, True, True),
+        )
+        self.__chopper_startup_time_kv = handle.add_remote_kv(
+            uuids.UUID_LASER_CONTROLLER,
+            subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"chopper_startup_time", False, True, True),
+        )
         self.__status_kv = handle.add_remote_kv(
             uuids.UUID_LASER_CONTROLLER,
             subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"status", True, True, False),
@@ -161,6 +238,11 @@ class LaserSyncTestGUI:
         self.__preinit_event = handle.add_event_provider(b"laser_test_preinit")
         self.__init_event = handle.add_event_provider(b"laser_test_init")
         self.__stop_event = handle.add_event_provider(b"laser_test_stop")
+        self.__laser_on_event = handle.add_event_provider(b"laser_test_laser_on")
+        self.__laser_off_event = handle.add_event_provider(b"laser_test_laser_off")
+        self.__chopper_on_event = handle.add_event_provider(b"laser_test_chopper_on")
+        self.__chopper_off_event = handle.add_event_provider(b"laser_test_chopper_off")
+        self.__set_phase_event = handle.add_event_provider(b"laser_test_set_phase")
 
         self.__connected = True
         self.__ui_queue.put(("connected", None))
@@ -187,6 +269,14 @@ class LaserSyncTestGUI:
                     self.__set_phase_kv(self.__preinit_phase_kv, payload, "preinit")
                 elif cmd == "set_target_phase":
                     self.__set_phase_kv(self.__target_phase_kv, payload, "target")
+                elif cmd == "set_initial_phase":
+                    self.__set_phase_kv(self.__initial_phase_kv, payload, "initial")
+                elif cmd == "set_skew_rate":
+                    self.__set_tuning_kv(self.__skew_rate_kv, payload, "skew_rate")
+                elif cmd == "set_laser_warmup_time":
+                    self.__set_tuning_kv(self.__laser_warmup_time_kv, payload, "laser_warmup_time")
+                elif cmd == "set_chopper_startup_time":
+                    self.__set_tuning_kv(self.__chopper_startup_time_kv, payload, "chopper_startup_time")
                 elif cmd == "preinit":
                     self.__call_preinit()
                 elif cmd == "init":
@@ -197,6 +287,16 @@ class LaserSyncTestGUI:
                     self.__refresh_phase_values()
                 elif cmd == "read_exp_state":
                     self.__read_exp_state()
+                elif cmd == "laser_on":
+                    self.__call_simple_test_event(self.__laser_on_event, "Laser ON")
+                elif cmd == "laser_off":
+                    self.__call_simple_test_event(self.__laser_off_event, "Laser OFF")
+                elif cmd == "chopper_on":
+                    self.__call_simple_test_event(self.__chopper_on_event, "Chopper ON")
+                elif cmd == "chopper_off":
+                    self.__call_simple_test_event(self.__chopper_off_event, "Chopper OFF")
+                elif cmd == "set_manual_phase":
+                    self.__call_set_manual_target(payload)
             except Exception as exc:
                 self.__ui_queue.put(("result", f"Action failed: {exc}"))
 
@@ -210,53 +310,120 @@ class LaserSyncTestGUI:
 
         if label == "preinit":
             self.__preinit_phase_value = float(value)
-        else:
+        elif label == "target":
             self.__target_phase_value = float(value)
+        else:
+            self.__initial_phase_value = float(value)
 
-        self.__ui_queue.put(("configured", (self.__preinit_phase_value, self.__target_phase_value)))
+        self.__ui_queue.put(("configured", (self.__preinit_phase_value, self.__target_phase_value, self.__initial_phase_value)))
         self.__ui_queue.put(("result", f"Set {label} phase to {value:.3f}"))
+
+    def __set_tuning_kv(self, kv, value: float, label: str):
+        if kv is None:
+            self.__ui_queue.put(("result", "Not connected to laser subsystem."))
+            return
+
+        awaiter = kv.try_set(float(value))
+        wait_for(awaiter, timeout=5.0)
+
+        if label == "skew_rate":
+            self.__skew_rate_value = float(value)
+            msg = f"Set skew rate to {value:.3f}"
+        elif label == "laser_warmup_time":
+            self.__laser_warmup_time_value = float(value)
+            msg = f"Set laser warmup time to {value:.3f}"
+        else:
+            self.__chopper_startup_time_value = float(value)
+            msg = f"Set chopper startup time to {value:.3f}"
+
+        self.__ui_queue.put(("timing", (self.__skew_rate_value, self.__laser_warmup_time_value, self.__chopper_startup_time_value)))
+        self.__ui_queue.put(("result", msg))
 
     def __call_preinit(self):
         if self.__preinit_event is None:
             self.__ui_queue.put(("result", "Preinit event provider not available."))
             return
 
-        awaiter = self.__preinit_event.call(bytes(), [uuids.UUID_LASER_CONTROLLER]).after()
-        r_value, _r_state, r_reason = wait_for_event(awaiter, uuids.UUID_LASER_CONTROLLER, timeout=30.0)
-
-        if r_value is None or not r_value.startswith(magics.OP_OK):
-            self.__ui_queue.put(("result", f"Preinit failed: {r_reason}"))
-            return
-
-        self.__ui_queue.put(("result", "Preinit complete."))
+        self.__run_event_with_feedback(self.__preinit_event, "Preinit", payload=bytes(), timeout=45.0)
 
     def __call_init(self):
         if self.__init_event is None:
             self.__ui_queue.put(("result", "Init event provider not available."))
             return
 
-        awaiter = self.__init_event.call(bytes(), [uuids.UUID_LASER_CONTROLLER]).after()
-        r_value, _r_state, r_reason = wait_for_event(awaiter, uuids.UUID_LASER_CONTROLLER, timeout=30.0)
-
-        if r_value is None or not r_value.startswith(magics.OP_OK):
-            self.__ui_queue.put(("result", f"Init failed: {r_reason}"))
-            return
-
-        self.__ui_queue.put(("result", "Init complete."))
+        self.__run_event_with_feedback(self.__init_event, "Init", payload=bytes(), timeout=45.0)
 
     def __call_stop(self):
         if self.__stop_event is None:
             self.__ui_queue.put(("result", "Stop event provider not available."))
             return
 
-        awaiter = self.__stop_event.call(bytes(), [uuids.UUID_LASER_CONTROLLER]).after()
-        r_value, _r_state, r_reason = wait_for_event(awaiter, uuids.UUID_LASER_CONTROLLER, timeout=15.0)
+        self.__run_event_with_feedback(self.__stop_event, "Stop", payload=bytes(), timeout=30.0)
 
-        if r_value is None or not r_value.startswith(magics.OP_OK):
-            self.__ui_queue.put(("result", f"Stop failed: {r_reason}"))
+    def __call_simple_test_event(self, event_provider, label: str):
+        if event_provider is None:
+            self.__ui_queue.put(("result", f"{label} event provider not available."))
             return
 
-        self.__ui_queue.put(("result", "Stop complete."))
+        self.__run_event_with_feedback(event_provider, label, payload=bytes(), timeout=30.0)
+
+    def __call_set_manual_target(self, phase: float):
+        if self.__set_phase_event is None:
+            self.__ui_queue.put(("result", "Set manual target event provider not available."))
+            return
+
+        payload = pickle.dumps(float(phase))
+        self.__run_event_with_feedback(self.__set_phase_event, f"Set manual target {phase:.3f}", payload=payload, timeout=30.0)
+
+    @staticmethod
+    def __decode_result_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            if value.startswith(magics.OP_OK):
+                value = value[len(magics.OP_OK):]
+            elif value.startswith(magics.OP_IN_PROGRESS):
+                value = value[len(magics.OP_IN_PROGRESS):]
+            return value.decode("utf-8", errors="replace").strip()
+        return str(value).strip()
+
+    def __run_event_with_feedback(self, event_provider, label: str, payload: bytes, timeout: float):
+        handle = event_provider.call(payload, [uuids.UUID_LASER_CONTROLLER])
+        if handle is None:
+            self.__ui_queue.put(("result", f"{label} failed: request could not be sent."))
+            return
+
+        self.__ui_queue.put(("progress_open", f"{label} in progress..."))
+
+        try:
+            begin = time.monotonic()
+            last_feedback = None
+
+            while handle.is_in_progress() and (time.monotonic() - begin) < timeout:
+                state = handle.get_state(uuids.UUID_LASER_CONTROLLER)
+                result = handle.get_result(uuids.UUID_LASER_CONTROLLER)
+                if state == client.EVENT_IN_PROGRESS:
+                    feedback = self.__decode_result_text(result)
+                    if feedback and feedback != last_feedback:
+                        last_feedback = feedback
+                        self.__ui_queue.put(("progress_update", feedback))
+                time.sleep(0.1)
+        finally:
+            self.__ui_queue.put(("progress_close", None))
+
+        if handle.is_in_progress():
+            self.__ui_queue.put(("result", f"{label} failed: timed out after {timeout:.0f}s."))
+            return
+
+        state = handle.get_state(uuids.UUID_LASER_CONTROLLER)
+        result = handle.get_result(uuids.UUID_LASER_CONTROLLER)
+        msg = self.__decode_result_text(result)
+
+        if state == client.EVENT_OK:
+            self.__ui_queue.put(("result", msg if msg else f"{label} complete."))
+            return
+
+        self.__ui_queue.put(("result", f"{label} failed: {msg if msg else 'unknown error.'}"))
 
     def __refresh_phase_values(self):
         if self.__preinit_phase_kv is not None:
@@ -269,7 +436,28 @@ class LaserSyncTestGUI:
             if t_val is not None:
                 self.__target_phase_value = t_val
 
-        self.__ui_queue.put(("configured", (self.__preinit_phase_value, self.__target_phase_value)))
+        if self.__initial_phase_kv is not None:
+            i_val, _, _ = wait_for(self.__initial_phase_kv.try_get(), timeout=5.0)
+            if i_val is not None:
+                self.__initial_phase_value = i_val
+
+        if self.__skew_rate_kv is not None:
+            skew, _, _ = wait_for(self.__skew_rate_kv.try_get(), timeout=5.0)
+            if skew is not None:
+                self.__skew_rate_value = skew
+
+        if self.__laser_warmup_time_kv is not None:
+            warmup, _, _ = wait_for(self.__laser_warmup_time_kv.try_get(), timeout=5.0)
+            if warmup is not None:
+                self.__laser_warmup_time_value = warmup
+
+        if self.__chopper_startup_time_kv is not None:
+            startup, _, _ = wait_for(self.__chopper_startup_time_kv.try_get(), timeout=5.0)
+            if startup is not None:
+                self.__chopper_startup_time_value = startup
+
+        self.__ui_queue.put(("configured", (self.__preinit_phase_value, self.__target_phase_value, self.__initial_phase_value)))
+        self.__ui_queue.put(("timing", (self.__skew_rate_value, self.__laser_warmup_time_value, self.__chopper_startup_time_value)))
 
     def __read_exp_state(self):
         if self.__exp_state_kv is None:
@@ -294,14 +482,23 @@ class LaserSyncTestGUI:
                 self.__current_status = payload
                 self.__render_status(payload)
             elif msg == "configured":
-                p_val, t_val = payload
-                self.__configured_label.config(text=f"Configured: preinit={p_val:.3f} target={t_val:.3f}")
+                p_val, t_val, i_val = payload
+                self.__configured_label.config(text=f"Configured: preinit={p_val:.3f} target={t_val:.3f} initial={i_val:.3f}")
+            elif msg == "timing":
+                skew, warmup, startup = payload
+                self.__timing_label.config(text=f"Timing: skew={skew:.3f} warmup={warmup:.3f} startup={startup:.3f}")
             elif msg == "result":
                 self.__result_label.config(text=f"Last action: {payload}")
             elif msg == "exp_state":
                 ok, reason = payload
                 status = "IN-PROGRESS" if ok else "IDLE"
                 self.__exp_state_label.config(text=f"Experiment State: {status} ({reason})")
+            elif msg == "progress_open":
+                self.__show_progress_dialog(payload)
+            elif msg == "progress_update":
+                self.__update_progress_dialog(payload)
+            elif msg == "progress_close":
+                self.__close_progress_dialog()
 
         if self.__run:
             self.__root.after(100, self.__ui_tick)
@@ -345,6 +542,42 @@ class LaserSyncTestGUI:
 
         self.__cmd_queue.put(("set_target_phase", value))
 
+    def __on_set_initial_phase(self):
+        try:
+            value = float(self.__initial_phase_entry.get().strip())
+        except ValueError:
+            self.__result_label.config(text="Last action: invalid initial phase value")
+            return
+
+        self.__cmd_queue.put(("set_initial_phase", value))
+
+    def __on_set_skew_rate(self):
+        try:
+            value = float(self.__skew_rate_entry.get().strip())
+        except ValueError:
+            self.__result_label.config(text="Last action: invalid skew rate value")
+            return
+
+        self.__cmd_queue.put(("set_skew_rate", value))
+
+    def __on_set_laser_warmup_time(self):
+        try:
+            value = float(self.__laser_warmup_entry.get().strip())
+        except ValueError:
+            self.__result_label.config(text="Last action: invalid laser warmup value")
+            return
+
+        self.__cmd_queue.put(("set_laser_warmup_time", value))
+
+    def __on_set_chopper_startup_time(self):
+        try:
+            value = float(self.__chopper_startup_entry.get().strip())
+        except ValueError:
+            self.__result_label.config(text="Last action: invalid chopper startup value")
+            return
+
+        self.__cmd_queue.put(("set_chopper_startup_time", value))
+
     def __on_preinit(self):
         self.__cmd_queue.put(("preinit", None))
 
@@ -354,11 +587,34 @@ class LaserSyncTestGUI:
     def __on_stop(self):
         self.__cmd_queue.put(("stop", None))
 
+    def __on_laser_on(self):
+        self.__cmd_queue.put(("laser_on", None))
+
+    def __on_laser_off(self):
+        self.__cmd_queue.put(("laser_off", None))
+
+    def __on_chopper_on(self):
+        self.__cmd_queue.put(("chopper_on", None))
+
+    def __on_chopper_off(self):
+        self.__cmd_queue.put(("chopper_off", None))
+
+    def __on_set_manual_phase(self):
+        try:
+            value = float(self.__manual_phase_entry.get().strip())
+        except ValueError:
+            self.__result_label.config(text="Last action: invalid manual target phase value")
+            return
+
+        self.__cmd_queue.put(("set_manual_phase", value))
+
     def ok(self):
         return self.__run and self.__client.ok() and self.__daemon.is_ok()
 
     def close(self):
         self.__run = False
+
+        self.__close_progress_dialog()
 
         if self.__daemon is not None:
             self.__daemon.stop()
@@ -368,6 +624,39 @@ class LaserSyncTestGUI:
 
         if self.__logger_sock is not None:
             self.__logger_sock.close()
+
+    def __show_progress_dialog(self, text: str):
+        if self.__progress_dialog is None:
+            dialog = tk.Toplevel(self.__root)
+            dialog.title("Laser Sync Progress")
+            dialog.geometry("460x120")
+            dialog.transient(self.__root)
+            dialog.grab_set()
+            dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            self.__progress_text = tk.StringVar(value=text)
+            label = tk.Label(dialog, textvariable=self.__progress_text, font=("Arial", 11), wraplength=430, justify="left")
+            label.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+            self.__progress_dialog = dialog
+            return
+
+        self.__update_progress_dialog(text)
+
+    def __update_progress_dialog(self, text: str):
+        if self.__progress_dialog is None or self.__progress_text is None:
+            return
+        self.__progress_text.set(text)
+
+    def __close_progress_dialog(self):
+        if self.__progress_dialog is None:
+            return
+        try:
+            self.__progress_dialog.grab_release()
+        except tk.TclError:
+            pass
+        self.__progress_dialog.destroy()
+        self.__progress_dialog = None
+        self.__progress_text = None
 
 
 def main(_args: argparse.Namespace):

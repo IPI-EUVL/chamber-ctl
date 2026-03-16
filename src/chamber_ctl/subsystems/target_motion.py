@@ -557,3 +557,6 @@ class TargetMotion:
 
     def is_homing(self):
         pass
+
+    def stop(self):
+        pass

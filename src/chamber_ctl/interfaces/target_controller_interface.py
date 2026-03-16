@@ -1,10 +1,8 @@
 import argparse
-import contextlib
-import io
 import sys
 import time
 import uuid
-from typing import Dict, Iterable, Set
+from typing import Iterable
 
 from chamber_ctl.subsystems.target_controller import TargetMotionControllerState, MotionState, TargetMotionProfile, MotionSegment, TargetMotionConfig
 import mt_events
@@ -17,11 +15,6 @@ import ipi_ecs.dds.subsystem as subsystem
 import ipi_ecs.dds.types as types
 from ipi_ecs.cli.captive_cli import CaptiveCLITemplate, wait_for, wait_for_event
 from ipi_ecs.logging.client import LogClient
-from ipi_ecs.cli.commands.keyboard_jog import (
-    JogWriteClient,
-    KeyPoller,
-    vector_from_keys,
-)
 
 from chamber_ctl.subsystems.uuids import UUID_TARGET_CONTROLLER
 
@@ -48,6 +41,15 @@ class TargetClient:
 
         self.__status_kv = None
         self.__profile_kv = None
+        self.__jog_kv = None
+
+        self.__start_event_sender = None
+        self.__stop_event_sender = None
+        self.__set_start_event_sender = None
+        self.__set_offset_here_event_sender = None
+        self.__clear_offset_event_sender = None
+        self.__home_event_sender = None
+        self.__set_position_event_sender = None
 
         def _on_ready():
             if self.__did_config:
@@ -71,17 +73,36 @@ class TargetClient:
         self.__status_kv.on_new_data_received(self.__on_status_update)
 
         self.__profile_kv = handle.add_remote_kv(UUID_TARGET_CONTROLLER, subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"profile", False, True, True))
+        self.__jog_kv = handle.add_remote_kv(
+            UUID_TARGET_CONTROLLER,
+            subsystem.KVDescriptor(
+                types.VectorTypeSpecifier(types.FloatTypeSpecifier(), 2),
+                b"jog",
+                True,
+                True,
+                True,
+            ),
+        )
 
         self.__start_event_sender = handle.add_event_provider(b"start_target_motion")
         self.__stop_event_sender = handle.add_event_provider(b"stop_target_motion")
         self.__set_start_event_sender = handle.add_event_provider(b"set_target_start")
+        self.__set_offset_here_event_sender = handle.add_event_provider(b"set_target_offset_here")
+        self.__clear_offset_event_sender = handle.add_event_provider(b"clear_target_offset")
         self.__home_event_sender = handle.add_event_provider(b"home_target")
         self.__set_position_event_sender = handle.add_event_provider(b"set_target_position")
         self.__set_position_event_sender.set_types(types.FloatTypeSpecifier(), types.ByteTypeSpecifier())
 
     def __on_status_update(self, n_status: bytes):
-        self.__current_state = TargetMotionControllerState.decode(n_status[0])
-        self.__motion_state = MotionState.decode(n_status[1])
+        if n_status is None or len(n_status) < 2:
+            return
+
+        try:
+            self.__current_state = TargetMotionControllerState.decode(n_status[0])
+            self.__motion_state = MotionState.decode(n_status[1])
+        except (TypeError, ValueError, IndexError):
+            self.__current_state = None
+            self.__motion_state = None
 
     def get_state(self) -> TargetMotionControllerState:
         return self.__current_state
@@ -91,19 +112,31 @@ class TargetClient:
 
     def get_profile(self) -> TargetMotionProfile:
         if self.__profile_kv is not None:
-            b_profile_data, b_config_data = segment_bytes.decode(self.__profile_kv.value)
+            if self.__profile_kv.value is None:
+                return None
 
-            if b_profile_data is not None:
-                return TargetMotionProfile.decode(b_profile_data)
+            try:
+                b_profile_data, b_config_data = segment_bytes.decode(self.__profile_kv.value)
+
+                if b_profile_data is not None:
+                    return TargetMotionProfile.decode(b_profile_data)
+            except (TypeError, ValueError, IndexError):
+                return None
             
         return None
     
     def get_config(self) -> TargetMotionConfig:
         if self.__profile_kv is not None:
-            b_profile_data, b_config_data = segment_bytes.decode(self.__profile_kv.value)
+            if self.__profile_kv.value is None:
+                return None
 
-            if b_config_data is not None:
-                return TargetMotionConfig.decode(b_config_data)
+            try:
+                b_profile_data, b_config_data = segment_bytes.decode(self.__profile_kv.value)
+
+                if b_config_data is not None:
+                    return TargetMotionConfig.decode(b_config_data)
+            except (TypeError, ValueError, IndexError):
+                return None
             
         return None
     
@@ -142,6 +175,107 @@ class TargetClient:
             return self.__home_event_sender.call(bytes(), []).after()
         
         return None
+
+    def set_jog(self, lin_speed: float, rot_speed: float) -> bool:
+        if self.__jog_kv is None:
+            return False
+
+        awaiter = self.__jog_kv.try_set([float(lin_speed), float(rot_speed)])
+        if awaiter is None:
+            return False
+
+        value, state, reason = wait_for(awaiter, 2.0)
+        return value == magics.OP_OK
+
+    def stop_jog(self) -> bool:
+        return self.set_jog(0.0, 0.0)
+
+    def set_offset_here(self):
+        if self.__set_offset_here_event_sender is not None:
+            return self.__set_offset_here_event_sender.call(bytes(), []).after()
+
+        return None
+
+    def clear_offset(self):
+        if self.__clear_offset_event_sender is not None:
+            return self.__clear_offset_event_sender.call(bytes(), []).after()
+
+        return None
+
+    def set_start_here(self):
+        return self.set_start_position()
+
+    def get_offset(self) -> tuple[float, float]:
+        state = self.get_state()
+        if state is None:
+            return 0.0, 0.0
+        if hasattr(state, "offset_position"):
+            return state.offset_position
+        return 0.0, 0.0
+
+    def is_connected(self) -> bool:
+        return self.__subsystem is not None and self.ok()
+
+    def wait_until_connected(self, timeout: float = 5.0) -> bool:
+        begin = time.monotonic()
+        while self.ok() and (time.monotonic() - begin) < timeout:
+            if self.__subsystem is not None:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def goto_position(
+        self,
+        l_pos: float,
+        r_pos: float,
+        l_speed: float,
+        r_speed: float,
+        timeout: float = 30.0,
+        l_tolerance: float = 0.05,
+        r_tolerance: float = 0.01,
+        poll_interval: float = 0.1,
+    ) -> tuple[bool, str]:
+        if l_speed < 0.0 or r_speed < 0.0:
+            return False, "Speeds must be non-negative."
+
+        if not self.wait_until_connected(timeout=min(timeout, 5.0)):
+            return False, "Target controller is not connected."
+
+        if self.__jog_kv is None:
+            return False, "Jog control is unavailable."
+
+        begin = time.monotonic()
+
+        while self.ok() and (time.monotonic() - begin) < timeout:
+            state = self.get_state()
+            if state is None:
+                time.sleep(poll_interval)
+                continue
+
+            cur_l, cur_r = state.position
+
+            err_l = l_pos - cur_l
+            err_r = r_pos - cur_r
+
+            if abs(err_l) <= l_tolerance and abs(err_r) <= r_tolerance:
+                self.stop_jog()
+                return True, "Reached target position."
+
+            cmd_l = 0.0
+            if l_speed > 0.0:
+                cmd_l = max(-l_speed, min(l_speed, err_l / max(poll_interval, 1e-6)))
+
+            cmd_r = 0.0
+            if r_speed > 0.0:
+                cmd_r = max(-r_speed, min(r_speed, err_r / max(poll_interval, 1e-6)))
+
+            if not self.set_jog(cmd_l, cmd_r):
+                return False, "Failed to write jog command."
+
+            time.sleep(poll_interval)
+
+        self.stop_jog()
+        return False, "Timed out before reaching target position."
 
     def ok(self):
         return self.__run and self.__client.ok()
@@ -195,7 +329,7 @@ class TargetClientCLI(CaptiveCLITemplate):
         print("Homing target...")
         awaiter = self.__t_client.home()
 
-        r_value, r_state, r_reason = wait_for_event(awaiter, UUID_TARGET_CONTROLLER, args.timeout)
+        r_value, r_state, r_reason = wait_for_event(awaiter, UUID_TARGET_CONTROLLER, 180.0)
 
         if r_value is None or not r_value.startswith(magics.OP_OK):
             print(f"Failed to home target: {r_reason}")
@@ -226,7 +360,24 @@ class TargetClientCLI(CaptiveCLITemplate):
             print(f"Failed to stop motion: {r_reason}")
 
     def __goto_position(self, args: argparse.Namespace):
-        pass
+        print(
+            f"Moving to position L={args.l_pos:.3f}, R={args.r_pos:.3f} "
+            f"at max speeds L={args.l_speed:.3f}, R={args.r_speed:.3f}..."
+        )
+
+        ok, reason = self.__t_client.goto_position(
+            l_pos=args.l_pos,
+            r_pos=args.r_pos,
+            l_speed=args.l_speed,
+            r_speed=args.r_speed,
+            timeout=args.timeout,
+        )
+
+        if ok:
+            print("Move complete.")
+            return
+
+        print(f"Move failed: {reason}")
 
     def __set_current_position(self, args: argparse.Namespace):
         position = args.position

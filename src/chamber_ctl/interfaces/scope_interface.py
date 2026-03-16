@@ -17,13 +17,12 @@ from matplotlib import colors as mpl_colors
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.ticker import FuncFormatter
 
-from scipy import signal
 from datetime import datetime
 
 from ipi_ecs.core.daemon import StopFlag, Daemon
 from ipi_ecs.core.tcp import TCPClientSocket
 
-from chamber_ctl.subsystems.oscilloscope import OscilloscopeStream, DummyOscilloscope
+from chamber_ctl.subsystems.oscilloscope import OscilloscopeStream, DummyOscilloscope, ScopeReader
 
 class PhosphorScopeTk:
     def __init__(
@@ -217,12 +216,12 @@ if __name__ == "__main__":
         tlim=(-0e-6, 10e-6),
         vlim=(-0.5, 1.0),
         grid_shape=(200, 500),
-        decay=0.98,
+        decay=0.90,
         gain=0.8,
         update_ms=20,
     )
 
-    scope = DummyOscilloscope()
+    scope = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
 
     daemon = Daemon()
     daemon.add(__update_thread, phosphor=phosphor, scope=scope)
@@ -232,6 +231,7 @@ if __name__ == "__main__":
 
     try:
         scope.start()
+        scope.set_active(True)
         root.mainloop()
     finally:
         scope.close()

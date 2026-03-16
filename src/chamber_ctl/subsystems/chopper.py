@@ -2,7 +2,6 @@ from math import floor
 import multiprocessing
 import os
 import pickle
-import queue
 import struct
 import time
 import uuid
@@ -156,8 +155,6 @@ class TargetMotionController:
         #self.__motion = MockTargetMotion(self.__config)
         self.__start_l = 0.0
         self.__start_r = 0.0
-        self.__offset_l = 0.0
-        self.__offset_r = 0.0
 
         self.__jog_speed = (0.0, 0.0)
         self.__is_running = False
@@ -193,8 +190,7 @@ class TargetMotionController:
 
                 l_c, r_c = self.__state.get_current_position()
                 print(f"Path start position: ({l_c:.3f}, {r_c:.3f})")
-                eff_start_l, eff_start_r = self.__effective_start()
-                t_l, t_r = l_c + eff_start_l, r_c + eff_start_r
+                t_l, t_r = l_c + self.__start_l, r_c + self.__start_r
 
                 print(f"Moving to position: ({t_l:.3f}, {t_r:.3f}) from current position: {self.__motion.get_position()}")
 
@@ -217,16 +213,13 @@ class TargetMotionController:
         #print(f"Current position: {self.__motion.get_position()[0] - self.__start_l}, {self.__motion.get_position()[1] - self.__start_r}")
         #print(f"Current time: {self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment():.3f}s until end of segment")
         
-        eff_start_l, eff_start_r = self.__effective_start()
-        self.__motion.move_to_position(t_l + eff_start_l, t_r + eff_start_r, v_l, v_r)
+        self.__motion.move_to_position(t_l + self.__start_l, t_r + self.__start_r, v_l, v_r)
 
-        if (abs(t_l - (self.__motion.get_position()[0] - eff_start_l)) > 1e-2 and v_l == 0) or (abs(t_r - (self.__motion.get_position()[1] - eff_start_r)) > 1e-2 and v_r == 0):
-            print(f"Warning: motion command with zero velocity but not at target! target=({t_l:.3f}, {t_r:.3f}) current=({self.__motion.get_position()[0] - eff_start_l:.3f}, {self.__motion.get_position()[1] - eff_start_r:.3f})")
-            return
-            #assert False, "Motion command with zero velocity but not at target!"
+        if (abs(t_l - (self.__motion.get_position()[0] - self.__start_l)) > 1e-2 and v_l == 0) or (abs(t_r - (self.__motion.get_position()[1] - self.__start_r)) > 1e-2 and v_r == 0):
+            assert False, "Motion command with zero velocity but not at target!"
 
         l_pos, r_pos = self.__motion.get_position()
-        self.__state.update_position(l_pos - eff_start_l, r_pos - eff_start_r)
+        self.__state.update_position(l_pos - self.__start_l, r_pos - self.__start_r)
 
         #print(f"Motion Profile @ time={self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment()} pos=({l_pos:.3f}, {r_pos:.3f})")
 
@@ -256,8 +249,6 @@ class TargetMotionController:
         l_pos, r_pos = self.__motion.get_position()
         self.__start_l = l_pos
         self.__start_r = r_pos
-        self.__offset_l = 0.0
-        self.__offset_r = 0.0
         self.__state.reset()
 
         self.__is_running = True
@@ -268,8 +259,6 @@ class TargetMotionController:
         
         self.__start_l = l_pos
         self.__start_r = r_pos
-        self.__offset_l = 0.0
-        self.__offset_r = 0.0
 
         return True
 
@@ -280,51 +269,23 @@ class TargetMotionController:
         l_pos, r_pos = self.__motion.get_position()
         self.__start_l = l_pos
         self.__start_r = r_pos
-        self.__offset_l = 0.0
-        self.__offset_r = 0.0
-
-    def __effective_start(self):
-        return self.__start_l + self.__offset_l, self.__start_r + self.__offset_r
-
-    def set_offset_position(self, l_offset: float, r_offset: float):
-        if not self.can_modify():
-            return False
-
-        self.__offset_l = l_offset
-        self.__offset_r = r_offset
-        return True
-
-    def set_offset_position_to_current(self):
-        if not self.can_modify():
-            return False
-
-        l_pos, r_pos = self.__motion.get_position()
-        self.__offset_l = l_pos - self.__start_l
-        self.__offset_r = r_pos - self.__start_r
-        return True
-
-    def clear_offset_position(self):
-        return self.set_offset_position(0.0, 0.0)
 
     def goto_start_position(self):
         if not self.can_modify():
             return False # Can't move while running
-
-        eff_start_l, eff_start_r = self.__effective_start()
-        self.__motion.move_to_position(eff_start_l, eff_start_r, self.__traverse_speed[0], self.__traverse_speed[1])
+        
+        self.__motion.move_to_position(self.__start_l, self.__start_r, self.__traverse_speed[0], self.__traverse_speed[1])
 
     def at_start_position(self):
         l_pos, r_pos = self.__motion.get_position()
-        eff_start_l, eff_start_r = self.__effective_start()
-        return abs(l_pos - eff_start_l) < 1e-3 and abs(r_pos - eff_start_r) < 1e-3
+        return abs(l_pos - self.__start_l) < 1e-3 and abs(r_pos - self.__start_r) < 1e-3
     
     def at_path_position(self):
         c_time = self.__state.get_current_time()
         l_c, r_c = self.__state.get_position_at_time(c_time)
 
         l_pos, r_pos = self.__motion.get_position()
-        eff_start_l, eff_start_r = self.__effective_start()
-        return abs(l_pos - (l_c + eff_start_l)) < 1e-3 and abs(r_pos - (r_c + eff_start_r)) < 1e-3
+        return abs(l_pos - (l_c + self.__start_l)) < 1e-3 and abs(r_pos - (r_c + self.__start_r)) < 1e-3
 
 
     def set_time_position(self, time_pos: float):
@@ -377,15 +338,6 @@ class TargetMotionController:
     
     def get_start_position(self):
         return self.__start_l, self.__start_r
-
-    def get_offset_position(self):
-        return self.__offset_l, self.__offset_r
-
-    def set_offset(self, l_offset: float, r_offset: float):
-        return self.set_offset_position(l_offset, r_offset)
-
-    def get_offset(self):
-        return self.get_offset_position()
     
     def set_state(self, state: MotionState):
         self.__state = state
@@ -406,7 +358,7 @@ class TargetMotionController:
         return self.__config
     
 class TargetMotionControllerState:
-    def __init__(self, position: tuple[float, float], target_position: tuple[float, float], is_running: bool, is_jogging: bool, is_homing: bool, current_time: float, current_segment: int, start_position: tuple[float, float], offset_position: tuple[float, float] = (0.0, 0.0)):
+    def __init__(self, position: tuple[float, float], target_position: tuple[float, float], is_running: bool, is_jogging: bool, is_homing: bool, current_time: float, current_segment: int):
         self.position = position
         self.target_position = target_position
         self.is_running = is_running
@@ -414,8 +366,6 @@ class TargetMotionControllerState:
         self.is_homing = is_homing
         self.current_time = current_time
         self.current_segment = current_segment
-        self.start_position = start_position
-        self.offset_position = offset_position
 
     def encode(self):
         b_data = pickle.dumps(self)
@@ -423,13 +373,10 @@ class TargetMotionControllerState:
     
     @staticmethod
     def decode(b_data: bytes) -> 'TargetMotionControllerState':
-        state = pickle.loads(b_data)
-        if not hasattr(state, "offset_position"):
-            state.offset_position = (0.0, 0.0)
-        return state
+        return pickle.loads(b_data)
     
     def __str__(self):
-        return f"TargetMotionControllerState(position={self.position}, target_position={self.target_position}, is_running={self.is_running}, is_jogging={self.is_jogging}, is_homing={self.is_homing}, current_time={self.current_time}, current_segment={self.current_segment}, start_position={self.start_position}, offset_position={self.offset_position})"
+        return f"TargetMotionControllerState(position={self.position}, target_position={self.target_position}, is_running={self.is_running}, is_jogging={self.is_jogging}, is_homing={self.is_homing}, current_time={self.current_time}, current_segment={self.current_segment})"
 
 
 class TargetController(ExperimentClient):
@@ -467,6 +414,7 @@ class TargetController(ExperimentClient):
         self.__event_queue = mt_events.EventConsumer()
 
         self.__SAVE_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
+        self.__library = db_library.Library(self.__SAVE_PATH)
 
         self.__preinit_handle = None
         self.__start_handle = None
@@ -480,20 +428,9 @@ class TargetController(ExperimentClient):
 
         self.__last_jog_write = 0.0
         self.__exp_name = None
-        self.__last_running_state = False
-        self.__config_save_interval_s = 30.0
-        self.__last_periodic_save = time.monotonic()
-
-        self.__config_save_queue = queue.Queue()
-        self.__config_save_in_progress = False
 
         self.__motion_controller = TargetMotionController()
         self.__profile = None
-
-        self.__config_daemon = daemon.Daemon()
-        self.__config_daemon.add(target=self.__config_saver_thread)
-        self.__config_daemon.start()
-
         self.__load_profile()
 
         self.__daemon = daemon.Daemon()
@@ -503,229 +440,68 @@ class TargetController(ExperimentClient):
         print("TargetController initialized.")
 
     def __load_profile(self):
-        try:
-            ok, payload = self.__request_saver_command("load", wait=True, timeout=5.0)
-            if not ok:
-                raise RuntimeError(f"Failed to load saved motion state: {payload}")
-
-            b_state, b_start_pos, b_offset_pos = self.__normalize_profile_payload(payload)
-            start_pos = pickle.loads(b_start_pos)
-            offset_pos = pickle.loads(b_offset_pos)
-            state = MotionState.decode(b_state)
-
-            print("Loaded saved motion state:", state)
-            print("Loaded saved start position:", start_pos)
-            print("Loaded saved offset position:", offset_pos)
-
-            assert self.__motion_controller.set_start_position(*start_pos)
-            assert self.__motion_controller.set_offset_position(*offset_pos)
-            assert self.__motion_controller.set_state(state)
-            self.__profile = self.__motion_controller.get_profile()
-
-            self.__logger.log(f"Resuming state (current/remaining): {self.__motion_controller.get_current_time()}/{self.__motion_controller.get_state().get_remaining_time()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
-            self.__logger.log(f"Start position @ {self.__motion_controller.get_start_position()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
-            self.__logger.log(f"Offset position @ {self.__motion_controller.get_offset_position()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
-            return
-        except (RuntimeError, ValueError, IndexError, TypeError, struct.error, pickle.PickleError) as exc:
-            self.__logger.log(f"Failed to load target motion state from saver thread: {exc}", level="ERROR", l_type="CTRL", subsystem="Target Controller", event="load_profile")
-            raise
-        
-    def __encode_profile_save_data(self):
-        return segment_bytes.encode([
-            self.__motion_controller.get_state().encode(),
-            pickle.dumps(self.__motion_controller.get_start_position()),
-            pickle.dumps(self.__motion_controller.get_offset_position()),
-        ])
-
-    def __get_or_create_profile_record(self, library: db_library.Library):
-        recs = library.query({"name": "Target Motion Controller Save State", "limit": 1})
+        recs = self.__library.query({"name": "Target Motion Controller Save State", "limit": 1})
 
         if not recs:
-            self.__logger.log("Could not find saved state record while saving. Creating new record.", level="WARN", l_type="CTRL", subsystem="Target Controller")
-            rec = library.create_entry("Target Motion Controller Save State", "Saves the state of the Target Motion Controller")
+            rec = self.__library.create_entry("Target Motion Controller Save State", "Saves the state of the Target Motion Controller")
         else:
             rec = recs[0]
-
-        return rec
-
-    def __default_profile_payload(self):
-        profile = TargetMotionProfile()
-        profile.add_segment(MotionSegment(10.0, 0.0, 5, 0.5))
-        profile.add_segment(MotionSegment(10.0, 1.0, 5, 0.5))
-        profile.add_segment(MotionSegment(00.0, 1.0, 5, 0.5))
-
-        state = MotionState(profile)
-        state.set_rep_amount(99)
-
-        return state.encode(), pickle.dumps((0.0, 0.0)), pickle.dumps((0.0, 0.0))
-
-    def __normalize_profile_payload(self, payload):
-        if isinstance(payload, tuple) or isinstance(payload, list):
-            decoded = list(payload)
-        elif isinstance(payload, bytes):
-            try:
-                decoded = list(segment_bytes.decode(payload))
-            except (ValueError, IndexError, TypeError, struct.error):
-                legacy = pickle.loads(payload)
-                if not isinstance(legacy, (tuple, list)):
-                    raise
-                decoded = list(legacy)
-        else:
-            raise TypeError(f"Unsupported profile payload type: {type(payload)}")
-
-        if len(decoded) == 2:
-            b_state, b_start_pos = decoded
-            b_offset_pos = pickle.dumps((0.0, 0.0))
-            return b_state, b_start_pos, b_offset_pos
-
-        if len(decoded) >= 3:
-            b_state, b_start_pos, b_offset_pos = decoded[:3]
-            return b_state, b_start_pos, b_offset_pos
-
-        raise ValueError("Profile payload is missing required state fields.")
-
-    def __load_profile_data(self, library: db_library.Library):
-        rec = self.__get_or_create_profile_record(library)
 
         try:
             res = rec.resource("motion_state.bin", "Motion State", "rb")
             b_data = res.read()
             res.close()
 
-            b_state, b_start_pos, b_offset_pos = self.__normalize_profile_payload(b_data)
+            b_state, b_start_pos = segment_bytes.decode(b_data)
+            start_pos = pickle.loads(b_start_pos)
 
-            MotionState.decode(b_state)
-            pickle.loads(b_start_pos)
-            pickle.loads(b_offset_pos)
+            print("Loaded saved motion state:", MotionState.decode(b_state))
+            print("Loaded saved start position:", start_pos)
 
-            return b_state, b_start_pos, b_offset_pos
+            assert self.__motion_controller.set_start_position(*start_pos)
+            assert self.__motion_controller.set_state(MotionState.decode(b_state))
+            self.__profile = self.__motion_controller.get_profile()
+
+            self.__logger.log(f"Resuming state (current/remaining): {self.__motion_controller.get_current_time()}/{self.__motion_controller.get_state().get_remaining_time()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
+            self.__logger.log(f"Start position @ {self.__motion_controller.get_start_position()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
+            return
         except (FileNotFoundError, ValueError, IndexError, TypeError, struct.error, pickle.UnpicklingError):
             self.__logger.log("No saved motion state found, or saved state is not valid. Creating new profile.", level="WARN", l_type="CTRL", subsystem="Target Controller")
 
-            b_state, b_start_pos, b_offset_pos = self.__default_profile_payload()
-            bdata = segment_bytes.encode([b_state, b_start_pos, b_offset_pos])
-
             res = rec.resource("motion_state.bin", "Motion State", "wb")
+            self.__profile = TargetMotionProfile()
+            self.__profile.add_segment(MotionSegment(10.0, 0.0, 5, 0.5))
+            self.__profile.add_segment(MotionSegment(10.0, 1.0, 5, 0.5))
+            self.__profile.add_segment(MotionSegment(00.0, 1.0, 5, 0.5))
+            self.__motion_controller.set_profile(self.__profile)
+            self.__motion_controller.set_max_repetitions(99)
+
+            bdata = segment_bytes.encode([self.__motion_controller.get_state().encode(), pickle.dumps(self.__motion_controller.get_start_position())])
+
             res.write(bdata)
             res.close()
+            return
+        
+    def __save_profile(self):
+        recs = self.__library.query({"name": "Target Motion Controller Save State", "limit": 1})
 
-            return b_state, b_start_pos, b_offset_pos
-
-    def __save_profile(self, library: db_library.Library, bdata: bytes):
-        rec = self.__get_or_create_profile_record(library)
+        if not recs:
+            self.__logger.log("Could not find saved state record while saving. Creating new record.", level="WARN", l_type="CTRL", subsystem="Target Controller")
+            rec = self.__library.create_entry("Target Motion Controller Save State", "Saves the state of the Target Motion Controller")
+        else:
+            rec = recs[0]
 
         self.__logger.log(f"Saving state (current/remaining): {self.__motion_controller.get_current_time()}/{self.__motion_controller.get_state().get_remaining_time()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
         self.__logger.log(f"Start position @ {self.__motion_controller.get_start_position()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
-        self.__logger.log(f"Offset position @ {self.__motion_controller.get_offset_position()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
 
         res = rec.resource("motion_state.bin", "Motion State", "wb")
+        bdata = segment_bytes.encode([self.__motion_controller.get_state().encode(), pickle.dumps(self.__motion_controller.get_start_position())])
         res.write(bdata)
         res.close()
-
-    def __request_profile_save(self):
-        self.__last_periodic_save = time.monotonic()
-        self.__request_saver_command("save", payload=self.__encode_profile_save_data())
-
-    def __request_saver_command(self, op: str, payload = None, wait: bool = False, timeout: float = 0.0):
-        response_queue = queue.Queue(maxsize=1) if wait else None
-        self.__config_save_queue.put((op, payload, response_queue))
-
-        if not wait:
-            return True, None
-
-        try:
-            return response_queue.get(timeout=timeout)
-        except queue.Empty:
-            return False, b"Timed out waiting for saver thread response."
-
-    def __config_saver_thread(self, stop_flag: daemon.StopFlag):
-        library = db_library.Library(self.__SAVE_PATH)
-        try:
-            while stop_flag.run() and self.__run:
-                try:
-                    op, payload, response_queue = self.__config_save_queue.get(timeout=0.2)
-                except queue.Empty:
-                    continue
-
-                if op == "save":
-                    bdata = payload
-                    while not self.__config_save_queue.empty():
-                        try:
-                            n_op, n_payload, n_response_queue = self.__config_save_queue.get_nowait()
-                            if n_op == "save":
-                                bdata = n_payload
-                                continue
-
-                            self.__config_save_queue.put((n_op, n_payload, n_response_queue))
-                            break
-                        except queue.Empty:
-                            break
-
-                    self.__config_save_in_progress = True
-                    try:
-                        self.__save_profile(library, bdata)
-                        if response_queue is not None:
-                            response_queue.put((True, None))
-                    except Exception as exc:
-                        self.__logger.log(
-                            f"Failed to save target motion state: {exc}",
-                            level="ERROR",
-                            l_type="CTRL",
-                            subsystem="Target Controller",
-                            event="save_profile",
-                        )
-                        if response_queue is not None:
-                            response_queue.put((False, str(exc).encode("utf-8", errors="replace")))
-                    finally:
-                        self.__config_save_in_progress = False
-                    continue
-
-                if op == "load":
-                    try:
-                        payload = self.__load_profile_data(library)
-                        if response_queue is not None:
-                            response_queue.put((True, payload))
-                    except Exception as exc:
-                        self.__logger.log(
-                            f"Failed to load target motion state: {exc}",
-                            level="ERROR",
-                            l_type="CTRL",
-                            subsystem="Target Controller",
-                            event="load_profile",
-                        )
-                        if response_queue is not None:
-                            response_queue.put((False, str(exc).encode("utf-8", errors="replace")))
-                    continue
-
-                if op == "close":
-                    try:
-                        library.close()
-                        if response_queue is not None:
-                            response_queue.put((True, None))
-                    except Exception as exc:
-                        if response_queue is not None:
-                            response_queue.put((False, str(exc).encode("utf-8", errors="replace")))
-                    return
-
-                if response_queue is not None:
-                    response_queue.put((False, b"Unknown saver thread operation."))
-        finally:
-            try:
-                library.close()
-            except Exception:
-                pass
 
     def __thread(self, stop_flag: daemon.StopFlag):
         while stop_flag.run() and self.__run:
             e = self.__event_queue.get(timeout=0.5)
-
-            if (time.monotonic() - self.__last_periodic_save) >= self.__config_save_interval_s:
-                self.__request_profile_save()
-
-            is_running = self.__motion_controller.is_running()
-            if is_running != self.__last_running_state:
-                self.__request_profile_save()
-                self.__last_running_state = is_running
 
             if self.__preinit_handle is not None:
                 # Continue already handles this
@@ -762,17 +538,12 @@ class TargetController(ExperimentClient):
                 if self.__status_publisher is not None:
                     state = TargetMotionControllerState(
                         position=self.__motion_controller.get_current_position(),
-                        target_position=(
-                            self.__motion_controller.get_profile().get_position_at_time(self.__motion_controller.get_current_time())[0] + self.__motion_controller.get_start_position()[0] + self.__motion_controller.get_offset_position()[0],
-                            self.__motion_controller.get_profile().get_position_at_time(self.__motion_controller.get_current_time())[1] + self.__motion_controller.get_start_position()[1] + self.__motion_controller.get_offset_position()[1],
-                        ),
+                        target_position=self.__motion_controller.get_profile().get_position_at_time(self.__motion_controller.get_current_time()),
                         is_running=self.__motion_controller.is_running(),
                         is_jogging=self.__motion_controller.is_jogging(),
                         is_homing=self.__motion_controller.is_homing(),
                         current_time=self.__motion_controller.get_current_time(),
-                        current_segment=self.__motion_controller.get_current_segment(),
-                        start_position=self.__motion_controller.get_start_position(),
-                        offset_position=self.__motion_controller.get_offset_position(),
+                        current_segment=self.__motion_controller.get_current_segment()
                     )
 
                     motion_state = self.__motion_controller.get_state()
@@ -844,47 +615,10 @@ class TargetController(ExperimentClient):
 
         l_pos, r_pos = self.__motion_controller.get_current_position()
         self.__motion_controller.set_start_position(l_pos, r_pos)
-        self.__request_profile_save()
 
         self.__logger.log(f"Set start position to current position @ L={l_pos}, R={r_pos}", level="INFO", l_type="CTRL", subsystem="Target Controller", event="set_start_position")
 
         handle.ret(OP_OK + b": start position set.")
-
-    def __on_set_offset_here_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
-        print("Set offset position event called by:", s_uuid, param)
-
-        if not self.__motion_controller.can_modify():
-            handle.fail(b"Cannot set offset while motion is running or not ready.")
-            return
-
-        ok = self.__motion_controller.set_offset_position_to_current()
-        if not ok:
-            handle.fail(b"Failed to set offset position.")
-            return
-
-        self.__request_profile_save()
-        l_off, r_off = self.__motion_controller.get_offset_position()
-
-        self.__logger.log(f"Set offset position to current @ L={l_off}, R={r_off}", level="INFO", l_type="CTRL", subsystem="Target Controller", event="set_offset_position")
-
-        handle.ret(OP_OK + b": offset position set.")
-
-    def __on_clear_offset_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
-        print("Clear offset event called by:", s_uuid, param)
-
-        if not self.__motion_controller.can_modify():
-            handle.fail(b"Cannot clear offset while motion is running or not ready.")
-            return
-
-        ok = self.__motion_controller.clear_offset_position()
-        if not ok:
-            handle.fail(b"Failed to clear offset position.")
-            return
-
-        self.__request_profile_save()
-        self.__logger.log("Cleared motion offset position.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="clear_offset_position")
-
-        handle.ret(OP_OK + b": offset position cleared.")
 
     def __on_start_move_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
         print("Start move event called by:", s_uuid, param)
@@ -927,7 +661,6 @@ class TargetController(ExperimentClient):
             return
 
         self.__motion_controller.set_time_position(param)
-        self.__request_profile_save()
 
         self.__logger.log(f"Set time position: {param}.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="set_pos", position=param)
 
@@ -952,8 +685,6 @@ class TargetController(ExperimentClient):
         handle.add_event_handler(b"start_target_motion").on_called(self.__on_start_move_event)
         handle.add_event_handler(b"stop_target_motion").on_called(self.__on_stop_move_event)
         handle.add_event_handler(b"set_target_start").on_called(self.__on_set_start_position)
-        handle.add_event_handler(b"set_target_offset_here").on_called(self.__on_set_offset_here_event)
-        handle.add_event_handler(b"clear_target_offset").on_called(self.__on_clear_offset_event)
         handle.add_event_handler(b"home_target").on_called(self.__on_home_event)
         handle.add_event_handler(b"set_target_position").on_called(self.__on_reset_move_event).set_types(types.FloatTypeSpecifier(), types.ByteTypeSpecifier())
 
@@ -982,7 +713,6 @@ class TargetController(ExperimentClient):
 
             self.__motion_controller.set_profile(profile)
             self.__profile = profile
-            self.__request_profile_save()
 
             self.__logger.log("Target motion profile updated.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="update_profile")
         except (ValueError, pickle.PickleError) as e:
@@ -992,9 +722,6 @@ class TargetController(ExperimentClient):
         return (magics.TRANSOP_STATE_OK, OP_OK)
 
     def __on_profile_read(self, requester):
-        if self.__profile is None:
-            return (magics.TRANSOP_STATE_REJ, b"No profile loaded.")
-        
         return (magics.TRANSOP_STATE_OK, segment_bytes.encode([self.__profile.encode(), self.__motion_controller.get_config().encode()]))
 
     def __on_jog_write(self, value: list[float]):
@@ -1009,22 +736,10 @@ class TargetController(ExperimentClient):
     
     def close(self):
         print("Closing Target Controller...")
-
-        self.__request_profile_save()
-
-        begin = time.monotonic()
-        while (not self.__config_save_queue.empty() or self.__config_save_in_progress) and (time.monotonic() - begin) < 2.0:
-            time.sleep(0.05)
-
-        if not self.__config_save_queue.empty() or self.__config_save_in_progress:
-            self.__logger.log("Timed out waiting for target motion state save during shutdown.", level="WARN", l_type="CTRL", subsystem="Target Controller", event="save_profile")
-
-        ok, reason = self.__request_saver_command("close", wait=True, timeout=3.0)
-        if not ok:
-            self.__logger.log(f"Failed to close target motion saver thread cleanly: {reason}", level="WARN", l_type="CTRL", subsystem="Target Controller", event="save_profile")
-
         self.__daemon.stop()
-        self.__config_daemon.stop()
+
+        self.__save_profile()
+        self.__library.close()
 
         self.__client.close()
         self.__logger_sock.close()
@@ -1032,7 +747,7 @@ class TargetController(ExperimentClient):
         self.__run = False
 
 
-def main(stop_event=None):
+def main(stop_event: "multiprocessing.Event"):
     m_target_controller = TargetController()
     print("Target Controller started.")
 

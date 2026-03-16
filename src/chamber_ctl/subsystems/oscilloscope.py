@@ -112,6 +112,9 @@ class ScopeReader(OscilloscopeStream):
     def set_active(self, active):
         self.__do_capture = active
 
+        if self.is_capturing and not active:
+            self.scope.write(":STOP")
+
     def configure(self):
         # --- one-time config ---
         self.scope.write(":STOP")
@@ -304,6 +307,9 @@ class ScopeReader(OscilloscopeStream):
             center = (1 << (adc_bits - 1)) - 1                 # 2047
             full   = 1 << adc_bits                             # 4096
 
+        if code_per_div == 0:
+            print(locals())
+
         # ---- reshape strictly by (read_frame, read_pts) ----
         codes_u = raw.reshape(read_frame, read_pts)
 
@@ -401,11 +407,11 @@ class ScopeReader(OscilloscopeStream):
         self.scope.write(":WAVeform:DATA?")
         data = self.read_hash_block(self.scope)                 # returns concatenated frame data
 
-        self.__read_queue.put((self.last_start_cmd, desc, data, uuid.uuid4()))
+        self.__read_queue.put((self.last_start_cmd, time.time_ns(), desc, data, uuid.uuid4()))
 
     def __proc_thread(self, stop_flag: StopFlag):
         while stop_flag.run():
-            start, desc, data, uid = self.__read_queue.get() # wait for signal to read
+            start, end, desc, data, uid = self.__read_queue.get() # wait for signal to read
 
             # 3) Decode to time + voltages
             t, V, meta, timestamps = self.decode_sequence_waveforms(desc, data, 10)
@@ -413,7 +419,7 @@ class ScopeReader(OscilloscopeStream):
             if len(V) == 0:
                 continue
 
-            # print(f"Got {len(V)} frames, {len(V[0])} pts/frame. First timestamp: {timestamps[0]} ns. Meta: {meta}")
+            #print(f"Got {len(V)} frames, {len(V[0])} pts/frame. First timestamp: {timestamps[0]} ns. Meta: {meta}")
 
             indexes = []
             data = np.empty((0, 2))
@@ -424,10 +430,12 @@ class ScopeReader(OscilloscopeStream):
 
                 indexes.append((len(data), float(myrealtime) / 1000000000.0))
 
-                values = np.column_stack((t[nv], V[nv]))
+                time_series = np.linspace(0, meta["interval"] * len(V[nv]) * self.HORI_NUM, len(V[nv]), endpoint=False)
+
+                values = np.column_stack((time_series, V[nv]))
                 data = np.vstack((data, values))
 
-            self.__out_queue.put((start, data, indexes, uid))
+            self.__out_queue.put((start, end, data, indexes, uid))
 
     def __read_thread(self, stop_flag: StopFlag):
         was_running = False
@@ -583,14 +591,6 @@ class RealtimeDoseCalc:
             time.sleep(0.1)
 
 def calculate_dose_of_experiment(e_uuid: uuid.UUID, d_reader: "DataReader"):
-    __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
-    __OFF_NUM = 98
-    __SAMPLE_dT = 10 / 1e9
-    __RESISTOR_OHMS = 50.0
-    __RESP_A_PER_W = 0.14
-    __AREA_CM2 = (5) / 100.0
-    __REP_RATE_HZ = 100.0
-
     segments = d_reader.get_snapshots(e_uuid)
 
     running_total = 0
@@ -600,47 +600,61 @@ def calculate_dose_of_experiment(e_uuid: uuid.UUID, d_reader: "DataReader"):
         snap_array = np.load(snapshot_file)
 
         meta = json.load(snapshot_meta)
-        start = meta["start"]
+        start = meta["start"]# - (3600 * 6) * 1e9 # adjust for timezone to match scope's naive timestamps
         end = meta["end"]
+
+        print(f"Processing segment {uid} with start={start / 1e9} s, end={end / 1e9} s, duration={(end - start) / 1e9} s")
+
+        if abs(start - end) > 10 * 1e9:
+            print(f"Segment {uid} has invalid timestamps: start={start}, end={end}. Skipping.")
+            continue
 
         data = snap_array["data"]
         indexes = snap_array["indexes"]
-        pulse_doses = []
-        pulse_webers = []
-        pulse_size = int(indexes[1, 0] - indexes[0, 0])
-        # print(f"Calculated pulse size: {pulse_size} pts")
-
-        for index, begin_time in indexes:
-            index = int(index)
-            pulse = data[index:index+pulse_size, :]
-            off_avg = np.average(pulse[:__OFF_NUM, 1])
-            pulse -= off_avg
-            pulsetime = pulse[-1, 0] - pulse[0, 0]
-            auc_webers = np.trapezoid(pulse[:, 1], pulse[:, 0])
-            # print(f"nWeber: {auc_webers * 1e9}") 
-            Q_coulombs = auc_webers / __RESISTOR_OHMS
-            E_joules = Q_coulombs / __RESP_A_PER_W
-            E_mJ = E_joules * 1000.0
-            dose_per_pulse_mJ_cm2 = E_mJ / __AREA_CM2
-            #print(f"uJ/cm2: {dose_per_pulse_mJ_cm2 * 1e3}")
-            pulse_doses.append((begin_time, dose_per_pulse_mJ_cm2))
-            pulse_webers.append((begin_time, auc_webers))
-
-            #if dose_per_pulse_mJ_cm2 < -1e-5:
-            #    print("NEGATIVE DOSE: ", dose_per_pulse_mJ_cm2)
-
-        pulse_doses = np.array(pulse_doses)
-        pulse_webers = np.array(pulse_webers)
-        total = np.average(pulse_doses[:, 1])
-        total *= ((end - start) / 1e9) * __REP_RATE_HZ
+        total, duration = calculate_dose_raw(start, end, data, indexes)
 
         running_total += total
-        running_time += (end - start) / 1e9
+        running_time += duration
 
     return running_total, running_time
 
-def calculate_dose_of_segment(e_uuid: uuid.UUID, s_uuid: uuid.UUID, d_reader: "DataReader"):
-    __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
+def calculate_doses_of_segments(e_uuid: uuid.UUID, d_reader: "DataReader"):
+    segments = d_reader.get_snapshots(e_uuid)
+
+    doses = np.array([])
+    times = np.array([])
+
+    for uid, (snapshot_file, snapshot_meta) in segments.items():
+        snap_array = np.load(snapshot_file)
+
+        meta = json.load(snapshot_meta)
+        start = meta["start"]# - (3600 * 6) * 1e9 # adjust for timezone to match scope's naive timestamps
+        end = meta["end"]
+
+        print(f"Processing segment {uid} with start={start / 1e9} s, end={end / 1e9} s, duration={(end - start) / 1e9} s")
+
+        if abs(start - end) > 10 * 1e9:
+            print(f"Segment {uid} has invalid timestamps: start={start}, end={end}. Skipping.")
+            continue
+
+        data = snap_array["data"]
+        indexes = snap_array["indexes"]
+        total, duration = calculate_dose_raw(start, end, data, indexes)
+
+        doses = np.append(doses, total)
+        times = np.append(times, duration)
+
+    return doses, times
+
+def calculate_dose_raw(start, end, data, indexes):
+    __REP_RATE_HZ = 100.0
+
+    total = calculate_avg_pulsedose(data, indexes)
+    total *= ((end - start) / 1e9) * __REP_RATE_HZ
+
+    return total, ((end - start) / 1e9)
+
+def calculate_avg_pulsedose(data, indexes):
     __OFF_NUM = 98
     __SAMPLE_dT = 10 / 1e9
     __RESISTOR_OHMS = 50.0
@@ -648,19 +662,27 @@ def calculate_dose_of_segment(e_uuid: uuid.UUID, s_uuid: uuid.UUID, d_reader: "D
     __AREA_CM2 = (5) / 100.0
     __REP_RATE_HZ = 100.0
 
-    snapshot_file, snapshot_meta = d_reader.get_snapshot(e_uuid, s_uuid)
-
-    snap_array = np.load(snapshot_file)
-
-    meta = json.load(snapshot_meta)
-    start = meta["start"]
-    end = meta["end"]
-
-    data = snap_array["data"]
-    indexes = snap_array["indexes"]
     pulse_doses = []
     pulse_webers = []
+
+    indexes = np.array(indexes)
+    data = np.array(data)
+
+    if len(indexes) < 2:
+        return 0.0, 0.0
+    
     pulse_size = int(indexes[1, 0] - indexes[0, 0])
+
+    #start_first_pulse = indexes[0, 1]
+
+    #print(f"Segment {s_uuid} starts at {start_first_pulse} s after epoch, capture started at {start / 1e9} s after epoch")
+    #print(f"Time between capture start and first pulse: {(start_first_pulse - (start / 1e9))} seconds")
+
+    #if start_first_pulse - (start / 1e9) > 1.0:
+    #    print(f"Laser was off for {(start_first_pulse - start) / 1e9} seconds before first pulse. Ignoring this segment for dose calculation.")
+    #    return 0.0, 0.0
+
+    
     # print(f"Calculated pulse size: {pulse_size} pts")
 
     for index, begin_time in indexes:
@@ -685,9 +707,25 @@ def calculate_dose_of_segment(e_uuid: uuid.UUID, s_uuid: uuid.UUID, d_reader: "D
     pulse_doses = np.array(pulse_doses)
     pulse_webers = np.array(pulse_webers)
     total = np.average(pulse_doses[:, 1])
-    total *= ((end - start) / 1e9) * __REP_RATE_HZ
+    return total
 
-    return total, ((end - start) / 1e9)
+def calculate_dose_of_segment(e_uuid: uuid.UUID, s_uuid: uuid.UUID, d_reader: "DataReader"):
+    __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
+
+    snapshot_file, snapshot_meta = d_reader.get_snapshot(e_uuid, s_uuid)
+
+    snap_array = np.load(snapshot_file)
+
+    meta = json.load(snapshot_meta)
+    start = meta["start"]# - (3600 * 6) * 1e9 # adjust for timezone to match scope's naive timestamps
+    end = meta["end"]
+
+    data = snap_array["data"]
+    indexes = snap_array["indexes"]
+
+    total, duration = calculate_dose_raw(start, end, data, indexes)
+    return total, duration
+    
 
 class DummyOscilloscope(OscilloscopeStream):
     def __init__(self):
@@ -942,6 +980,15 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
         self.__dose_queue = queue.Queue()
 
+        self.__last_laser_on = False
+        self.__last_laser_off_time = 0
+
+        self.__current_dose = 0.0
+        self.__current_time = 0.0
+
+        self.__target_dose = None
+        self.__target_time = None
+
         def _on_ready():
             if self.__did_config:
                 return
@@ -961,6 +1008,16 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__daemon = Daemon()
         self.__daemon.add(self.__thread)
         self.__daemon.start()
+
+    def __is_laser_on(self):
+        if self.osc.is_capturing() and (time.time() - self.osc.get_last_start_cmd_time()) > 0.25:
+            self.__last_laser_on = (time.time() - self.osc.get_last_capture_time()) < 0.5
+
+        return self.__last_laser_on
+
+    def __update_laser_status(self):
+        if not self.__is_laser_on():
+            self.__last_laser_off_time = time.time_ns()
 
     def __thread(self, stop_flag: StopFlag):
         self.__exp_reader = ExperimentReader(os.path.join(os.environ["EUVL_PATH"], "datasets"), "exposure")
@@ -985,21 +1042,68 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
             #    print("Exposure has timed out, resetting state.")
             #    self.__stop_exp()
 
+            self.__update_laser_status()
+
             if not self.__osc_queue.empty() and not self.__exp_id is None:
                 #print("New oscilloscope data available, writing...")
                 start, end, data, indexes, uid = self.__osc_queue.get()
+
+                if start < self.__last_laser_off_time <= end:
+                    print(f"[OscilloscopeSubsystem] Skipped snapshot {uid}: laser off during segment ({start}..{end}, off at {self.__last_laser_off_time}).")
+                    self.__logger.log(
+                        f"Skipping snapshot {uid}: laser off detected during segment.",
+                        level="WARNING",
+                        l_type="EXP",
+                        subsystem="Oscilloscope",
+                    )
+                    continue
+
                 ok = self.__writer.write_wf(start, end, data, indexes, uid)
+
+                pdose, pduration = calculate_dose_raw(start, end, data, indexes)
+                self.__current_dose += pdose
+                self.__current_time += pduration
+
+
                 self.__logger.log(f"Saved snapshot {uid}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
+                self.__logger.log(f"Current dose: {self.__current_dose} mJ/cm2, time: {self.__current_time}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
+                
+                if self.__target_dose is not None and self.__current_dose >= self.__target_dose:
+                    print(f"Target dose of {self.__target_dose} mJ/cm2 reached, stopping exposure.")
+                    self.__logger.log(f"Target dose of {self.__target_dose} mJ/cm2 reached, stopping exposure.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
+                    self.__stop_experiment_event_sender.call((f"Target dose of {self.__target_dose} mJ/cm2 reached").encode("utf-8"), [])
+
+                if self.__target_time is not None and self.__current_time >= self.__target_time:
+                    print(f"Target time of {self.__target_time} s reached, stopping exposure.")
+                    self.__logger.log(f"Target time of {self.__target_time} s reached, stopping exposure.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
+                    self.__stop_experiment_event_sender.call((f"Target time of {self.__target_time} s reached").encode("utf-8"), [])
+
                 if not ok:
                     print("Failed to write oscilloscope data")
                     self.osc.set_active(False)
+                else:
+                    print(f"[OscilloscopeSubsystem] Saved snapshot {uid}: segment window {start}..{end}.")
 
                 self.__on_new_segment_publisher.value = segment_bytes.encode([self.__exp_id.bytes, uid.bytes])
 
             if not self.__dose_queue.empty() and not self.osc.is_capturing():
                 time.sleep(0.5) # wait a moment to ensure all data is written and available for reading
                 exp = self.__dose_queue.get()
-                rec = self.__exp_reader.get_run(exp)
+                for _ in range(5): # retry a few times to get the experiment record, in case it's not immediately available
+                    try:
+                        rec = self.__exp_reader.get_run(exp)
+                        break
+                    except ValueError:
+                        print(f"Experiment record for {exp} not found yet, retrying...")
+                        time.sleep(0.5)
+                    except AttributeError:
+                        print(f"Experiment was not saved properly, ignoring this dose calculation.")
+                        break
+                
+                if rec is None:
+                    print(f"Experiment record for {exp} not found after retries, skipping dose calculation.")
+                    continue
+
                 dose, runtime = calculate_dose_of_experiment(exp, self.__data_reader)
 
                 rec.add_tag("runtime", runtime)
@@ -1012,13 +1116,28 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__subsystem = sh
 
         self.__on_new_segment_publisher = sh.get_kv_property(b"new_segment", False, True, True)
+        self.__stop_experiment_event_sender = sh.add_event_provider(f"stop_exposure".encode("utf-8"))
 
         self._setup_subsystem(sh)
 
     def _can_start(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
         print("Started exposure with UUID: ", state.get_uuid())
         self.__exp_id = state.get_uuid()
+        self.__current_dose = 0.0
+        self.__current_time = 0.0
 
+        if state.get_settings().get_attr("target_dose") > 0.1:
+            self.__target_dose = state.get_settings().get_attr("target_dose")
+            print(f"Target dose for this exposure: {self.__target_dose} mJ/cm2")
+
+        if state.get_settings().get_attr("target_time") > 0.1:
+            self.__target_time = state.get_settings().get_attr("target_time")
+            print(f"Target time for this exposure: {self.__target_time} s")
+
+        if self.__target_dose is not None and self.__target_time is not None:
+            self.__logger.log("Warning: both target dose and target time are set. Refusing to start exposure.", level="WARNING", l_type="EXP", subsystem="Oscilloscope")
+            return False, b"Cannot set both target dose and target time. Please set only one of them."
+        
         self.__writer.set_exp_id(self.__exp_id)
 
         return super()._can_start(settings, state)
@@ -1029,6 +1148,11 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
     def _on_start(self, handle: client._EventHandler._IncomingEventHandle) -> bytes:
         self.__start_handle = handle
+
+        self.__last_laser_on = False
+        self.__last_laser_off_time = 0
+        self.__current_dose = 0.0
+        self.__current_time = 0.0
 
         self.__logger.log("Scope starting recording.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
 
@@ -1067,7 +1191,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
 
 def main(stop_event: "multiprocessing.Event"):
-    osc = DummyOscilloscope() #ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
+    osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
     subsystem = OscilloscopeSubsystem(osc)
     print("Oscilloscope subsystem initializing...")
     #proc = RealtimeDoseCalc(osc)

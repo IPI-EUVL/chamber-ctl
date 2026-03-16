@@ -47,7 +47,7 @@ class LJSerialTargetMotion(TargetMotion):
 
         self.__target_l = float('nan')
         self.__target_r = float('nan')
-        self.__last_l = 0.0
+        self.__last_l = float('nan')
         self.__last_r = float('nan')
 
         self.__jog_l = 0.0
@@ -98,7 +98,7 @@ class LJSerialTargetMotion(TargetMotion):
 
     def __rot_thread(self, stop_flag: daemon.StopFlag):
         while stop_flag.run():
-            time.sleep(0.1)
+            time.sleep(0.02)
 
             if self.__rot_process is not None:
                 self.__update_r()
@@ -196,6 +196,13 @@ class LJSerialTargetMotion(TargetMotion):
             assert False, "LIN position parse error: received: " + str(ret)    
 
     def __home_lin(self):
+        assert self.__lin_command("CM11")
+        assert self.__lin_command("SV20000")
+        assert self.__lin_command("SF20000")
+        assert self.__lin_command("SJ10000")
+        assert self.__lin_command("SA50000")
+        assert self.__lin_command("SD50000")
+        assert self.__lin_command("SC00010")
         assert self.__lin_command("HD"), "LIN home command failed."
 
     def __get_lin_current_op(self):
@@ -257,11 +264,19 @@ class LJSerialTargetMotion(TargetMotion):
         if self.__l_homing:
             return
         
-        #print(f"LIN Current Position: {self.__current_l} mm")
-        #print(f"LIN Target Position: {self.__target_l} mm")
-        #print(f"LIN Last Position: {self.__last_l / float(MM_TO_STEPS)} mm")
-    
-        if not isnan(self.__target_l):
+        print(f"LIN Current Position: {self.__current_l} mm")
+        print(f"LIN Target Position: {self.__target_l} mm")
+        print(f"LIN Last Position: {self.__last_l / float(MM_TO_STEPS)} mm")
+
+        print(f"LIN Speed: {self.__l_speed} mm/s")
+        print(f"LIN Moving: {self.__l_moving}")
+        if isnan(self.__jog_l) and not self.__l_moving and (abs((self.__current_l / float(MM_TO_STEPS)) - self.__target_l) > 1e-3 or isnan(self.__last_l)) and self.__l_speed > 0.0:
+            self.__move_lin_to_position(int(self.__target_l * MM_TO_STEPS), int(self.__l_speed * MM_TO_STEPS))
+            print(f"Reissuing LIN move command issued to position {self.__target_l} mm at speed {self.__l_speed} mm/s.")
+
+        if self.__l_speed < 0.01 and self.__l_moving:
+            self.__stop_lin()            
+        elif not isnan(self.__target_l):
             if (abs((self.__last_l / float(MM_TO_STEPS)) - self.__target_l) > 1e-3 or isnan(self.__last_l)) and self.__l_speed > 0.0:
                 self.__move_lin_to_position(int(self.__target_l * MM_TO_STEPS), int(self.__l_speed * MM_TO_STEPS))
         elif not isnan(self.__jog_l):
@@ -290,13 +305,13 @@ class LJSerialTargetMotion(TargetMotion):
         return self.__target_l, self.__target_r
     
     def is_moving(self):
-        print(f"Checking is_moving: Current L: {self.__current_l}, Target L: {self.__target_l}, Current R: {self.__current_r}, Target R: {self.__target_r}, L moving: {self.__l_moving}")
+        #print(f"Checking is_moving: Current L: {self.__current_l}, Target L: {self.__target_l}, Current R: {self.__current_r}, Target R: {self.__target_r}, L moving: {self.__l_moving}")
         if isnan(self.__target_l):
             return False
         if isnan(self.__target_r):
             return False
 
-        return not (self.__current_r == self.__target_r) or self.__l_moving
+        return not ((self.__current_r - self.__target_r) < 2e-2) or self.__l_moving
     
     def jog(self, delta_l: float, delta_r: float):
         self.__jog_l = delta_l
@@ -322,6 +337,11 @@ class LJSerialTargetMotion(TargetMotion):
     def is_homing(self):
         return self.__l_homing or self.__should_home_l
         #return self.__get_lin_current_op() == "Home to datum"
+
+    def stop(self):
+        self.__r_speed = 0.0
+        self.__l_speed = 0.0
+        pass
 
 class LabJackHandlerSubprocess:
     PUL_PLUS = "FIO4"
@@ -365,7 +385,7 @@ class LabJackHandlerSubprocess:
     def __conn_thread(self, stop_flag: daemon.StopFlag):
         #print("LabJack Handler connection thread started.")
         while stop_flag.run():
-            time.sleep(0.1)
+            time.sleep(0.02)
 
             target_r, r_speed, jog_r, set_pos = self.__conn.recv()
             self.__target_r = target_r
@@ -379,7 +399,7 @@ class LabJackHandlerSubprocess:
 
     def __send_thread(self, stop_flag: daemon.StopFlag):
         while stop_flag.run():
-            time.sleep(0.1)
+            time.sleep(0.02)
             self.__conn.send((self.__current_r, ))
 
     def __direction_set(self, direction):
@@ -407,10 +427,10 @@ class LabJackHandlerSubprocess:
             l_t = t
 
             if self.__jog_r != 0.0:
-                if self.__jog_r > 0.0:
-                    self.__target_r += self.__r_speed * dt
-                else:
-                    self.__target_r -= self.__r_speed * dt
+                self.__target_r += self.__jog_r * dt
+
+            if self.__r_speed < 0.01 and self.__jog_r == 0.0:
+                self.__target_r = self.__current_r
 
             if target_r < self.__target_r:
                 target_r += self.__r_speed * dt

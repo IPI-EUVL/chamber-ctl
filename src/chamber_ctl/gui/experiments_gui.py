@@ -4,10 +4,11 @@ import os
 import time
 import threading
 from queue import Queue, Empty
+import plotly.graph_objects as go
 
 from ipi_ecs.core import daemon
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader, RunRecord
-from chamber_ctl.subsystems.oscilloscope import DataReader, calculate_dose_of_experiment
+from chamber_ctl.subsystems.oscilloscope import DataReader, calculate_dose_of_experiment, calculate_doses_of_segments
 from ipi_ecs.util.export_experiment import export_experiment_data
 
 
@@ -205,7 +206,7 @@ class QueryFrame(ttk.LabelFrame):
 
         zr = self.__zr_var.get().strip()
         if zr:
-            tag_filters["zr"] = zr
+            tag_filters["zr_filter"] = zr
 
         sample = self.__sample_var.get().strip()
         if sample:
@@ -372,8 +373,17 @@ class DetailFrame(ttk.LabelFrame):
         self.__desc_entry = ttk.Entry(edit_frame, textvariable=self.__desc_var, state=tk.DISABLED)
         self.__desc_entry.grid(row=1, column=1, sticky=tk.EW, padx=2, pady=2)
 
-        self.__save_btn = ttk.Button(edit_frame, text="Save", command=self.__do_save, state=tk.DISABLED)
-        self.__save_btn.grid(row=2, column=0, columnspan=2, pady=5)
+        btn_frame = ttk.Frame(edit_frame)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=5)
+        self.__save_btn = ttk.Button(btn_frame, text="Save", command=self.__do_save, state=tk.DISABLED)
+        self.__save_btn.pack(side=tk.LEFT, padx=3)
+        self.__copy_id_btn = ttk.Button(
+            btn_frame,
+            text="Copy Experiment ID",
+            command=self.__copy_experiment_id,
+            state=tk.DISABLED,
+        )
+        self.__copy_id_btn.pack(side=tk.LEFT, padx=3)
 
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 4))
 
@@ -457,6 +467,7 @@ class DetailFrame(ttk.LabelFrame):
             self.__name_entry.config(state=tk.DISABLED)
             self.__desc_entry.config(state=tk.DISABLED)
             self.__save_btn.config(state=tk.DISABLED)
+            self.__copy_id_btn.config(state=tk.DISABLED)
             self.__clear_frame(self.__settings_lf)
             self.__tags_tree.delete(*self.__tags_tree.get_children())
             self.__clear_frame(self.__meta_lf)
@@ -466,6 +477,7 @@ class DetailFrame(ttk.LabelFrame):
         self.__name_entry.config(state=tk.NORMAL)
         self.__desc_entry.config(state=tk.NORMAL)
         self.__save_btn.config(state=tk.NORMAL)
+        self.__copy_id_btn.config(state=tk.NORMAL)
 
         self.__name_var.set(record.get_name() or "")
         self.__desc_var.set(record.get_description() or "")
@@ -505,6 +517,15 @@ class DetailFrame(ttk.LabelFrame):
             self.__on_saved(self.__record)
         except Exception as e:
             messagebox.showerror("Save Failed", str(e))
+
+    def __copy_experiment_id(self):
+        if self.__record is None:
+            return
+        run_uuid = self.__record.get_state().get_uuid()
+        uuid_text = str(run_uuid)
+        self.clipboard_clear()
+        self.clipboard_append(uuid_text)
+        self.update_idletasks()
 
     def __add_tag_dialog(self):
         self.__tag_dialog(title="Add Or Update Tag")
@@ -597,8 +618,12 @@ class ExperimentsGUI:
         self.__export_queue: Queue = Queue()
         self.__export_worker = None
 
+        self.__plot_queue: Queue = Queue()
+        self.__plot_worker = None
+
         self.__loading_dialog = None
         self.__loading_progressbar = None
+        self.__loading_progress_var = tk.DoubleVar(value=0.0)
 
         self.__status_var = tk.StringVar(value="Ready.")
         ttk.Label(root, textvariable=self.__status_var, anchor=tk.W, relief=tk.SUNKEN, padding=(4, 2)).pack(
@@ -630,6 +655,16 @@ class ExperimentsGUI:
             text="Recalculate Doses (Listed)",
             command=self.__on_recalculate_listed_doses,
         ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            self.__actions_frame,
+            text="Combined Dose/Runtime (Selected)",
+            command=self.__on_combined_selected_dose_runtime,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            self.__actions_frame,
+            text="Plot Dose Graph (Selected)",
+            command=self.__on_plot_selected_dose_graph,
+        ).pack(side=tk.LEFT, padx=2)
 
         self.__results_frame = ResultsFrame(left, on_selection_changed=self.__on_selection_changed)
         self.__results_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -653,7 +688,7 @@ class ExperimentsGUI:
         self.__show_loading_dialog("Loading all experiments...")
         self.__status_var.set("Loading all experiments...")
 
-    def __show_loading_dialog(self, message: str):
+    def __show_loading_dialog(self, message: str, determinate: bool = False, maximum: int = 1):
         if self.__loading_dialog is not None and self.__loading_dialog.winfo_exists():
             self.__hide_loading_dialog()
 
@@ -668,9 +703,17 @@ class ExperimentsGUI:
         frame.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(frame, text=message).pack(anchor=tk.W, pady=(0, 6))
-        self.__loading_progressbar = ttk.Progressbar(frame, mode="indeterminate")
+        mode = "determinate" if determinate else "indeterminate"
+        self.__loading_progress_var.set(0.0)
+        self.__loading_progressbar = ttk.Progressbar(
+            frame,
+            mode=mode,
+            variable=self.__loading_progress_var,
+            maximum=max(maximum, 1),
+        )
         self.__loading_progressbar.pack(fill=tk.X)
-        self.__loading_progressbar.start(10)
+        if not determinate:
+            self.__loading_progressbar.start(10)
 
         dialog.protocol("WM_DELETE_WINDOW", lambda: None)
         self.__loading_dialog = dialog
@@ -683,6 +726,7 @@ class ExperimentsGUI:
             self.__loading_dialog.destroy()
         self.__loading_dialog = None
         self.__loading_progressbar = None
+        self.__loading_progress_var.set(0.0)
 
     def __on_selection_changed(self, record: RunRecord):
         self.__detail_frame.load_record(record)
@@ -751,6 +795,56 @@ class ExperimentsGUI:
 
         self.__start_dose_recalc([record])
 
+    def __on_combined_selected_dose_runtime(self):
+        records = self.__results_frame.get_selected_records()
+        if not records:
+            messagebox.showinfo("Combined Dose/Runtime", "Select one or more experiments from the list first.")
+            return
+
+        dose_total = 0.0
+        runtime_total = 0.0
+        dose_count = 0
+        runtime_count = 0
+        invalid_dose = 0
+        invalid_runtime = 0
+
+        for record in records:
+            tags = record.get_tags() or {}
+
+            dose_val = tags.get("dose")
+            if dose_val is not None:
+                try:
+                    dose_total += float(dose_val)
+                    dose_count += 1
+                except (TypeError, ValueError):
+                    invalid_dose += 1
+
+            runtime_val = tags.get("runtime")
+            if runtime_val is not None:
+                try:
+                    runtime_total += float(runtime_val)
+                    runtime_count += 1
+                except (TypeError, ValueError):
+                    invalid_runtime += 1
+
+        selected_count = len(records)
+        self.__status_var.set(
+            f"Combined selected ({selected_count}): dose={dose_total:.6g} mJ/cm2, runtime={runtime_total:.6g} s"
+        )
+
+        message = (
+            f"Selected experiments: {selected_count}\n"
+            f"\n"
+            f"Total dose: {dose_total:.6g} mJ/cm2 (from {dose_count} tag(s))\n"
+            f"Total runtime: {runtime_total:.6g} s (from {runtime_count} tag(s))"
+        )
+        if invalid_dose or invalid_runtime:
+            message += (
+                f"\n\nIgnored invalid values — dose: {invalid_dose}, runtime: {invalid_runtime}."
+            )
+
+        messagebox.showinfo("Combined Dose/Runtime", message)
+
     def __start_dose_recalc(self, records: list[RunRecord]):
 
         if self.__dose_recalc_worker is not None and self.__dose_recalc_worker.is_alive():
@@ -766,6 +860,63 @@ class ExperimentsGUI:
             daemon=True,
         )
         self.__dose_recalc_worker.start()
+
+    def __on_plot_selected_dose_graph(self):
+        records = self.__results_frame.get_selected_records()
+        if not records:
+            messagebox.showinfo("Plot Dose Graph", "Select one or more experiments from the list first.")
+            return
+
+        if self.__plot_worker is not None and self.__plot_worker.is_alive():
+            messagebox.showinfo("Plot Dose Graph", "A graph is already being prepared.")
+            return
+
+        run_ids = [record.get_state().get_uuid() for record in records]
+        self.__show_loading_dialog(
+            f"Preparing dose graph for {len(run_ids)} experiment(s)...",
+            determinate=True,
+            maximum=len(run_ids),
+        )
+        self.__status_var.set(f"Preparing dose graph for {len(run_ids)} experiment(s)...")
+
+        self.__plot_worker = threading.Thread(
+            target=self.__plot_selected_thread,
+            args=(run_ids,),
+            daemon=True,
+        )
+        self.__plot_worker.start()
+
+    def __plot_selected_thread(self, run_ids: list):
+        data_reader = DataReader(self.__data_path)
+        exp_reader = ExperimentReader(self.__data_path, self.__exp_name)
+        traces = []
+        errors = []
+        total = len(run_ids)
+
+        for idx, run_uuid in enumerate(run_ids, start=1):
+            try:
+                run = exp_reader.locate_run_by_uuid(run_uuid)
+                name = f"{run.get_name()}:{run.get_description()}"
+
+                doses, times = calculate_doses_of_segments(run_uuid, data_reader)
+                abs_doses = []
+                abs_times = []
+                running_total = 0.0
+                running_time = 0.0
+
+                for dose, run_time in zip(doses, times):
+                    running_total += float(dose)
+                    running_time += float(run_time)
+                    abs_doses.append(running_total)
+                    abs_times.append(running_time)
+
+                traces.append((name, abs_times, abs_doses))
+                self.__plot_queue.put(("progress", idx, total, run_uuid))
+            except Exception as e:
+                errors.append((run_uuid, str(e)))
+                self.__plot_queue.put(("error", idx, total, run_uuid, str(e)))
+
+        self.__plot_queue.put(("done", traces, errors, total))
 
     def __open_dose_progress_dialog(self, total_count: int):
         if self.__dose_dialog is not None and self.__dose_dialog.winfo_exists():
@@ -921,6 +1072,53 @@ class ExperimentsGUI:
                     else:
                         self.__status_var.set(f"Export complete: {total}/{total} succeeded.")
                         messagebox.showinfo("Export Complete", f"Exported {total} experiment(s).")
+        except Empty:
+            pass
+
+        try:
+            while True:
+                msg = self.__plot_queue.get_nowait()
+                m_type = msg[0]
+
+                if m_type == "progress":
+                    _t, done, total, run_uuid = msg
+                    self.__loading_progress_var.set(done)
+                    self.__status_var.set(f"Preparing graph {done}/{total} (...{str(run_uuid)[-8:]})")
+
+                elif m_type == "error":
+                    _t, done, total, run_uuid, err = msg
+                    self.__loading_progress_var.set(done)
+                    self.__status_var.set(f"Graph {done}/{total}: failed ...{str(run_uuid)[-8:]} ({err})")
+
+                elif m_type == "done":
+                    _t, traces, errors, total = msg
+                    self.__hide_loading_dialog()
+
+                    if traces:
+                        fig = go.Figure()
+                        for name, times, doses in traces:
+                            fig.add_trace(go.Scatter(x=times, y=doses, mode="lines", name=name))
+                        fig.update_layout(
+                            title="Dose vs Time",
+                            xaxis_title="Time (s)",
+                            yaxis_title="Dose (mJ/cm2)",
+                        )
+                        fig.show()
+
+                    if errors:
+                        success = len(traces)
+                        self.__status_var.set(
+                            f"Graph ready with errors: {success}/{total} experiments plotted."
+                        )
+                        first_uuid, first_err = errors[0]
+                        messagebox.showwarning(
+                            "Plot Dose Graph",
+                            f"Plotted {success}/{total} experiment(s). "
+                            f"First error (...{str(first_uuid)[-8:]}): {first_err}",
+                        )
+                    else:
+                        self.__status_var.set(f"Graph ready: {len(traces)}/{total} experiments plotted.")
+
         except Empty:
             pass
 

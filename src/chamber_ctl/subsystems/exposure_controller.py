@@ -33,6 +33,13 @@ class ExposureSettings(RunSettings):
         self.data["zr_filter"] = zr_filter
         self.data["sample"] = sample
 
+    def set_attr(self, key, value):
+        if (self.data["target_time"] is not None and key == "target_dose" and float(value) > 0.1) and self.data["target_time"] >= 0.1:
+            raise ValueError("Cannot set target_dose when target_time is already set. Please clear target_time before setting target_dose.")
+        if (self.data["target_dose"] is not None and self.data["target_dose"] >= 0.1) and key == "target_time" and float(value) > 0.1:
+            raise ValueError("Cannot set target_time when target_dose is already set. Please clear target_dose before setting target_time.")
+        return super().set_attr(key, value)
+
     def get_target_time(self) -> float:
         return self.data.get("target_time", 0.0)
     
@@ -65,8 +72,9 @@ class ExposureSettings(RunSettings):
 def main(stop_event: "multiprocessing.Event"):
     __SAVE_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
     m_run_controller = ExperimentController("ExposureController", uuids.UUID_EXPOSURE_CONTROLLER, "exposure", __SAVE_PATH)
-    #m_run_controller.add_required_subsystem(uuids.UUID_TARGET_CONTROLLER)
-    m_run_controller.add_required_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER)
+    m_run_controller.add_required_subsystem(uuids.UUID_TARGET_CONTROLLER, "Target Controller")
+    m_run_controller.add_required_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER, "Oscilloscope Controller")
+    m_run_controller.add_required_subsystem(uuids.UUID_LASER_CONTROLLER, "Laser Controller")
     m_run_controller.register_experiment_settings_type(ExposureSettings)
 
     try:
