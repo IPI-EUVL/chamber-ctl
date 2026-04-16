@@ -27,7 +27,7 @@ from ipi_ecs.subsystems.experiment_client import ExperimentClient, RunState
 
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.target_motion import TargetMotion, TargetMotionConfig, TargetMotionProfile, MotionSegment, MotionState
-from chamber_ctl.subsystems.ljs_target_motion import LJSerialTargetMotion
+#from chamber_ctl.subsystems.ljs_target_motion import LJSerialTargetMotion
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 
 
@@ -104,7 +104,7 @@ class MockTargetMotion(TargetMotion):
 
             if cur_t - last_print_t > 0.025:
                 last_print_t = cur_t
-                print(f"MockTargetMotion @ L={self.__current_l:.3f}/{self.__target_l:.3f} R={self.__current_r:.3f}/{self.__target_r:.3f}")
+                #print(f"MockTargetMotion @ L={self.__current_l:.3f}/{self.__target_l:.3f} R={self.__current_r:.3f}/{self.__target_r:.3f}")
 
     def move_to_position(self, l_pos: float, r_pos: float, speed_l: float, speed_r: float):
         self.__target_l = l_pos
@@ -1029,7 +1029,7 @@ class TargetController(ExperimentClient):
         self.__motion_controller.jog(value[0], value[1])
 
     def ok(self):
-        return self.__run and self.__client.ok()
+        return self.__run and self.__client.ok() and self.__daemon.is_ok()
     
     def close(self):
         print("Closing Target Controller...")
