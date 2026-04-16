@@ -75,6 +75,10 @@ class LaserSyncProvider(abc.ABC):
         pass
 
     @abc.abstractmethod
+    def do_single_shot(self, expose_time: float) -> tuple[bool, str]:
+        pass
+
+    @abc.abstractmethod
     def start(self):
         pass
 

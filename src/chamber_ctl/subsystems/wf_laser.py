@@ -190,6 +190,24 @@ class WFLaserSyncProvider(LaserSyncProvider):
             return False
 
         return (time.monotonic() - self.__laser_started_time) < self.__laser_warmup_time
+    
+    def do_single_shot(self, shut_phase: float, open_phase: float, expose_time: float):
+        if self.get_chopper_starting_up():
+            return False, "Cannot do single shot while chopper is starting up."
+        if self.get_laser_warming_up():
+            return False, "Cannot do single shot while laser is warming up."
+        
+        self.set_target_phase(open_phase) # Open chopper
+        while abs(self.__current_phase - open_phase) > 1e-2:
+            time.sleep(0.01)
+
+        time.sleep(expose_time)
+
+        self.set_target_phase(shut_phase) # Close chopper
+        while abs(self.__current_phase - shut_phase) > 1e-2:
+            time.sleep(0.01)
+            
+        return True, f"Single shot completed with expose time {expose_time:.3f} s."
 
     def __thread(self, stop_flag: daemon.StopFlag):
         last_time = time.monotonic()

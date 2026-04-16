@@ -10,7 +10,7 @@ from chamber_ctl.subsystems.uuids import UUID_TARGET_CONTROLLER
 from ipi_ecs.cli.captive_cli import wait_for_event
 import ipi_ecs.dds.magics as magics
 
-LIN_LENGTH = 67.5
+LIN_LENGTH = 150
 
 def rotated_rectangle_coords(cx, cy, width, height, angle_deg):
     """

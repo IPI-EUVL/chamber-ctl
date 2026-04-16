@@ -5,6 +5,7 @@ import pickle
 import queue
 import struct
 import time
+import traceback
 import uuid
 import sys
 import mt_events
@@ -168,9 +169,24 @@ class TargetMotionController:
 
         self.__motion.start()
 
-        self.__daemon = daemon.Daemon()
+        self.__logger = logger
+
+        self.__daemon = daemon.Daemon(exception_handler=self.handle_exception)
         self.__daemon.add(target=self.__move_thread)
         self.__daemon.start()
+
+    def handle_exception(self, e: Exception):
+        self.__log("Caught exception on daemon thread!", level="ERROR")
+        for line in traceback.format_exception(None, e, e.__traceback__):
+            for split in line.split('\n'):
+                self.__log(split, level="ERROR")
+    
+    def __log(self, msg, level = "INFO", **data):
+        if self.__logger is None:
+            print(level, msg)
+            return
+        
+        self.__logger.log(msg, level=level, l_type="SW", subsystem="Target Controller", **data)
 
     def set_profile(self, profile: TargetMotionProfile):
         self.__state.set_profile(profile)
@@ -284,7 +300,7 @@ class TargetMotionController:
         self.__offset_r = 0.0
 
     def __effective_start(self):
-        return self.__start_l + self.__offset_l, self.__start_r + self.__offset_r
+        return self.__start_l + self.__offset_l, 0 #not very effective huh? self.__start_r + self.__offset_r
 
     def set_offset_position(self, l_offset: float, r_offset: float):
         if not self.can_modify():
@@ -448,6 +464,8 @@ class TargetController(ExperimentClient):
         self.__did_config = False
         self.__subsystem = None
 
+        self.__profile = None
+        
         def _on_ready():
             if self.__did_config:
                 return
@@ -484,11 +502,12 @@ class TargetController(ExperimentClient):
         self.__config_save_interval_s = 30.0
         self.__last_periodic_save = time.monotonic()
 
+        self.__last_preinit_feedback = 0.0
+
         self.__config_save_queue = queue.Queue()
         self.__config_save_in_progress = False
 
-        self.__motion_controller = TargetMotionController()
-        self.__profile = None
+        self.__motion_controller = TargetMotionController(self.__logger)
 
         self.__config_daemon = daemon.Daemon()
         self.__config_daemon.add(target=self.__config_saver_thread)
@@ -496,7 +515,7 @@ class TargetController(ExperimentClient):
 
         self.__load_profile()
 
-        self.__daemon = daemon.Daemon()
+        self.__daemon = daemon.Daemon(exception_handler=self.handle_exception)
         self.__daemon.add(target=self.__thread)
         self.__daemon.start()
         
@@ -614,9 +633,9 @@ class TargetController(ExperimentClient):
     def __save_profile(self, library: db_library.Library, bdata: bytes):
         rec = self.__get_or_create_profile_record(library)
 
-        self.__logger.log(f"Saving state (current/remaining): {self.__motion_controller.get_current_time()}/{self.__motion_controller.get_state().get_remaining_time()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
-        self.__logger.log(f"Start position @ {self.__motion_controller.get_start_position()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
-        self.__logger.log(f"Offset position @ {self.__motion_controller.get_offset_position()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
+        self.__logger.log(f"Saving state (current/remaining): {self.__motion_controller.get_current_time()}/{self.__motion_controller.get_state().get_remaining_time()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
+        self.__logger.log(f"Start position @ {self.__motion_controller.get_start_position()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
+        self.__logger.log(f"Offset position @ {self.__motion_controller.get_offset_position()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
 
         res = rec.resource("motion_state.bin", "Motion State", "wb")
         res.write(bdata)
@@ -731,6 +750,11 @@ class TargetController(ExperimentClient):
                 # Continue already handles this
                 #if not self.__motion_controller.is_running() and self.__motion_controller.at_path_position():
                 #    self.__motion_controller.continue_move()
+
+                if time.time() - self.__last_preinit_feedback > 5.0:
+                    self.__preinit_handle.feedback(b"Moving to position...")
+                    self.__logger.log("Moving to position...", level="INFO", l_type="CTRL", subsystem="Target Controller", event="motion_start")
+                    self.__last_preinit_feedback = time.time()
                 
                 if self.__motion_controller.is_running():
                     self.__logger.log("Started motion.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="motion_start")
@@ -843,7 +867,7 @@ class TargetController(ExperimentClient):
             return
 
         l_pos, r_pos = self.__motion_controller.get_current_position()
-        self.__motion_controller.set_start_position(l_pos, r_pos)
+        self.__motion_controller.set_start_position(l_pos, 0)
         self.__request_profile_save()
 
         self.__logger.log(f"Set start position to current position @ L={l_pos}, R={r_pos}", level="INFO", l_type="CTRL", subsystem="Target Controller", event="set_start_position")
@@ -1030,6 +1054,19 @@ class TargetController(ExperimentClient):
         self.__logger_sock.close()
 
         self.__run = False
+
+    def handle_exception(self, e: Exception):
+        self.__log("Caught exception on daemon thread!", level="ERROR")
+        for line in traceback.format_exception(None, e, e.__traceback__):
+            for split in line.split('\n'):
+                self.__log(split, level="ERROR")
+    
+    def __log(self, msg, level = "INFO", **data):
+        if self.__logger is None:
+            print(level, msg)
+            return
+        
+        self.__logger.log(msg, level=level, l_type="SW", subsystem="Target Controller", **data)
 
 
 def main(stop_event=None):

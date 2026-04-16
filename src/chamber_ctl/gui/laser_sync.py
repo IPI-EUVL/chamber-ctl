@@ -1,9 +1,11 @@
 import argparse
 import pickle
 import queue
+import struct
 import sys
 import time
 import tkinter as tk
+import traceback
 import uuid
 
 import segment_bytes
@@ -51,6 +53,10 @@ class LaserSyncTestGUI:
         self.__chopper_off_event = None
         self.__set_phase_event = None
 
+        self.__do_timed_exposure_event = None
+        self.__do_continuous_exposure_event = None
+        self.__laser_shut_event = None
+
         self.__current_status = None
         self.__ui_queue = queue.Queue()
         self.__cmd_queue = queue.Queue()
@@ -68,12 +74,25 @@ class LaserSyncTestGUI:
         self.__build_ui(root)
         self.__setup_client()
 
-        self.__daemon = daemon.Daemon()
+        self.__daemon = daemon.Daemon(exception_handler=self.handle_exception)
         self.__daemon.add(self.__worker_thread)
         self.__daemon.start()
 
         self.__root.after(100, self.__ui_tick)
         self.__root.after(800, self.__periodic_refresh)
+
+    def handle_exception(self, e: Exception):
+        self.__log("Caught exception on daemon thread!", level="ERROR")
+        for line in traceback.format_exception(None, e, e.__traceback__):
+            for split in line.split('\n'):
+                self.__log(split, level="ERROR")
+    
+    def __log(self, msg, level = "INFO", **data):
+        if self.__logger is None:
+            print(level, msg)
+            return
+        
+        self.__logger.log(msg, level=level, l_type="SW", subsystem="Laser Sync GUI", **data)
 
     def __build_ui(self, root: tk.Tk):
         root.title("Laser Sync Test")
@@ -156,6 +175,18 @@ class LaserSyncTestGUI:
         self.__manual_phase_entry.insert(0, "0.0")
         self.__manual_phase_entry.grid(row=1, column=1, padx=8, pady=8, sticky="w")
         tk.Button(manual_frame, text="Set Manual Target", command=self.__on_set_manual_phase).grid(row=1, column=2, padx=8, pady=8)
+
+        exposure_frame = tk.LabelFrame(frame, text="Timed Exposure Control")
+        exposure_frame.pack(fill=tk.X, pady=(8, 8))
+
+        tk.Label(exposure_frame, text="Exposure Time (s)", font=("Arial", 11)).grid(row=0, column=0, padx=8, pady=8, sticky="w")
+        self.__exposure_time_entry = tk.Entry(exposure_frame, width=16)
+        self.__exposure_time_entry.insert(0, "1.0")
+        self.__exposure_time_entry.grid(row=0, column=1, padx=8, pady=8, sticky="w")
+        tk.Button(exposure_frame, text="Do Timed Exposure", command=self.__on_do_timed_exposure).grid(row=0, column=2, padx=8, pady=8)
+
+        tk.Button(exposure_frame, text="Do Continuous", width=14, command=self.__on_do_continuous_exposure).grid(row=1, column=0, padx=8, pady=8)
+        tk.Button(exposure_frame, text="Laser Shut", width=14, command=self.__on_laser_shut).grid(row=1, column=1, padx=8, pady=8)
 
         status_frame = tk.LabelFrame(frame, text="Laser Status")
         status_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -244,6 +275,10 @@ class LaserSyncTestGUI:
         self.__chopper_off_event = handle.add_event_provider(b"laser_test_chopper_off")
         self.__set_phase_event = handle.add_event_provider(b"laser_test_set_phase")
 
+        self.__do_timed_exposure_event = handle.add_event_provider(b"laser_do_timed_exposure")
+        self.__do_continuous_exposure_event = handle.add_event_provider(b"laser_do_continuous_exposure")
+        self.__laser_shut_event = handle.add_event_provider(b"laser_shut")
+
         self.__connected = True
         self.__ui_queue.put(("connected", None))
         self.__cmd_queue.put(("refresh_phases", None))
@@ -297,6 +332,12 @@ class LaserSyncTestGUI:
                     self.__call_simple_test_event(self.__chopper_off_event, "Chopper OFF")
                 elif cmd == "set_manual_phase":
                     self.__call_set_manual_target(payload)
+                elif cmd == "do_timed_exposure":
+                    self.__call_do_timed_exposure(payload)
+                elif cmd == "do_continuous_exposure":
+                    self.__call_do_continuous_exposure()
+                elif cmd == "laser_shut":
+                    self.__call_laser_shut()
             except Exception as exc:
                 self.__ui_queue.put(("result", f"Action failed: {exc}"))
 
@@ -374,6 +415,28 @@ class LaserSyncTestGUI:
 
         payload = pickle.dumps(float(phase))
         self.__run_event_with_feedback(self.__set_phase_event, f"Set manual target {phase:.3f}", payload=payload, timeout=30.0)
+
+    def __call_do_timed_exposure(self, expose_time: float):
+        if self.__do_timed_exposure_event is None:
+            self.__ui_queue.put(("result", "Timed exposure event provider not available."))
+            return
+
+        payload = struct.pack('d', float(expose_time))
+        self.__run_event_with_feedback(self.__do_timed_exposure_event, f"Timed exposure {expose_time:.3f}s", payload=payload, timeout=expose_time + 30.0)
+
+    def __call_do_continuous_exposure(self):
+        if self.__do_continuous_exposure_event is None:
+            self.__ui_queue.put(("result", "Continuous exposure event provider not available."))
+            return
+
+        self.__run_event_with_feedback(self.__do_continuous_exposure_event, "Continuous exposure", payload=bytes(), timeout=30.0)
+
+    def __call_laser_shut(self):
+        if self.__laser_shut_event is None:
+            self.__ui_queue.put(("result", "Laser shut event provider not available."))
+            return
+
+        self.__run_event_with_feedback(self.__laser_shut_event, "Laser shut", payload=bytes(), timeout=30.0)
 
     @staticmethod
     def __decode_result_text(value) -> str:
@@ -607,6 +670,21 @@ class LaserSyncTestGUI:
             return
 
         self.__cmd_queue.put(("set_manual_phase", value))
+
+    def __on_do_timed_exposure(self):
+        try:
+            value = float(self.__exposure_time_entry.get().strip())
+        except ValueError:
+            self.__result_label.config(text="Last action: invalid exposure time value")
+            return
+
+        self.__cmd_queue.put(("do_timed_exposure", value))
+
+    def __on_do_continuous_exposure(self):
+        self.__cmd_queue.put(("do_continuous_exposure", None))
+
+    def __on_laser_shut(self):
+        self.__cmd_queue.put(("laser_shut", None))
 
     def ok(self):
         return self.__run and self.__client.ok() and self.__daemon.is_ok()

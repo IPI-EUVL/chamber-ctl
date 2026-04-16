@@ -1,4 +1,5 @@
 import time
+import traceback
 import uuid
 import sys
 import argparse
@@ -62,11 +63,24 @@ class PulseDosageDisplay:
         self.__client = client.DDSClient(c_uuid, logger=self.__logger)
         self.__client.when_ready().then(_on_ready)
 
-        self.__daemon = daemon.Daemon()
+        self.__daemon = daemon.Daemon(exception_handler=self.handle_exception)
         self.__daemon.add(self.__calc_thread)
         self.__daemon.start()
 
         self.__update_values() # start the periodic update of the dose label
+
+    def handle_exception(self, e: Exception):
+        self.__log("Caught exception on daemon thread!", level="ERROR")
+        for line in traceback.format_exception(None, e, e.__traceback__):
+            for split in line.split('\n'):
+                self.__log(split, level="ERROR")
+
+    def __log(self, msg, level = "INFO", **data):
+        if self.__logger is None:
+            print(level, msg)
+            return
+        
+        self.__logger.log(msg, level=level, l_type="SW", subsystem="Dosage GUI", **data)
 
     def __initialize_component(self, root: tk.Tk):
         pulses_frame = tk.LabelFrame(root, text="Pulse Display")
@@ -128,7 +142,7 @@ class PulseDosageDisplay:
                     self.__logger.log(f"New experiment {exp} detected, resetting total dose.", level="INFO", l_type="SW", subsystem="Dose GUI")
                     self.__total_dose, self.__total_time = calculate_dose_of_experiment(exp, self.__d_reader)
                     last_experiment = exp
-                except (ValueError, TypeError) as e:
+                except Exception as e:
                     self.__logger.log(f"Error calculating dose for experiment {exp}: {e}", level="ERROR", l_type="SW", subsystem="Dose GUI")
                     last_experiment = None # reset experiment to force recalculation on next segment
                 continue
@@ -139,7 +153,7 @@ class PulseDosageDisplay:
                 self.__total_time += r_time
 
                 self.__update_phosphor(exp, segment, self.__phosphor)
-            except (ValueError, TypeError) as e:
+            except (Exception) as e:
                 self.__logger.log(f"Error calculating dose for experiment {exp}, segment {segment}: {e}", level="ERROR", l_type="SW", subsystem="Dose GUI")
                 last_experiment = None # reset experiment to force recalculation on next segment
                 continue

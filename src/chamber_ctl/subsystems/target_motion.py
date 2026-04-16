@@ -364,7 +364,7 @@ class MotionState:
         self.__rep_amount = int(max_l_size // l_size)
 
     def resume_from(self, time: float):
-        self.__current_position = time
+        self.__current_position = time % self.__profile.get_length()
         self.__current_rep = int(time // self.__profile.get_length())
 
         r_t = time % self.__profile.get_length()
@@ -477,6 +477,7 @@ class MotionState:
                 struct.pack("d", self.__current_position),
                 self.__current_segment.to_bytes(4, "big"),
                 self.__rep_amount.to_bytes(4, "big"),
+                self.__current_rep.to_bytes(4, "big"),
             ]
         )
         b_profile = self.__profile.encode()
@@ -494,6 +495,8 @@ class MotionState:
         state.set_position(struct.unpack("d", my_data[0])[0])
         state.set_segment(int.from_bytes(my_data[1], "big"))
         state.set_rep_amount(int.from_bytes(my_data[2], "big"))
+        if len(my_data) >= 4:
+            state._MotionState__current_rep = int.from_bytes(my_data[3], "big")
 
         return state
 

@@ -1,4 +1,6 @@
 import time
+import traceback
+import traceback
 import uuid
 import pickle
 import os
@@ -125,6 +127,25 @@ class DummyLaserSyncProvider:
         
         return (time.monotonic() - self.__laser_started_time) < self.__laser_warmup_time
     
+    def do_single_shot(self, shut_phase: float, open_phase: float, expose_time: float):
+        if self.get_chopper_starting_up():
+            return False, "Cannot do single shot while chopper is starting up."
+        if self.get_laser_warming_up():
+            return False, "Cannot do single shot while laser is warming up."
+        # In a real implementation, this would trigger the laser and chopper for a single exposure of the given time.
+        # Here we just simulate the timing.
+        self.set_target_phase(open_phase) # Open chopper
+        while abs(self.__current_phase - open_phase) > 1e-2:
+            time.sleep(0.01)
+
+        time.sleep(expose_time)
+
+        self.set_target_phase(shut_phase) # Close chopper
+        while abs(self.__current_phase - shut_phase) > 1e-2:
+            time.sleep(0.01)
+            
+        return True, f"Single shot completed with expose time {expose_time:.3f} s."
+    
     def __thread(self, stop_flag: daemon.StopFlag):
         last_time = time.monotonic()
         while stop_flag.run():
@@ -202,6 +223,10 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__test_chopper_off_handle = None
         self.__test_set_phase_handle = None
 
+        self.__do_timed_exposure_handle = None
+        self.__do_continuous_exposure_handle = None
+        self.__laser_shut_handle = None
+
         self.__experiment_active = False
         self.__test_active = False
 
@@ -261,7 +286,7 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__client = client.DDSClient(c_uuid, logger=self.__logger)
         self.__client.when_ready().then(_on_ready)
 
-        self.__daemon = daemon.Daemon()
+        self.__daemon = daemon.Daemon(exception_handler=self.handle_exception)
         self.__daemon.add(target=self.__thread)
         self.__daemon.add(target=self.__setter_worker_thread)
         self.__daemon.add(target=self.__config_saver_thread)
@@ -269,6 +294,19 @@ class LaserSyncSubsystem(ExperimentClient):
 
         super().__init__("exposure", "Laser Sync Controller", self.__logger)
         self.register_experiment_settings_type(ExposureSettings)
+
+    def handle_exception(self, e: Exception):
+        self.__log("Caught exception on daemon thread!", level="ERROR")
+        for line in traceback.format_exception(None, e, e.__traceback__):
+            for split in line.split('\n'):
+                self.__log(split, level="ERROR")
+
+    def __log(self, msg, level = "INFO", **data):
+        if self.__logger is None:
+            print(level, msg)
+            return
+        
+        self.__logger.log(msg, level=level, l_type="SW", subsystem="Laser Sync Controller", **data)
 
     def __load_config(self):
         library = db_library.Library(self.__SAVE_PATH)
@@ -472,6 +510,12 @@ class LaserSyncSubsystem(ExperimentClient):
                     self.__execute_test_chopper_off_setters()
                 elif job_name == "test_set_phase":
                     self.__execute_test_set_phase_setters(float(payload))
+                elif job_name == "do_timed_exposure":
+                    self.__execute_do_timed_exposure(float(payload))
+                elif job_name == "do_continuous_exposure":
+                    self.__execute_do_continuous_exposure()
+                elif job_name == "laser_shut":
+                    self.__execute_laser_shut()
             except Exception as exc:
                 self.__logger.log(
                     f"Setter worker error in {job_name}: {exc}",
@@ -716,6 +760,60 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__refresh_test_active()
         handle.ret(OP_OK + b": " + status)
 
+    def __execute_do_timed_exposure(self, expose_time: float):
+        handle = self.__do_timed_exposure_handle
+        if handle is None:
+            return
+
+        self.__do_timed_exposure_handle = None
+        try:
+            ok, status = self.__provider_set(handle, "Running timed exposure", self.__sync.do_single_shot, self.__preinit_phase, self.__target_phase, expose_time)
+        except Exception as exc:
+            handle.fail(self.__to_bytes(f"Timed exposure failed: {exc}"))
+            return
+
+        if not ok:
+            handle.fail(status)
+            return
+
+        handle.ret(OP_OK + b": " + status)
+
+    def __execute_do_continuous_exposure(self):
+        handle = self.__do_continuous_exposure_handle
+        if handle is None:
+            return
+
+        self.__do_continuous_exposure_handle = None
+        try:
+            ok, status = self.__provider_set(handle, "Starting continuous exposure", self.__sync.set_target_phase, self.__target_phase)
+        except Exception as exc:
+            handle.fail(self.__to_bytes(f"Continuous exposure failed: {exc}"))
+            return
+
+        if not ok:
+            handle.fail(status)
+            return
+
+        handle.ret(OP_OK + b": " + status)
+
+    def __execute_laser_shut(self):
+        handle = self.__laser_shut_handle
+        if handle is None:
+            return
+
+        self.__laser_shut_handle = None
+        try:
+            ok, status = self.__provider_set(handle, "Shutting laser", self.__sync.set_target_phase, self.__preinit_phase)
+        except Exception as exc:
+            handle.fail(self.__to_bytes(f"Laser shut failed: {exc}"))
+            return
+
+        if not ok:
+            handle.fail(status)
+            return
+
+        handle.ret(OP_OK + b": " + status)
+
     def __phase_at(self, phase: float) -> bool:
         return abs(self.__sync.get_current_phase() - phase) <= self.PHASE_EPSILON
 
@@ -831,7 +929,7 @@ class LaserSyncSubsystem(ExperimentClient):
         return False, b"Laser/chopper are not active."
 
     def _can_preinit(self, settings, state):
-        if self.__test_active or self.__test_in_progress():
+        if self.__test_active or self.__test_in_progress() or self.__exposure_control_in_progress():
             return False, b"Laser test control is active."
 
         return super()._can_preinit(settings, state)
@@ -848,8 +946,18 @@ class LaserSyncSubsystem(ExperimentClient):
             or self.__test_set_phase_handle is not None
         )
 
+    def __exposure_control_in_progress(self) -> bool:
+        return (
+            self.__do_timed_exposure_handle is not None
+            or self.__do_continuous_exposure_handle is not None
+            or self.__laser_shut_handle is not None
+        )
+
     def __refresh_test_active(self):
-        self.__test_active = self.__sync.get_laser_on() or self.__sync.get_chopper_on() or self.__test_in_progress()
+        self.__test_active = (
+            not self.__experiment_active
+            and (self.__sync.get_laser_on() or self.__sync.get_chopper_on() or self.__test_in_progress())
+        )
 
     def __on_test_preinit(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
         if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
@@ -966,6 +1074,57 @@ class LaserSyncSubsystem(ExperimentClient):
 
         self.__enqueue_setter_job("test_set_phase", phase)
         handle.feedback(magics.OP_IN_PROGRESS + b": manual phase set started.")
+
+    def __on_do_timed_exposure(self, _s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
+        if self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
+            handle.fail(b"Cannot perform timed exposure during laser lifecycle transitions.")
+            return
+
+        if self.__test_in_progress() or self.__exposure_control_in_progress():
+            handle.fail(b"Laser control already in progress.")
+            return
+
+        self.__do_timed_exposure_handle = handle
+        try:
+            expose_time = struct.unpack('d', param)[0]
+        except (struct.error, IndexError):
+            self.__do_timed_exposure_handle = None
+            handle.fail(b"Invalid exposure time payload.")
+            return
+
+        if expose_time < 0:
+            self.__do_timed_exposure_handle = None
+            handle.fail(b"Exposure time must be non-negative.")
+            return
+
+        self.__enqueue_setter_job("do_timed_exposure", expose_time)
+        handle.feedback(magics.OP_IN_PROGRESS + b": timed exposure started.")
+
+    def __on_do_continuous_exposure(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
+        if self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
+            handle.fail(b"Cannot perform continuous exposure during laser lifecycle transitions.")
+            return
+
+        if self.__test_in_progress() or self.__exposure_control_in_progress():
+            handle.fail(b"Laser control already in progress.")
+            return
+
+        self.__do_continuous_exposure_handle = handle
+        self.__enqueue_setter_job("do_continuous_exposure")
+        handle.feedback(magics.OP_IN_PROGRESS + b": continuous exposure started.")
+
+    def __on_laser_shut(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
+        if self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
+            handle.fail(b"Cannot shut laser during lifecycle transitions.")
+            return
+
+        if self.__test_in_progress() or self.__exposure_control_in_progress():
+            handle.fail(b"Laser control already in progress.")
+            return
+
+        self.__laser_shut_handle = handle
+        self.__enqueue_setter_job("laser_shut")
+        handle.feedback(magics.OP_IN_PROGRESS + b": laser shut started.")
 
     def __on_preinit_phase_write(self, _h, _requester, value: float):
         self.__preinit_phase = value
@@ -1084,6 +1243,10 @@ class LaserSyncSubsystem(ExperimentClient):
         handle.add_event_handler(b"laser_test_chopper_on").on_called(self.__on_test_chopper_on)
         handle.add_event_handler(b"laser_test_chopper_off").on_called(self.__on_test_chopper_off)
         handle.add_event_handler(b"laser_test_set_phase").on_called(self.__on_test_set_phase)
+
+        handle.add_event_handler(b"laser_do_timed_exposure").on_called(self.__on_do_timed_exposure)
+        handle.add_event_handler(b"laser_do_continuous_exposure").on_called(self.__on_do_continuous_exposure)
+        handle.add_event_handler(b"laser_shut").on_called(self.__on_laser_shut)
 
         self.__status_publisher = handle.get_kv_property(b"status", False, True, True)
         self.__status_publisher.set_type(types.ByteTypeSpecifier())

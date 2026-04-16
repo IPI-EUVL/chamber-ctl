@@ -223,7 +223,7 @@ class QueryFrame(ttk.LabelFrame):
 
 
 class ResultsFrame(ttk.LabelFrame):
-    _COLS = ("name", "description", "date", "uuid", "dose", "status")
+    _COLS = ("name", "description", "date", "uuid", "dose", "runtime", "status")
 
     def __init__(self, parent, on_selection_changed):
         super().__init__(parent, text="Results", padding=5)
@@ -256,6 +256,7 @@ class ResultsFrame(ttk.LabelFrame):
         self.__tree.heading("date", text="Created")
         self.__tree.heading("uuid", text="UUID")
         self.__tree.heading("dose", text="Dose")
+        self.__tree.heading("runtime", text="Runtime")
         self.__tree.heading("status", text="Status")
 
         self.__tree.column("name", width=140, minwidth=70)
@@ -263,6 +264,7 @@ class ResultsFrame(ttk.LabelFrame):
         self.__tree.column("date", width=150, minwidth=100)
         self.__tree.column("uuid", width=80, minwidth=60)
         self.__tree.column("dose", width=110, minwidth=80)
+        self.__tree.column("runtime", width=110, minwidth=80)
         self.__tree.column("status", width=80, minwidth=60)
 
         self.__tree.grid(row=0, column=0, sticky=tk.NSEW)
@@ -285,11 +287,12 @@ class ResultsFrame(ttk.LabelFrame):
             uuid_str = str(record.get_state().get_uuid())[-8:]
             status = (end_meta or {}).get("status", "Active")
             dose = self.__dose_display(record)
+            runtime = self.__runtime_display(record)
             name = record.get_name() or ""
             desc = record.get_description() or ""
             if len(desc) > 60:
                 desc = desc[:57] + "..."
-            iid = self.__tree.insert("", tk.END, values=(name, desc, date_str, uuid_str, dose, status))
+            iid = self.__tree.insert("", tk.END, values=(name, desc, date_str, uuid_str, dose, runtime, status))
             self.__records[iid] = record
 
         n = len(records)
@@ -304,11 +307,12 @@ class ResultsFrame(ttk.LabelFrame):
                 uuid_str = str(record.get_state().get_uuid())[-8:]
                 status = (end_meta or {}).get("status", "Active")
                 dose = self.__dose_display(record)
+                runtime = self.__runtime_display(record)
                 name = record.get_name() or ""
                 desc = record.get_description() or ""
                 if len(desc) > 60:
                     desc = desc[:57] + "..."
-                self.__tree.item(iid, values=(name, desc, date_str, uuid_str, dose, status))
+                self.__tree.item(iid, values=(name, desc, date_str, uuid_str, dose, runtime, status))
                 break
 
     @staticmethod
@@ -321,6 +325,17 @@ class ResultsFrame(ttk.LabelFrame):
             return f"{float(dose):.6g}"
         except (TypeError, ValueError):
             return str(dose)
+
+    @staticmethod
+    def __runtime_display(record: RunRecord) -> str:
+        tags = record.get_tags() or {}
+        runtime = tags.get("runtime")
+        if runtime is None:
+            return "None"
+        try:
+            return f"{float(runtime):.6g}"
+        except (TypeError, ValueError):
+            return str(runtime)
 
     def get_records(self) -> list:
         records = []
@@ -754,7 +769,11 @@ class ExperimentsGUI:
         )
 
         run_ids = [record.get_state().get_uuid() for record in records]
-        self.__show_loading_dialog(f"Exporting {len(run_ids)} experiment(s)...")
+        self.__show_loading_dialog(
+            f"Exporting {len(run_ids)} experiment(s)...",
+            determinate=True,
+            maximum=len(run_ids),
+        )
         self.__status_var.set(f"Exporting {len(run_ids)} experiment(s)...")
 
         self.__export_worker = threading.Thread(
@@ -1052,10 +1071,12 @@ class ExperimentsGUI:
 
                 if m_type == "progress":
                     _t, done, total, run_uuid = msg
+                    self.__loading_progress_var.set(done)
                     self.__status_var.set(f"Exported {done}/{total} experiments...")
 
                 elif m_type == "error":
                     _t, done, total, run_uuid, err = msg
+                    self.__loading_progress_var.set(done)
                     self.__status_var.set(f"Export {done}/{total}: failed ...{str(run_uuid)[-8:]} ({err})")
 
                 elif m_type == "done":

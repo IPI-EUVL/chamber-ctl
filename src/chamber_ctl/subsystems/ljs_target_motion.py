@@ -5,6 +5,7 @@ import pickle
 import struct
 import time
 import sys
+import traceback
 import mt_events
 import serial
 
@@ -59,7 +60,7 @@ class LJSerialTargetMotion(TargetMotion):
 
         self.__lin_lock = Lock()
 
-        self.__daemon = daemon.Daemon()
+        self.__daemon = daemon.Daemon(exception_handler=self.handle_exception)
         self.__daemon.add(target=self.__l_thread)
         self.__daemon.add(target=self.__rot_thread)
 
@@ -68,6 +69,19 @@ class LJSerialTargetMotion(TargetMotion):
         self.__init_lin()
 
         self.__daemon.start()
+
+    def handle_exception(self, e: Exception):
+        self.__log("Caught exception on daemon thread!", level="ERROR")
+        for line in traceback.format_exception(None, e, e.__traceback__):
+            for split in line.split('\n'):
+                self.__log(split, level="ERROR")
+
+    def __log(self, msg, level = "INFO", **data):
+        if self.__logger is None:
+            print(level, msg)
+            return
+        
+        self.__logger.log(msg, level=level, l_type="SW", subsystem="Target Motion", **data)
 
     def close(self):
         if self.__rot_process is not None:
@@ -178,6 +192,8 @@ class LJSerialTargetMotion(TargetMotion):
 
         print(f"LIN command response: {ret}")
 
+        self.__logger.log(f"LIN command: {line}, response: {ret}", level="DEBUG", l_type="REC", subsystem="Target Motion")
+
         if ret.startswith("01:OK"):
             return True
         else:
@@ -218,6 +234,7 @@ class LJSerialTargetMotion(TargetMotion):
             print("LIN already moving, stopping first.")
             self.__stop_lin()
 
+        self.__logger.log(f"Moving LIN to position {position} at speed {speed}.", level="DEBUG", l_type="REC", subsystem="Target Motion")
         print(f"Moving LIN to position {position} at speed {speed}.")
         
         assert self.__lin_command(f"SV{speed}"), "LIN move command failed."
@@ -264,15 +281,23 @@ class LJSerialTargetMotion(TargetMotion):
         if self.__l_homing:
             return
         
-        print(f"LIN Current Position: {self.__current_l} mm")
-        print(f"LIN Target Position: {self.__target_l} mm")
-        print(f"LIN Last Position: {self.__last_l / float(MM_TO_STEPS)} mm")
+        #print(f"LIN Current Position: {self.__current_l} mm")
+        #print(f"LIN Target Position: {self.__target_l} mm")
+        #print(f"LIN Last Position: {self.__last_l / float(MM_TO_STEPS)} mm")
 
-        print(f"LIN Speed: {self.__l_speed} mm/s")
-        print(f"LIN Moving: {self.__l_moving}")
+        #print(f"LIN Speed: {self.__l_speed} mm/s")
+        #print(f"LIN Moving: {self.__l_moving}")
+
+        #self.__logger.log(f"LIN Current Position: {self.__current_l} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        #self.__logger.log(f"LIN Target Position: {self.__target_l} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        #self.__logger.log(f"LIN Last Position: {self.__last_l / float(MM_TO_STEPS)} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        #self.__logger.log(f"LIN Speed: {self.__l_speed} mm/s", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        #self.__logger.log(f"LIN Moving: {self.__l_moving}", level="DEBUG", l_type="REC", subsystem="Target Motion")
+
         if isnan(self.__jog_l) and not self.__l_moving and (abs((self.__current_l / float(MM_TO_STEPS)) - self.__target_l) > 1e-3 or isnan(self.__last_l)) and self.__l_speed > 0.0:
             self.__move_lin_to_position(int(self.__target_l * MM_TO_STEPS), int(self.__l_speed * MM_TO_STEPS))
             print(f"Reissuing LIN move command issued to position {self.__target_l} mm at speed {self.__l_speed} mm/s.")
+            self.__logger.log(f"Reissuing LIN move command issued to position {self.__target_l} mm at speed {self.__l_speed} mm/s.", level="DEBUG", l_type="REC", subsystem="Target Motion")
 
         if self.__l_speed < 0.01 and self.__l_moving:
             self.__stop_lin()            
@@ -426,6 +451,11 @@ class LabJackHandlerSubprocess:
             dt = t - l_t
             l_t = t
 
+            #if not isnan(self.__target_r):
+            #    mt = floor(self.__target_r / 6.281)
+            #    mc = current_r % (6.281 * RADS_TO_STEPS)
+            #    current_r = int(mt * RADS_TO_STEPS * 6.281) + mc
+
             if self.__jog_r != 0.0:
                 self.__target_r += self.__jog_r * dt
 
@@ -451,6 +481,8 @@ class LabJackHandlerSubprocess:
 
                 direction = (target_r * RADS_TO_STEPS) > current_r
                 self.__direction_set(direction)
+
+                #steps = steps % int(RADS_TO_STEPS * 0.1)
 
                 for _ in range(steps):
                     self.__pulse()

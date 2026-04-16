@@ -2,6 +2,7 @@ import json
 import multiprocessing
 import random
 import time, struct, os, signal, re, sys, threading
+import traceback
 import uuid
 from datetime import date
 
@@ -62,6 +63,9 @@ class OscilloscopeStream:
     def set_active(self, active: bool):
         pass
 
+    def capture_once(self):
+        pass
+
 class ScopeReader(OscilloscopeStream):
     HORI_NUM = 10.0
 
@@ -98,6 +102,7 @@ class ScopeReader(OscilloscopeStream):
         self.__last_capturing = 0
 
         self.__do_capture = False
+        self.__do_capture_once = False
 
         self.__out_queue = queue.Queue() # for processed data
 
@@ -114,6 +119,20 @@ class ScopeReader(OscilloscopeStream):
 
         if self.is_capturing and not active:
             self.scope.write(":STOP")
+
+    def capture_once(self):
+        print("Oscilloscope capture once triggered.")
+        self.__do_capture_once = True
+
+        print("Waiting for capture to start...")
+        while not self.__is_capturing:
+            self.__do_capture_once = True
+            time.sleep(0.01)
+
+        print("Capture started, waiting for it to finish...")
+
+        while self.__is_capturing:
+            time.sleep(0.01)
 
     def configure(self):
         # --- one-time config ---
@@ -309,6 +328,7 @@ class ScopeReader(OscilloscopeStream):
 
         if code_per_div == 0:
             print(locals())
+            return None, None, None, None
 
         # ---- reshape strictly by (read_frame, read_pts) ----
         codes_u = raw.reshape(read_frame, read_pts)
@@ -396,7 +416,7 @@ class ScopeReader(OscilloscopeStream):
             self.__state = "CAPTURING"
             self.__last_capturing = time.time()
 
-        self.__state = "IDLE"
+        self.__state = "PROC"
         self.__is_capturing = False
         # Freeze a consistent snapshot is already ensured (we're stopped)
         self.scope.write(":WAVeform:SEQuence 0,1")         # or 0,<next_start> in your loop
@@ -411,10 +431,15 @@ class ScopeReader(OscilloscopeStream):
 
     def __proc_thread(self, stop_flag: StopFlag):
         while stop_flag.run():
+            print("Proc thread waiting for read signal...")
             start, end, desc, data, uid = self.__read_queue.get() # wait for signal to read
+            print(f"Read thread got data for capture started at {start} ns, ended at {end} ns, processing...")
 
             # 3) Decode to time + voltages
             t, V, meta, timestamps = self.decode_sequence_waveforms(desc, data, 10)
+            if t is None:
+                print("Failed to decode waveform data, skipping this capture.")
+                continue
             
             if len(V) == 0:
                 continue
@@ -436,23 +461,25 @@ class ScopeReader(OscilloscopeStream):
                 data = np.vstack((data, values))
 
             self.__out_queue.put((start, end, data, indexes, uid))
+            self.__state = "IDLE"
 
     def __read_thread(self, stop_flag: StopFlag):
-        was_running = False
         while stop_flag.run():
-            if not self.__do_capture:
-                if was_running:
-                    print("Capture deactivated, stopping any ongoing capture...")
-                    self.scope.write(":STOP")
-                    self.__state = "IDLE"
-                    self.__is_capturing = False
-                    was_running = False
+            print("Read thread waiting for capture signal...")
+            if not self.__do_capture and self.__is_capturing:
+                print("Capture deactivated, stopping any ongoing capture...")
+                self.scope.write(":STOP")
+                self.__state = "IDLE"
+                self.__is_capturing = False
 
+            if (not self.__do_capture) and (not self.__do_capture_once):
                 time.sleep(0.1)
                 continue
-            
-            was_running = True
-            self.capture_burst_and_read(100)
+
+            self.__do_capture_once = False
+            print("Starting capture...")
+            self.capture_burst_and_read(250)
+            print("Capture done, waiting for processing to finish...")
        
     def close(self):
         self.scope.write(":ACQ:SEQuence OFF")
@@ -597,9 +624,14 @@ def calculate_dose_of_experiment(e_uuid: uuid.UUID, d_reader: "DataReader"):
     running_time = 0
 
     for uid, (snapshot_file, snapshot_meta) in segments.items():
-        snap_array = np.load(snapshot_file)
+        try:
+            snap_array = np.load(snapshot_file)
 
-        meta = json.load(snapshot_meta)
+            meta = json.load(snapshot_meta)
+        except Exception as e:
+            print(f"Error loading snapshot {uid}: {e}. Skipping this segment.")
+            continue
+            
         start = meta["start"]# - (3600 * 6) * 1e9 # adjust for timezone to match scope's naive timestamps
         end = meta["end"]
 
@@ -611,7 +643,13 @@ def calculate_dose_of_experiment(e_uuid: uuid.UUID, d_reader: "DataReader"):
 
         data = snap_array["data"]
         indexes = snap_array["indexes"]
-        total, duration = calculate_dose_raw(start, end, data, indexes)
+
+        try:
+            total, duration = calculate_dose_raw(start, end, data, indexes)
+
+        except Exception as e:
+            print(f"Error calculating dose for segment {uid}: {e}. Skipping.")
+            continue
 
         running_total += total
         running_time += duration
@@ -625,9 +663,14 @@ def calculate_doses_of_segments(e_uuid: uuid.UUID, d_reader: "DataReader"):
     times = np.array([])
 
     for uid, (snapshot_file, snapshot_meta) in segments.items():
-        snap_array = np.load(snapshot_file)
+        try:
+            snap_array = np.load(snapshot_file)
 
-        meta = json.load(snapshot_meta)
+            meta = json.load(snapshot_meta)
+        except Exception as e:
+            print(f"Error loading snapshot {uid}: {e}. Skipping this segment.")
+            continue
+
         start = meta["start"]# - (3600 * 6) * 1e9 # adjust for timezone to match scope's naive timestamps
         end = meta["end"]
 
@@ -639,7 +682,12 @@ def calculate_doses_of_segments(e_uuid: uuid.UUID, d_reader: "DataReader"):
 
         data = snap_array["data"]
         indexes = snap_array["indexes"]
-        total, duration = calculate_dose_raw(start, end, data, indexes)
+
+        try:
+            total, duration = calculate_dose_raw(start, end, data, indexes)
+        except Exception as e:
+            print(f"Error calculating dose for segment {uid}: {e}. Skipping.")
+            continue
 
         doses = np.append(doses, total)
         times = np.append(times, duration)
@@ -647,12 +695,19 @@ def calculate_doses_of_segments(e_uuid: uuid.UUID, d_reader: "DataReader"):
     return doses, times
 
 def calculate_dose_raw(start, end, data, indexes):
-    __REP_RATE_HZ = 100.0
+    __REP_RATE_HZ = 100
 
-    total = calculate_avg_pulsedose(data, indexes)
-    total *= ((end - start) / 1e9) * __REP_RATE_HZ
+    total, cont, realtime = calculate_avg_pulsedose(data, indexes)
 
-    return total, ((end - start) / 1e9)
+    if cont:
+        #print(f"Continuous dose calculation: {total} mJ/cm2 over {(end - start) / 1e9} seconds")
+        total *= ((end - start) / 1e9) * __REP_RATE_HZ
+        return total, ((end - start) / 1e9)
+    else:
+        #print(f"Non-continuous dose calculation: {total} mJ/cm2 average per pulse, not scaled by time. Realtime: {realtime} seconds")
+        total *= realtime * __REP_RATE_HZ
+        return total, realtime
+
 
 def calculate_avg_pulsedose(data, indexes):
     __OFF_NUM = 98
@@ -660,7 +715,7 @@ def calculate_avg_pulsedose(data, indexes):
     __RESISTOR_OHMS = 50.0
     __RESP_A_PER_W = 0.14
     __AREA_CM2 = (5) / 100.0
-    __REP_RATE_HZ = 100.0
+    __REP_RATE_HZ = 100
 
     pulse_doses = []
     pulse_webers = []
@@ -669,7 +724,7 @@ def calculate_avg_pulsedose(data, indexes):
     data = np.array(data)
 
     if len(indexes) < 2:
-        return 0.0, 0.0
+        return 0.0, False, 0.0
     
     pulse_size = int(indexes[1, 0] - indexes[0, 0])
 
@@ -707,7 +762,18 @@ def calculate_avg_pulsedose(data, indexes):
     pulse_doses = np.array(pulse_doses)
     pulse_webers = np.array(pulse_webers)
     total = np.average(pulse_doses[:, 1])
-    return total
+    last_50 = np.average(pulse_doses[-50:, 1])
+
+    #print(f"Average dose per pulse: {total} mJ/cm2")
+    #print(f"Last 50 pulses average dose: {last_50} mJ/cm2")
+    #print(pulse_doses[:, 1])
+
+
+    if last_50 < 0.1 * total:
+        #print("WARNING: Average dose in last 50 pulses is very low, using non continuous calculation.")
+        return total, False, pulse_doses[-1, 0] - pulse_doses[0, 0]
+    
+    return total, True, pulse_doses[-1, 0] - pulse_doses[0, 0]
 
 def calculate_dose_of_segment(e_uuid: uuid.UUID, s_uuid: uuid.UUID, d_reader: "DataReader"):
     __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
@@ -736,6 +802,7 @@ class DummyOscilloscope(OscilloscopeStream):
         self.__out_queue = queue.Queue() # for processed data
 
         self.__do_capture = False
+        self.__do_capture_once = False
 
         self.__daemon = Daemon()
         self.__daemon.add(self.__proc_thread)
@@ -746,6 +813,16 @@ class DummyOscilloscope(OscilloscopeStream):
     def set_active(self, active):
         print(f"Setting dummy oscilloscope active: {active}")
         self.__do_capture = active
+
+    def capture_once(self):
+        print("Dummy oscilloscope capture once triggered.")
+        self.__do_capture_once = True
+
+        while not self.__is_capturing:
+            time.sleep(0.01)
+
+        while self.__is_capturing:
+            time.sleep(0.01)
 
     def dummy_wf(self):
         timestamp = time.time_ns()
@@ -777,9 +854,11 @@ class DummyOscilloscope(OscilloscopeStream):
 
     def __proc_thread(self, stop_flag: StopFlag):
         while stop_flag.run():
-            if not self.__do_capture:
+            if not self.__do_capture or self.__do_capture_once:
                 time.sleep(0.1)
                 continue
+
+            self.__do_capture_once = False
 
             start = time.time_ns()
             self.last_start_cmd = time.time_ns()
@@ -830,8 +909,9 @@ class DummyOscilloscope(OscilloscopeStream):
         return self.last_start_cmd / 1e9
     
 class ScopeWriter:
-    def __init__(self):
+    def __init__(self, logger: LogClient):
         self.__SAVE_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
+        self.__logger = logger
 
         self.__exp_reader = None
         self.__record = None
@@ -847,12 +927,16 @@ class ScopeWriter:
         self.__exp_reader = ExperimentReader(self.__SAVE_PATH, "exposure")
 
         while stop_flag.run():
-            if self.__record is None and self.__s_uuid is not None:
-                self.__do_get_record()
+            try:
+                if self.__record is None and self.__s_uuid is not None:
+                    self.__do_get_record()
 
-            if not self.__write_queue.empty():
-                start, end, data, indexes, uid = self.__write_queue.get()
-                self.__write_wf(start, end, data, indexes, uid)
+                if not self.__write_queue.empty():
+                    start, end, data, indexes, uid = self.__write_queue.get()
+                    self.__write_wf(start, end, data, indexes, uid)
+            except Exception as e:
+                print(f"Error in ScopeWriter thread: {e}")
+                self.__logger.log(f"Error in ScopeWriter thread: {e}", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
 
             time.sleep(0.1)
 
@@ -913,13 +997,18 @@ class DataReader:
         for fname, f_type in resources:
             if f_type == "snapshot" and fname.endswith(".npz"):
                 uid_str = fname[len("snap_"):-len(".npz")]
+                print(f"Found snapshot file: {fname}, extracted UID string: {uid_str}")
                 try:
                     uid = uuid.UUID(uid_str)
                 except ValueError:
                     print(f"Invalid UUID in filename: {fname}, skipping...")
                     continue
-
-                snapshots[uid] = (record.get_record().resource(fname, "snapshot", "rb"), record.get_record().resource(f"snap_{uid}.json", "snap_meta", "r"))
+                
+                try:
+                    snapshots[uid] = (record.get_record().resource(fname, "snapshot", "rb"), record.get_record().resource(f"snap_{uid}.json", "snap_meta", "r"))
+                except Exception as e:
+                    print(f"Error loading snapshot {uid}: {e}. Skipping this segment.")
+                    continue
 
         return snapshots
     
@@ -947,6 +1036,7 @@ class DataReader:
         return None
 
 class OscilloscopeSubsystem(exp_client.ExperimentClient):
+    __STEP_DOSE_TGT = 2.0 # mJ/cm2, start stepping once dose is within this range of target
     def __init__(self, scope: OscilloscopeStream):
         self.__out_queue = queue.Queue()
 
@@ -965,6 +1055,8 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__logger = LogClient(self.__logger_sock, origin_uuid=c_uuid)
 
         self.__did_config = False
+        self.__do_run = False
+        self.__did_read = True
         self.__subsystem = None
 
         self.__exp_id = None
@@ -973,7 +1065,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__start_handle = None
         self.__stop_handle = None
 
-        self.__writer = ScopeWriter()
+        self.__writer = ScopeWriter(self.__logger)
 
         self.__exp_reader = None
         self.__data_reader = None
@@ -1005,9 +1097,23 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         super().__init__("exposure", "Oscilloscope", self.__logger)
         self.register_experiment_settings_type(ExposureSettings)
 
-        self.__daemon = Daemon()
+        self.__daemon = Daemon(exception_handler=self.handle_exception)
         self.__daemon.add(self.__thread)
+        self.__daemon.add(self.__capt_thread)
         self.__daemon.start()
+
+    def handle_exception(self, e: Exception):
+        self.__log("Caught exception on daemon thread!", level="ERROR")
+        for line in traceback.format_exception(None, e, e.__traceback__):
+            for split in line.split('\n'):
+                self.__log(split, level="ERROR")
+    
+    def __log(self, msg, level = "INFO", **data):
+        if self.__logger is None:
+            print(level, msg)
+            return
+        
+        self.__logger.log(msg, level=level, l_type="SW", subsystem="Oscilloscope", **data)
 
     def __is_laser_on(self):
         if self.osc.is_capturing() and (time.time() - self.osc.get_last_start_cmd_time()) > 0.25:
@@ -1018,6 +1124,39 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
     def __update_laser_status(self):
         if not self.__is_laser_on():
             self.__last_laser_off_time = time.time_ns()
+
+    def __capt_thread(self, stop_flag: StopFlag):
+        while stop_flag.run():
+            time.sleep(0.1)
+            #print("Checking if step exposure should be triggered...")
+            #print(f"Current dose: {self.__current_dose} mJ/cm2, target dose: {self.__target_dose} mJ/cm2, do run: {self.__do_run}")
+            if self.__do_run and self.__target_dose is not None and self.__current_dose >= (self.__target_dose - self.__STEP_DOSE_TGT) and self.__current_dose < self.__target_dose:
+                #print(f"Current dose {self.__current_dose} mJ/cm2 is within {self.__STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...")
+                self.__logger.log(f"Current dose {self.__current_dose} mJ/cm2 is within {self.__STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...", level="INFO", l_type="EXP", subsystem="Oscilloscope")
+                self.osc.set_active(False)
+
+                time.sleep(0.1)
+                while self.osc.is_capturing():
+                    time.sleep(0.1)
+                
+                time.sleep(0.1)
+                payload = struct.pack('d', float(1.0))
+                self.__timed_exposure_handle = self.__do_timed_exposure_event.call(payload, [uuids.UUID_LASER_CONTROLLER])
+                self.__did_read = False
+                self.osc.capture_once()
+                time.sleep(0.1)
+
+                while self.__timed_exposure_handle.is_in_progress():
+                    time.sleep(0.1)
+
+                while not self.__did_read:
+                    time.sleep(0.1)
+
+                print("Step exposure completed.")
+                print(f"Step result: {self.__timed_exposure_handle.get_result(uuids.UUID_LASER_CONTROLLER)}")
+
+                self.__timed_exposure_handle = None
+
 
     def __thread(self, stop_flag: StopFlag):
         self.__exp_reader = ExperimentReader(os.path.join(os.environ["EUVL_PATH"], "datasets"), "exposure")
@@ -1045,6 +1184,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
             self.__update_laser_status()
 
             if not self.__osc_queue.empty() and not self.__exp_id is None:
+                self.__did_read = True
                 #print("New oscilloscope data available, writing...")
                 start, end, data, indexes, uid = self.__osc_queue.get()
 
@@ -1103,13 +1243,16 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                 if rec is None:
                     print(f"Experiment record for {exp} not found after retries, skipping dose calculation.")
                     continue
+                
+                try:
+                    dose, runtime = calculate_dose_of_experiment(exp, self.__data_reader)
+                    rec.add_tag("runtime", runtime)
+                    rec.add_tag("dose", dose)
+                    self.__logger.log(f"Saved dose for experiment {exp}: {dose} mJ/cm2", level="INFO", l_type="EXP", subsystem="Oscilloscope")
 
-                dose, runtime = calculate_dose_of_experiment(exp, self.__data_reader)
-
-                rec.add_tag("runtime", runtime)
-                rec.add_tag("dose", dose)
-                self.__logger.log(f"Saved dose for experiment {exp}: {dose} mJ/cm2", level="INFO", l_type="EXP", subsystem="Oscilloscope")
-
+                except Exception as e:
+                    self.__logger.log(f"Error calculating dose for experiment {exp}: {e}", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
+                    continue
 
     def __on_got_subsystem(self, sh: client._RegisteredSubsystemHandle):
         print("Registered subsystem with UUID: ", sh.get_info().get_uuid())
@@ -1117,6 +1260,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
         self.__on_new_segment_publisher = sh.get_kv_property(b"new_segment", False, True, True)
         self.__stop_experiment_event_sender = sh.add_event_provider(f"stop_exposure".encode("utf-8"))
+        self.__do_timed_exposure_event = sh.add_event_provider(b"laser_do_timed_exposure")
 
         self._setup_subsystem(sh)
 
@@ -1144,19 +1288,22 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
     
     def _on_preinit(self, handle):
         self.__preinit_handle = handle
+        self.__last_laser_on = False
+        self.__last_laser_off_time = 0
+
+        self.__current_dose = 0.0
+        self.__current_time = 0.0
+
+        self.osc.set_active(True)
+
         return super()._on_preinit(handle)
 
     def _on_start(self, handle: client._EventHandler._IncomingEventHandle) -> bytes:
         self.__start_handle = handle
 
-        self.__last_laser_on = False
-        self.__last_laser_off_time = 0
-        self.__current_dose = 0.0
-        self.__current_time = 0.0
-
         self.__logger.log("Scope starting recording.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
 
-        self.osc.set_active(True)
+        self.__do_run = True
 
         return b"Scope started recording."
     
@@ -1166,6 +1313,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__logger.log("Scope stopping recording.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
 
         self.__stop_exp()
+        self.__do_run = False
 
         return b"Scope stopped recording."
     
