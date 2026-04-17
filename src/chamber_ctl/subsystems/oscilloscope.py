@@ -1209,6 +1209,10 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                 self.__current_dose += pdose
                 self.__current_time += pduration
 
+                self.__dose_publisher.value = self.__current_dose
+                self.__time_publisher.value = self.__current_time
+
+
 
                 self.__logger.log(f"Saved snapshot {uid}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
                 self.__logger.log(f"Current dose: {self.__current_dose} mJ/cm2, time: {self.__current_time}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
@@ -1254,7 +1258,6 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                     rec.add_tag("runtime", runtime)
                     rec.add_tag("dose", dose)
                     self.__logger.log(f"Saved dose for experiment {exp}: {dose} mJ/cm2", level="INFO", l_type="EXP", subsystem="Oscilloscope")
-                    self.__dose_publisher.value = dose
 
                 except Exception as e:
                     self.__logger.log(f"Error calculating dose for experiment {exp}: {e}", level="ERROR", l_type="EXP", subsystem="Oscilloscope")

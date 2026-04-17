@@ -192,7 +192,11 @@ class PulseDosageDisplay:
         self.__run = False
 
     def __update_phosphor(self, exp, s_uuid, phosphor):
-        snap, meta = self.__d_reader.get_snapshot(exp, s_uuid)
+        try:
+            snap, meta = self.__d_reader.get_snapshot(exp, s_uuid)
+        except Exception as e:
+            self.__logger.log(f"Error loading snapshot for experiment {exp}, segment {s_uuid}: {e}", level="ERROR", l_type="SW", subsystem="Dose GUI")
+            return
 
         data_f = np.load(snap)
 
