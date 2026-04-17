@@ -25,19 +25,27 @@ from ipi_ecs.subsystems.experiment_controller import ExperimentController, RunSe
 from chamber_ctl.subsystems import uuids
 
 class ExposureSettings(RunSettings):
-    def __init__(self, target_time: float = 0.0, target_dose: float = 0.0, operator: str = "", zr_filter: str = "", sample: str = ""):
+    def __init__(self, target_time: float = 0.0, target_dose: float = 0.0, operator: str = "", zr_filter: str = "", sample: str = "", sample_type: str = ""):
         super().__init__()
+        print(f"Initializing ExposureSettings with target_time={target_time}, target_dose={target_dose}, operator='{operator}', zr_filter='{zr_filter}', sample='{sample}', sample_type='{sample_type}'")
         self.data["target_time"] = target_time
         self.data["target_dose"] = target_dose
         self.data["operator"] = operator
         self.data["zr_filter"] = zr_filter
         self.data["sample"] = sample
+        self.data["sample_type"] = sample_type
 
     def set_attr(self, key, value):
+        print(f"Setting {key} to {value} of type {type(value)}")
+
         if (self.data["target_time"] is not None and key == "target_dose" and float(value) > 0.1) and self.data["target_time"] >= 0.1:
             raise ValueError("Cannot set target_dose when target_time is already set. Please clear target_time before setting target_dose.")
         if (self.data["target_dose"] is not None and self.data["target_dose"] >= 0.1) and key == "target_time" and float(value) > 0.1:
             raise ValueError("Cannot set target_time when target_dose is already set. Please clear target_dose before setting target_time.")
+        assert key in ["target_time", "target_dose", "operator", "zr_filter", "sample", "sample_type", "name", "description"], f"Invalid key '{key}' for ExposureSettings"
+
+
+        #assert type(value) == self.data.get(key).__class__, f"Type mismatch for {key}: expected {self.data.get(key).__class__}, got {type(value)}"
         return super().set_attr(key, value)
 
     def get_target_time(self) -> float:
@@ -51,6 +59,9 @@ class ExposureSettings(RunSettings):
     
     def get_sample(self) -> str:
         return self.data.get("sample", "")
+    
+    def get_sample_type(self) -> str:
+        return self.data.get("sample_type", "")
     
     def get_target_dose(self) -> float:
         return self.data.get("target_dose", 0.0)
@@ -66,7 +77,8 @@ class ExposureSettings(RunSettings):
         assert obj.data.get("operator") is not None, "Decoded ExposureSettings missing operator"
         assert obj.data.get("zr_filter") is not None, "Decoded ExposureSettings missing zr_filter"
         assert obj.data.get("sample") is not None, "Decoded ExposureSettings missing sample"
-        
+        assert obj.data.get("sample_type") is not None, "Decoded ExposureSettings missing sample_type"
+
         return obj
 
 def main(stop_event: "multiprocessing.Event"):
