@@ -556,7 +556,7 @@ class LaserSyncSubsystem(ExperimentClient):
             return
 
         self.__preinit_setup_pending = False
-        handle.feedback(magics.OP_IN_PROGRESS + b": preinit setup complete, waiting for ready conditions.")
+        handle.feedback(b"Preinit setup complete, waiting for laser to warm up and chopper to start")
 
     def __execute_exp_start_setters(self):
         handle = self.__start_handle
@@ -572,7 +572,7 @@ class LaserSyncSubsystem(ExperimentClient):
             return
 
         self.__start_setup_pending = False
-        handle.feedback(magics.OP_IN_PROGRESS + b": init setup complete, waiting for target phase.")
+        handle.feedback(b"Init setup complete, waiting for target phase.")
 
     def __execute_exp_stop_setters(self):
         handle = self.__stop_handle
@@ -602,7 +602,7 @@ class LaserSyncSubsystem(ExperimentClient):
             return
 
         self.__stop_setup_pending = False
-        handle.feedback(magics.OP_IN_PROGRESS + b": stop setup complete, waiting for laser/chopper to disable.")
+        handle.feedback(b"Stop complete, waiting for laser/chopper to disable.")
 
     def __execute_test_preinit_setters(self):
         handle = self.__test_preinit_handle
@@ -835,16 +835,16 @@ class LaserSyncSubsystem(ExperimentClient):
             time.sleep(0.01)
 
             if self.__preinit_handle is not None and not self.__preinit_setup_pending and self.__preinit_ready():
-                self._on_did_preinit(b": preinit complete.")
+                self._on_did_preinit(b"Preinit complete.")
                 self.__preinit_handle = None
 
             if self.__start_handle is not None and not self.__start_setup_pending and self.__init_ready():
-                self._on_did_start(b": target phase reached.")
+                self._on_did_start(b"Target phase reached.")
                 self.__start_handle = None
 
             if self.__stop_handle is not None:
                 if not self.__stop_setup_pending and not self.__sync.get_laser_on() and not self.__sync.get_chopper_on():
-                    self._on_did_stop(b": laser and chopper disabled.")
+                    self._on_did_stop(b"Laser and chopper disabled.")
                     self.__stop_handle = None
                     self.__experiment_active = False
 
