@@ -29,6 +29,7 @@ from ipi_ecs.logging.client import LogClient
 
 import ipi_ecs.core.tcp as tcp
 import ipi_ecs.dds.client as client
+import ipi_ecs.dds.types as types
 import ipi_ecs.subsystems.experiment_client as exp_client
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader, RunRecord, RunState
 
@@ -1081,6 +1082,10 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__target_dose = None
         self.__target_time = None
 
+        self.__dose_publisher = None
+        self.__time_publisher = None
+        self.__timed_exposure_handle = None
+
         def _on_ready():
             if self.__did_config:
                 return
@@ -1249,6 +1254,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                     rec.add_tag("runtime", runtime)
                     rec.add_tag("dose", dose)
                     self.__logger.log(f"Saved dose for experiment {exp}: {dose} mJ/cm2", level="INFO", l_type="EXP", subsystem="Oscilloscope")
+                    self.__dose_publisher.value = dose
 
                 except Exception as e:
                     self.__logger.log(f"Error calculating dose for experiment {exp}: {e}", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
@@ -1259,6 +1265,12 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__subsystem = sh
 
         self.__on_new_segment_publisher = sh.get_kv_property(b"new_segment", False, True, True)
+        self.__dose_publisher = sh.get_kv_property(b"cur_dose", False, True, True)
+        self.__time_publisher = sh.get_kv_property(b"cur_time", False, True, True)
+
+        self.__dose_publisher.set_type(types.FloatTypeSpecifier())
+        self.__time_publisher.set_type(types.FloatTypeSpecifier())
+
         self.__stop_experiment_event_sender = sh.add_event_provider(f"stop_exposure".encode("utf-8"))
         self.__do_timed_exposure_event = sh.add_event_provider(b"laser_do_timed_exposure")
 
@@ -1273,10 +1285,14 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         if state.get_settings().get_attr("target_dose") > 0.1:
             self.__target_dose = state.get_settings().get_attr("target_dose")
             print(f"Target dose for this exposure: {self.__target_dose} mJ/cm2")
+        else:
+            self.__target_dose = None
 
         if state.get_settings().get_attr("target_time") > 0.1:
             self.__target_time = state.get_settings().get_attr("target_time")
             print(f"Target time for this exposure: {self.__target_time} s")
+        else:
+            self.__target_time = None
 
         if self.__target_dose is not None and self.__target_time is not None:
             self.__logger.log("Warning: both target dose and target time are set. Refusing to start exposure.", level="WARNING", l_type="EXP", subsystem="Oscilloscope")
@@ -1339,7 +1355,8 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
 
 def main(stop_event: "multiprocessing.Event"):
-    osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
+    #osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
+    osc = DummyOscilloscope()
     subsystem = OscilloscopeSubsystem(osc)
     print("Oscilloscope subsystem initializing...")
     #proc = RealtimeDoseCalc(osc)
