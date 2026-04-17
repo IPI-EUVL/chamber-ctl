@@ -41,6 +41,8 @@ class PulseDosageDisplay:
         self.__did_config = False
         self.__subsystem = None
 
+        self.__dose_kv = None
+
         self.__total_dose = 0
         self.__total_time = 0
 
@@ -104,9 +106,9 @@ class PulseDosageDisplay:
 
     def __update_values(self):
         if self.__total_dose == 0:
-            self.__current_dose_label.config(text="Current dose: N/A mJ/cm^2")
+            self.__current_dose_label.config(text="No Data")
         else:
-            self.__current_dose_label.config(text=f"Current dose: {self.__total_dose:.2f} mJ/cm^2")
+            self.__current_dose_label.config(text=f"{self.__total_dose:.2f} mJ/cm^2, {self.__total_time:.2f} s")
         self.__root.after(1000, self.__update_values) # schedule next update
 
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):
@@ -116,6 +118,8 @@ class PulseDosageDisplay:
             self.__run = False
 
         handle.get_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER).then(lambda subsystem: subsystem.get_kv(b"new_segment").then(self.__on_got_kv).catch(fail)).catch(fail)
+        handle.get_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER).then(lambda subsystem: subsystem.get_kv(b"cur_dose").then(self.__on_got_dose_kv).catch(fail)).catch(fail)
+        handle.get_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER).then(lambda subsystem: subsystem.get_kv(b"cur_time").then(self.__on_got_time_kv).catch(fail)).catch(fail)
 
         #pylint: disable=pointless-string-statement
 
@@ -125,19 +129,27 @@ class PulseDosageDisplay:
         self.__new_segment_kv = value
         self.__new_segment_kv.on_new_data_received(self.__on_new_segment)
 
+    def __on_got_dose_kv(self, value):
+        self.__dose_kv = value
+        self.__dose_kv.on_new_data_received(self.__on_new_dose)
+
+    def __on_got_time_kv(self, value):
+        self.__time_kv = value
+        self.__time_kv.on_new_data_received(self.__on_new_time)
+
     def ok(self):
         return self.__run and self.__client.ok()
     
     def __calc_thread(self, stop_flag: daemon.StopFlag):
         self.__d_reader = DataReader(self.__PATH)
-        self.__total_dose = 0
-        self.__total_time = 0
-        last_experiment = None
+        #self.__total_dose = 0
+        #self.__total_time = 0
+        #last_experiment = None
 
         while stop_flag.run():
             exp, segment = self.__segment_queue.get()
             time.sleep(0.1) # wait a bit for the data to be fully written
-            if last_experiment is None or exp != last_experiment:
+            """if last_experiment is None or exp != last_experiment:
                 try:
                     self.__logger.log(f"New experiment {exp} detected, resetting total dose.", level="INFO", l_type="SW", subsystem="Dose GUI")
                     self.__total_dose, self.__total_time = calculate_dose_of_experiment(exp, self.__d_reader)
@@ -152,18 +164,25 @@ class PulseDosageDisplay:
                 self.__total_dose += dose
                 self.__total_time += r_time
 
-                self.__update_phosphor(exp, segment, self.__phosphor)
             except (Exception) as e:
                 self.__logger.log(f"Error calculating dose for experiment {exp}, segment {segment}: {e}", level="ERROR", l_type="SW", subsystem="Dose GUI")
                 last_experiment = None # reset experiment to force recalculation on next segment
                 continue
+            """
+            self.__update_phosphor(exp, segment, self.__phosphor)
 
-            self.__logger.log(f"Calculated dose for experiment {exp} is {self.__total_dose} mJ/cm^2 over {self.__total_time:.2f} seconds.", level="DEBUG", l_type="EXP", subsystem="Dose GUI")
+            #self.__logger.log(f"Calculated dose for experiment {exp} is {self.__total_dose} mJ/cm^2 over {self.__total_time:.2f} seconds.", level="DEBUG", l_type="EXP", subsystem="Dose GUI")
     
     def __on_new_segment(self, new_data):
         exp, segment = segment_bytes.decode(new_data)
 
         self.__segment_queue.put((uuid.UUID(bytes=exp), uuid.UUID(bytes=segment)))
+
+    def __on_new_dose(self, new_data):
+        self.__total_dose = new_data
+
+    def __on_new_time(self, new_data):
+        self.__total_time = new_data
 
     def close(self):
         self.__client.close()
