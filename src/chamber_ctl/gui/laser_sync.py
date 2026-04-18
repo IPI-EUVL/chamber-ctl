@@ -24,8 +24,10 @@ from chamber_ctl.subsystems.laser import LaserSyncStatus
 
 
 class LaserSyncTestGUI:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root, own_window: bool = True):
         self.__root = root
+        self.__own_window = own_window
+        self.__dialog_parent = root if own_window else root.winfo_toplevel()
         self.__run = True
         self.__connected = False
 
@@ -94,14 +96,16 @@ class LaserSyncTestGUI:
         
         self.__logger.log(msg, level=level, l_type="SW", subsystem="Laser Sync GUI", **data)
 
-    def __build_ui(self, root: tk.Tk):
-        root.title("Laser Sync Test")
-        root.geometry("900x600")
+    def __build_ui(self, root):
+        if self.__own_window and hasattr(root, "title"):
+            root.title("Laser Sync Control")
+        if self.__own_window and hasattr(root, "geometry"):
+            root.geometry("900x600")
 
         frame = tk.Frame(root)
         frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
-        title = tk.Label(frame, text="Laser Sync Isolated Test", font=("Arial", 24, "bold"))
+        title = tk.Label(frame, text="Laser Sync Control", font=("Arial", 24, "bold"))
         title.pack(anchor="w")
 
         self.__connection_label = tk.Label(frame, text="Connection: DISCONNECTED", font=("Arial", 12))
@@ -705,10 +709,10 @@ class LaserSyncTestGUI:
 
     def __show_progress_dialog(self, text: str):
         if self.__progress_dialog is None:
-            dialog = tk.Toplevel(self.__root)
+            dialog = tk.Toplevel(self.__dialog_parent)
             dialog.title("Laser Sync Progress")
             dialog.geometry("460x120")
-            dialog.transient(self.__root)
+            dialog.transient(self.__dialog_parent)
             dialog.grab_set()
             dialog.protocol("WM_DELETE_WINDOW", lambda: None)
 

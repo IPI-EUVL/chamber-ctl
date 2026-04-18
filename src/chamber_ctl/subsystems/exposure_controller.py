@@ -25,7 +25,7 @@ from ipi_ecs.subsystems.experiment_controller import ExperimentController, RunSe
 from chamber_ctl.subsystems import uuids
 
 class ExposureSettings(RunSettings):
-    def __init__(self, target_time: float = 0.0, target_dose: float = 0.0, operator: str = "", zr_filter: str = "", sample: str = "", sample_type: str = ""):
+    def __init__(self, target_time: float = 0.0, target_dose: float = 0.0, operator: str = "", zr_filter: str = "", sample: str = "", sample_type: str = "", base_pressure: float = 0.0, operating_pressure: float = 0.0, flow_sccm: float = 0.0):
         super().__init__()
         print(f"Initializing ExposureSettings with target_time={target_time}, target_dose={target_dose}, operator='{operator}', zr_filter='{zr_filter}', sample='{sample}', sample_type='{sample_type}'")
         self.data["target_time"] = target_time
@@ -34,6 +34,9 @@ class ExposureSettings(RunSettings):
         self.data["zr_filter"] = zr_filter
         self.data["sample"] = sample
         self.data["sample_type"] = sample_type
+        self.data["base_pressure"] = base_pressure
+        self.data["operating_pressure"] = operating_pressure
+        self.data["flow_sccm"] = flow_sccm
 
     def set_attr(self, key, value):
         print(f"Setting {key} to {value} of type {type(value)}")
@@ -42,7 +45,7 @@ class ExposureSettings(RunSettings):
             raise ValueError("Cannot set target_dose when target_time is already set. Please clear target_time before setting target_dose.")
         if (self.data["target_dose"] is not None and self.data["target_dose"] >= 0.1) and key == "target_time" and float(value) > 0.1:
             raise ValueError("Cannot set target_time when target_dose is already set. Please clear target_dose before setting target_time.")
-        assert key in ["target_time", "target_dose", "operator", "zr_filter", "sample", "sample_type", "name", "description"], f"Invalid key '{key}' for ExposureSettings"
+        assert self.data.get(key, None) is not None, f"Invalid key '{key}' for ExposureSettings"
 
 
         #assert type(value) == self.data.get(key).__class__, f"Type mismatch for {key}: expected {self.data.get(key).__class__}, got {type(value)}"
@@ -51,6 +54,15 @@ class ExposureSettings(RunSettings):
     def get_target_time(self) -> float:
         return self.data.get("target_time", 0.0)
     
+    def get_base_pressure(self) -> float:
+        return self.data.get("base_pressure", 0.0)
+
+    def get_operating_pressure(self) -> float:
+        return self.data.get("operating_pressure", 0.0)
+
+    def get_flow_sccm(self) -> float:
+        return self.data.get("flow_sccm", 0.0)
+
     def get_operator(self) -> str:
         return self.data.get("operator", "")
     
@@ -78,6 +90,9 @@ class ExposureSettings(RunSettings):
         assert obj.data.get("zr_filter") is not None, "Decoded ExposureSettings missing zr_filter"
         assert obj.data.get("sample") is not None, "Decoded ExposureSettings missing sample"
         assert obj.data.get("sample_type") is not None, "Decoded ExposureSettings missing sample_type"
+        assert obj.data.get("base_pressure") is not None, "Decoded ExposureSettings missing base_pressure"
+        assert obj.data.get("operating_pressure") is not None, "Decoded ExposureSettings missing operating_pressure"
+        assert obj.data.get("flow_sccm") is not None, "Decoded ExposureSettings missing flow_sccm"
 
         return obj
 
@@ -87,6 +102,7 @@ def main(stop_event: "multiprocessing.Event"):
     m_run_controller.add_required_subsystem(uuids.UUID_TARGET_CONTROLLER, "Target Controller")
     m_run_controller.add_required_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER, "Oscilloscope Controller")
     m_run_controller.add_required_subsystem(uuids.UUID_LASER_CONTROLLER, "Laser Controller")
+    m_run_controller.add_required_subsystem(uuids.UUID_SAMPLE_MOTION_CONTROLLER, "Sample Motion Controller")
     m_run_controller.register_experiment_settings_type(ExposureSettings)
 
     try:

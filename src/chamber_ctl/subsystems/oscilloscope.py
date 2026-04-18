@@ -942,6 +942,7 @@ class ScopeWriter:
             time.sleep(0.1)
 
     def set_exp_id(self, s_uuid):
+        print(f"ScopeWriter set to new experiment UUID: {s_uuid}")
         self.__s_uuid = s_uuid
         self.__record = None
 
@@ -1202,8 +1203,18 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                         subsystem="Oscilloscope",
                     )
                     continue
-
-                ok = self.__writer.write_wf(start, end, data, indexes, uid)
+                
+                for i in range(5):
+                    try:
+                        ok = self.__writer.write_wf(start, end, data, indexes, uid)
+                        if ok:
+                            break
+                        print(f"Failed to write waveform data for snapshot {uid}, attempt {i+1}. Retrying...")
+                        self.__log(f"Failed to write waveform data for snapshot {uid}, attempt {i+1}. Retrying...", level="WARNING", l_type="EXP", subsystem="Oscilloscope")
+                    except Exception as e:
+                        print(f"Error writing waveform data for snapshot {uid}, attempt {i+1}: {e}")
+                        self.__logger.log(f"Error writing waveform data for snapshot {uid}, attempt {i+1}: {e}", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
+                        time.sleep(0.5)
 
                 pdose, pduration = calculate_dose_raw(start, end, data, indexes)
                 self.__current_dose += pdose
@@ -1217,23 +1228,24 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                 self.__logger.log(f"Saved snapshot {uid}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
                 self.__logger.log(f"Current dose: {self.__current_dose} mJ/cm2, time: {self.__current_time}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
                 
-                if self.__target_dose is not None and self.__current_dose >= self.__target_dose:
+                if self.__do_run and self.__target_dose is not None and self.__current_dose >= self.__target_dose:
                     print(f"Target dose of {self.__target_dose} mJ/cm2 reached, stopping exposure.")
                     self.__logger.log(f"Target dose of {self.__target_dose} mJ/cm2 reached, stopping exposure.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
                     self.__stop_experiment_event_sender.call((f"Target dose of {self.__target_dose} mJ/cm2 reached").encode("utf-8"), [])
 
-                if self.__target_time is not None and self.__current_time >= self.__target_time:
+                if self.__do_run and self.__target_time is not None and self.__current_time >= self.__target_time:
                     print(f"Target time of {self.__target_time} s reached, stopping exposure.")
                     self.__logger.log(f"Target time of {self.__target_time} s reached, stopping exposure.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
                     self.__stop_experiment_event_sender.call((f"Target time of {self.__target_time} s reached").encode("utf-8"), [])
 
                 if not ok:
                     print("Failed to write oscilloscope data")
-                    self.osc.set_active(False)
+                    self.__logger.log("Failed to write oscilloscope data", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
+                    #self.osc.set_active(False)
                 else:
                     print(f"[OscilloscopeSubsystem] Saved snapshot {uid}: segment window {start}..{end}.")
 
-                self.__on_new_segment_publisher.value = segment_bytes.encode([self.__exp_id.bytes, uid.bytes])
+                    self.__on_new_segment_publisher.value = segment_bytes.encode([self.__exp_id.bytes, uid.bytes])
 
             if not self.__dose_queue.empty() and not self.osc.is_capturing():
                 time.sleep(0.5) # wait a moment to ensure all data is written and available for reading

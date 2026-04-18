@@ -153,8 +153,8 @@ class TargetMotionController:
         self.__config = TargetMotionConfig(max_l_size=300.0)
 
         self.__state = MotionState()
-        self.__motion = LJSerialTargetMotion(self.__config, logger, port="COM3")
-        #self.__motion = MockTargetMotion(self.__config)
+        #self.__motion = LJSerialTargetMotion(self.__config, logger, port="COM3")
+        self.__motion = MockTargetMotion(self.__config)
         self.__start_l = 0.0
         self.__start_r = 0.0
         self.__offset_l = 0.0
@@ -264,6 +264,9 @@ class TargetMotionController:
     
     def can_home(self):
         return not self.__is_running and not self.__should_start and not self.__motion.is_moving()
+
+    def is_moving_to_start(self):
+        return self.__should_start
         
     def begin_move_here(self):
         if not self.can_modify():
@@ -300,7 +303,7 @@ class TargetMotionController:
         self.__offset_r = 0.0
 
     def __effective_start(self):
-        return self.__start_l + self.__offset_l, 0 #not very effective huh? self.__start_r + self.__offset_r
+        return self.__start_l + self.__offset_l, self.__start_r + self.__offset_r
 
     def set_offset_position(self, l_offset: float, r_offset: float):
         if not self.can_modify():
@@ -422,12 +425,13 @@ class TargetMotionController:
         return self.__config
     
 class TargetMotionControllerState:
-    def __init__(self, position: tuple[float, float], target_position: tuple[float, float], is_running: bool, is_jogging: bool, is_homing: bool, current_time: float, current_segment: int, start_position: tuple[float, float], offset_position: tuple[float, float] = (0.0, 0.0)):
+    def __init__(self, position: tuple[float, float], target_position: tuple[float, float], is_running: bool, is_jogging: bool, is_homing: bool, is_moving_to_start: bool, current_time: float, current_segment: int, start_position: tuple[float, float], offset_position: tuple[float, float] = (0.0, 0.0)):
         self.position = position
         self.target_position = target_position
         self.is_running = is_running
         self.is_jogging = is_jogging
         self.is_homing = is_homing
+        self.is_moving_to_start = is_moving_to_start
         self.current_time = current_time
         self.current_segment = current_segment
         self.start_position = start_position
@@ -442,10 +446,12 @@ class TargetMotionControllerState:
         state = pickle.loads(b_data)
         if not hasattr(state, "offset_position"):
             state.offset_position = (0.0, 0.0)
+        if not hasattr(state, "is_moving_to_start"):
+            state.is_moving_to_start = False
         return state
     
     def __str__(self):
-        return f"TargetMotionControllerState(position={self.position}, target_position={self.target_position}, is_running={self.is_running}, is_jogging={self.is_jogging}, is_homing={self.is_homing}, current_time={self.current_time}, current_segment={self.current_segment}, start_position={self.start_position}, offset_position={self.offset_position})"
+        return f"TargetMotionControllerState(position={self.position}, target_position={self.target_position}, is_running={self.is_running}, is_jogging={self.is_jogging}, is_homing={self.is_homing}, is_moving_to_start={self.is_moving_to_start}, current_time={self.current_time}, current_segment={self.current_segment}, start_position={self.start_position}, offset_position={self.offset_position})"
 
 
 class TargetController(ExperimentClient):
@@ -784,19 +790,26 @@ class TargetController(ExperimentClient):
             if (time.monotonic() - self.__last_status_update) > 0.2:
                 self.__last_status_update = time.monotonic()
                 if self.__status_publisher is not None:
+                    current_time = self.__motion_controller.get_current_time()
+                    start_l, start_r = self.__motion_controller.get_start_position()
+                    offset_l, offset_r = self.__motion_controller.get_offset_position()
+                    profile = self.__motion_controller.get_profile()
+                    if profile is not None:
+                        target_l, target_r = profile.get_position_at_time(current_time)
+                    else:
+                        target_l, target_r = self.__motion_controller.get_current_position()
+
                     state = TargetMotionControllerState(
                         position=self.__motion_controller.get_current_position(),
-                        target_position=(
-                            self.__motion_controller.get_profile().get_position_at_time(self.__motion_controller.get_current_time())[0] + self.__motion_controller.get_start_position()[0] + self.__motion_controller.get_offset_position()[0],
-                            self.__motion_controller.get_profile().get_position_at_time(self.__motion_controller.get_current_time())[1] + self.__motion_controller.get_start_position()[1] + self.__motion_controller.get_offset_position()[1],
-                        ),
+                        target_position=(target_l + start_l + offset_l, target_r + start_r + offset_r),
                         is_running=self.__motion_controller.is_running(),
                         is_jogging=self.__motion_controller.is_jogging(),
                         is_homing=self.__motion_controller.is_homing(),
-                        current_time=self.__motion_controller.get_current_time(),
+                        is_moving_to_start=self.__motion_controller.is_moving_to_start(),
+                        current_time=current_time,
                         current_segment=self.__motion_controller.get_current_segment(),
-                        start_position=self.__motion_controller.get_start_position(),
-                        offset_position=self.__motion_controller.get_offset_position(),
+                        start_position=(start_l, start_r),
+                        offset_position=(offset_l, offset_r),
                     )
 
                     motion_state = self.__motion_controller.get_state()

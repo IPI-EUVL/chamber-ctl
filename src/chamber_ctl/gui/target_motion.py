@@ -44,10 +44,13 @@ def rotated_rectangle_coords(cx, cy, width, height, angle_deg):
     return rotated
 
 class TargetControlGUI:
-    def __init__(self, root, itf : target_controller_interface.TargetClient):
+    def __init__(self, root, itf : target_controller_interface.TargetClient, own_window: bool = True):
         self.root = root
-        self.root.title("Target Motion Control GUI")
-        self.root.geometry("1250x760")
+        self.__own_window = own_window
+        if self.__own_window and hasattr(self.root, "title"):
+            self.root.title("Target Motion Control GUI")
+        if self.__own_window and hasattr(self.root, "geometry"):
+            self.root.geometry("1250x760")
 
         self.__run = True
         self.__ui_queue = queue.Queue()
@@ -468,11 +471,16 @@ class TargetControlGUI:
         self.canvas.update_idletasks()
 
     def handle_window(self):
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.__own_window and hasattr(self.root, "protocol"):
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def on_close(self):
         self.__run = False
-        self.root.destroy()
+        if self.__own_window and hasattr(self.root, "destroy"):
+            self.root.destroy()
+
+    def close(self):
+        self.__run = False
 
 if __name__ == "__main__":
     itf = target_controller_interface.TargetClient()

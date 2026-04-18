@@ -12,7 +12,8 @@ dependencies = [
   "ipi-ecs>=0.1.0",
   "prompt_toolkit>=3.0",
   "numpy>=2.4.0",
-  "pyvisa>=1.16.0"
+  "pyvisa>=1.16.0",
+  "scipy>=1.17.0"
 ]
 
 license = { text = "MIT" }

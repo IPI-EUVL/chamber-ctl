@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 from ipi_ecs.core import daemon
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader, RunRecord
 from chamber_ctl.subsystems.oscilloscope import DataReader, calculate_dose_of_experiment, calculate_doses_of_segments
+from chamber_ctl.subsystems.development_metrics import DevelopmentMetrics
 from ipi_ecs.util.export_experiment import export_experiment_data
 
 
@@ -223,7 +224,18 @@ class QueryFrame(ttk.LabelFrame):
 
 
 class ResultsFrame(ttk.LabelFrame):
-    _COLS = ("name", "description", "date", "uuid", "dose", "runtime", "status")
+    _COLS = (
+        "name",
+        "description",
+        "date",
+        "uuid",
+        "dose",
+        "runtime",
+        "effective_dose_rate",
+        "avg_exposed_thickness",
+        "avg_blank_thickness",
+        "status",
+    )
 
     def __init__(self, parent, on_selection_changed):
         super().__init__(parent, text="Results", padding=5)
@@ -257,6 +269,9 @@ class ResultsFrame(ttk.LabelFrame):
         self.__tree.heading("uuid", text="UUID")
         self.__tree.heading("dose", text="Dose")
         self.__tree.heading("runtime", text="Runtime")
+        self.__tree.heading("effective_dose_rate", text="Eff. Dose Rate")
+        self.__tree.heading("avg_exposed_thickness", text="Avg Exposed (nm)")
+        self.__tree.heading("avg_blank_thickness", text="Avg Blank (nm)")
         self.__tree.heading("status", text="Status")
 
         self.__tree.column("name", width=140, minwidth=70)
@@ -265,6 +280,9 @@ class ResultsFrame(ttk.LabelFrame):
         self.__tree.column("uuid", width=80, minwidth=60)
         self.__tree.column("dose", width=110, minwidth=80)
         self.__tree.column("runtime", width=110, minwidth=80)
+        self.__tree.column("effective_dose_rate", width=130, minwidth=90)
+        self.__tree.column("avg_exposed_thickness", width=130, minwidth=90)
+        self.__tree.column("avg_blank_thickness", width=130, minwidth=90)
         self.__tree.column("status", width=80, minwidth=60)
 
         self.__tree.grid(row=0, column=0, sticky=tk.NSEW)
@@ -288,11 +306,29 @@ class ResultsFrame(ttk.LabelFrame):
             status = (end_meta or {}).get("status", "Active")
             dose = self.__dose_display(record)
             runtime = self.__runtime_display(record)
+            effective_dose_rate = self.__effective_dose_rate_display(record)
+            avg_exposed_thickness = self.__avg_exposed_thickness_display(record)
+            avg_blank_thickness = self.__avg_blank_thickness_display(record)
             name = record.get_name() or ""
             desc = record.get_description() or ""
             if len(desc) > 60:
                 desc = desc[:57] + "..."
-            iid = self.__tree.insert("", tk.END, values=(name, desc, date_str, uuid_str, dose, runtime, status))
+            iid = self.__tree.insert(
+                "",
+                tk.END,
+                values=(
+                    name,
+                    desc,
+                    date_str,
+                    uuid_str,
+                    dose,
+                    runtime,
+                    effective_dose_rate,
+                    avg_exposed_thickness,
+                    avg_blank_thickness,
+                    status,
+                ),
+            )
             self.__records[iid] = record
 
         n = len(records)
@@ -308,11 +344,28 @@ class ResultsFrame(ttk.LabelFrame):
                 status = (end_meta or {}).get("status", "Active")
                 dose = self.__dose_display(record)
                 runtime = self.__runtime_display(record)
+                effective_dose_rate = self.__effective_dose_rate_display(record)
+                avg_exposed_thickness = self.__avg_exposed_thickness_display(record)
+                avg_blank_thickness = self.__avg_blank_thickness_display(record)
                 name = record.get_name() or ""
                 desc = record.get_description() or ""
                 if len(desc) > 60:
                     desc = desc[:57] + "..."
-                self.__tree.item(iid, values=(name, desc, date_str, uuid_str, dose, runtime, status))
+                self.__tree.item(
+                    iid,
+                    values=(
+                        name,
+                        desc,
+                        date_str,
+                        uuid_str,
+                        dose,
+                        runtime,
+                        effective_dose_rate,
+                        avg_exposed_thickness,
+                        avg_blank_thickness,
+                        status,
+                    ),
+                )
                 break
 
     @staticmethod
@@ -336,6 +389,40 @@ class ResultsFrame(ttk.LabelFrame):
             return f"{float(runtime):.6g}"
         except (TypeError, ValueError):
             return str(runtime)
+
+    @staticmethod
+    def __effective_dose_rate_display(record: RunRecord) -> str:
+        tags = record.get_tags() or {}
+        dose = tags.get("dose")
+        runtime = tags.get("runtime")
+        if dose is None or runtime is None:
+            return "None"
+        try:
+            runtime_f = float(runtime)
+            if runtime_f == 0.0:
+                return "None"
+            return f"{float(dose) / runtime_f:.6g}"
+        except (TypeError, ValueError):
+            return "None"
+
+    @staticmethod
+    def __avg_exposed_thickness_display(record: RunRecord) -> str:
+        tags = record.get_tags() or {}
+        return ResultsFrame.__format_numeric_tag(tags.get("avg_exposed_area_thickness_nm"))
+
+    @staticmethod
+    def __avg_blank_thickness_display(record: RunRecord) -> str:
+        tags = record.get_tags() or {}
+        return ResultsFrame.__format_numeric_tag(tags.get("avg_blank_area_thickness_nm"))
+
+    @staticmethod
+    def __format_numeric_tag(value) -> str:
+        if value is None:
+            return "None"
+        try:
+            return f"{float(value):.6g}"
+        except (TypeError, ValueError):
+            return str(value)
 
     def get_records(self) -> list:
         records = []
@@ -366,10 +453,12 @@ class ResultsFrame(ttk.LabelFrame):
 
 
 class DetailFrame(ttk.LabelFrame):
-    def __init__(self, parent, reader: ExperimentReaderThread, on_saved):
+    def __init__(self, parent, reader: ExperimentReaderThread, on_saved, on_read_metrics, on_save_metrics):
         super().__init__(parent, text="Experiment Detail", padding=8)
         self.__reader = reader
         self.__on_saved = on_saved
+        self.__on_read_metrics = on_read_metrics
+        self.__on_save_metrics = on_save_metrics
         self.__record: RunRecord = None
         self.__build()
 
@@ -452,6 +541,46 @@ class DetailFrame(ttk.LabelFrame):
         self.__meta_lf.columnconfigure(0, minsize=120)
         self.__meta_lf.columnconfigure(1, weight=1)
 
+        self.__metrics_lf = ttk.LabelFrame(self.__scroll_frame, text="Development Metrics", padding=5)
+        self.__metrics_lf.pack(fill=tk.X, padx=2, pady=4)
+        self.__metrics_lf.columnconfigure(1, weight=1)
+
+        ttk.Label(self.__metrics_lf, text="Exposed Thickness (nm):").grid(row=0, column=0, sticky=tk.W, padx=2, pady=2)
+        self.__exposed_var = tk.StringVar()
+        self.__exposed_entry = ttk.Entry(self.__metrics_lf, textvariable=self.__exposed_var)
+        self.__exposed_entry.grid(row=0, column=1, sticky=tk.EW, padx=2, pady=2)
+
+        ttk.Label(self.__metrics_lf, text="Blank Thickness (nm):").grid(row=1, column=0, sticky=tk.W, padx=2, pady=2)
+        self.__blank_var = tk.StringVar()
+        self.__blank_entry = ttk.Entry(self.__metrics_lf, textvariable=self.__blank_var)
+        self.__blank_entry.grid(row=1, column=1, sticky=tk.EW, padx=2, pady=2)
+
+        ttk.Label(self.__metrics_lf, text="Goodness Of Fit:").grid(row=2, column=0, sticky=tk.W, padx=2, pady=2)
+        self.__gof_var = tk.StringVar()
+        self.__gof_entry = ttk.Entry(self.__metrics_lf, textvariable=self.__gof_var)
+        self.__gof_entry.grid(row=2, column=1, sticky=tk.EW, padx=2, pady=2)
+
+        ttk.Label(self.__metrics_lf, text="Comma-separated floats.", foreground="gray").grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, padx=2, pady=(0, 4)
+        )
+
+        self.__metrics_btn_frame = ttk.Frame(self.__metrics_lf)
+        self.__metrics_btn_frame.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.__read_metrics_btn = ttk.Button(
+            self.__metrics_btn_frame,
+            text="Read Metrics",
+            command=self.__read_metrics,
+            state=tk.DISABLED,
+        )
+        self.__read_metrics_btn.pack(side=tk.LEFT, padx=2)
+        self.__save_metrics_btn = ttk.Button(
+            self.__metrics_btn_frame,
+            text="Save Metrics",
+            command=self.__save_metrics,
+            state=tk.DISABLED,
+        )
+        self.__save_metrics_btn.pack(side=tk.LEFT, padx=2)
+
         self.__placeholder = ttk.Label(
             self, text="Select an experiment to view details.",
             font=("Arial", 11), foreground="gray"
@@ -483,6 +612,8 @@ class DetailFrame(ttk.LabelFrame):
             self.__desc_entry.config(state=tk.DISABLED)
             self.__save_btn.config(state=tk.DISABLED)
             self.__copy_id_btn.config(state=tk.DISABLED)
+            self.__set_metrics_state(False)
+            self.__clear_metrics_fields()
             self.__clear_frame(self.__settings_lf)
             self.__tags_tree.delete(*self.__tags_tree.get_children())
             self.__clear_frame(self.__meta_lf)
@@ -493,6 +624,7 @@ class DetailFrame(ttk.LabelFrame):
         self.__desc_entry.config(state=tk.NORMAL)
         self.__save_btn.config(state=tk.NORMAL)
         self.__copy_id_btn.config(state=tk.NORMAL)
+        self.__set_metrics_state(True)
 
         self.__name_var.set(record.get_name() or "")
         self.__desc_var.set(record.get_description() or "")
@@ -517,6 +649,86 @@ class DetailFrame(ttk.LabelFrame):
             meta_items["Status"] = "Active"
         meta_items["Version"] = meta.get("version", "?")
         self.__populate_kv_frame(self.__meta_lf, meta_items)
+
+    def set_metrics_values(self, data: dict):
+        exposed = data.get("exposed_area_thickness_nm", [])
+        blank = data.get("blank_area_thickness_nm", [])
+        gof = data.get("goodness_of_fit", [])
+
+        self.__exposed_var.set(self.__format_float_list(exposed))
+        self.__blank_var.set(self.__format_float_list(blank))
+        self.__gof_var.set(self.__format_float_list(gof))
+
+    def __clear_metrics_fields(self):
+        self.__exposed_var.set("")
+        self.__blank_var.set("")
+        self.__gof_var.set("")
+
+    def __set_metrics_state(self, enabled: bool):
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self.__exposed_entry.config(state=state)
+        self.__blank_entry.config(state=state)
+        self.__gof_entry.config(state=state)
+        self.__read_metrics_btn.config(state=state)
+        self.__save_metrics_btn.config(state=state)
+
+    @staticmethod
+    def __format_float_list(values) -> str:
+        out = []
+        for value in values or []:
+            try:
+                out.append(f"{float(value):.10g}")
+            except (TypeError, ValueError):
+                out.append(str(value))
+        return ", ".join(out)
+
+    @staticmethod
+    def __parse_float_list(text: str, field_name: str) -> list[float]:
+        stripped = text.strip()
+        if not stripped:
+            return []
+
+        values = []
+        for raw in stripped.split(","):
+            token = raw.strip()
+            if not token:
+                continue
+            try:
+                values.append(float(token))
+            except ValueError:
+                raise ValueError(f"Invalid float in {field_name}: '{token}'")
+        return values
+
+    def __read_metrics(self):
+        if self.__record is None:
+            return
+        self.__on_read_metrics(self.__record)
+
+    def __save_metrics(self):
+        if self.__record is None:
+            return
+
+        try:
+            exposed = self.__parse_float_list(self.__exposed_var.get(), "Exposed Thickness")
+            blank = self.__parse_float_list(self.__blank_var.get(), "Blank Thickness")
+            gof = self.__parse_float_list(self.__gof_var.get(), "Goodness Of Fit")
+        except ValueError as e:
+            messagebox.showerror("Invalid Metrics Input", str(e))
+            return
+
+        expected_gof_count = len(exposed) + len(blank)
+        if len(gof) != expected_gof_count:
+            messagebox.showerror(
+                "Invalid Metrics Input",
+                (
+                    "Goodness-of-fit list must contain exposed values first, followed by blank values. "
+                    f"Expected {expected_gof_count} total GoF values "
+                    f"({len(exposed)} exposed + {len(blank)} blank), got {len(gof)}."
+                ),
+            )
+            return
+
+        self.__on_save_metrics(self.__record, exposed, blank, gof)
 
     def is_showing_record(self, record: RunRecord) -> bool:
         return self.__record is record
@@ -609,19 +821,28 @@ class DetailFrame(ttk.LabelFrame):
 
 
 class ExperimentsGUI:
-    def __init__(self, root: tk.Tk, data_path: str, exp_name: str):
+    def __init__(self, root, data_path: str, exp_name: str, own_window: bool = True):
         self.root = root
-        root.title("Experiments Browser")
-        root.geometry("1200x700")
-        root.minsize(800, 500)
+        self.__own_window = own_window
+        if self.__own_window and hasattr(root, "title"):
+            root.title("Experiments Browser")
+        if self.__own_window and hasattr(root, "geometry"):
+            root.geometry("1200x700")
+        if self.__own_window and hasattr(root, "minsize"):
+            root.minsize(800, 500)
 
         self.__data_path = data_path
         self.__exp_name = exp_name
         self.__reader = ExperimentReaderThread(data_path, exp_name)
+        self.__dev_metrics = DevelopmentMetrics(self.__data_path)
         self.__pending_query: Queue = None
         self.__dose_recalc_queue: Queue = Queue()
         self.__dose_recalc_cancel = threading.Event()
         self.__dose_recalc_worker = None
+
+        self.__metrics_queue: Queue = Queue()
+        self.__metrics_read_worker = None
+        self.__metrics_save_worker = None
 
         self.__dose_dialog = None
         self.__dose_progressbar = None
@@ -687,10 +908,17 @@ class ExperimentsGUI:
         right = ttk.Frame(paned)
         paned.add(right, weight=3)
 
-        self.__detail_frame = DetailFrame(right, reader=self.__reader, on_saved=self.__on_record_saved)
+        self.__detail_frame = DetailFrame(
+            right,
+            reader=self.__reader,
+            on_saved=self.__on_record_saved,
+            on_read_metrics=self.__on_read_metrics,
+            on_save_metrics=self.__on_save_metrics,
+        )
         self.__detail_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.__own_window and hasattr(root, "protocol"):
+            root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.__updater()
 
     def __on_search(self, query: dict):
@@ -745,9 +973,72 @@ class ExperimentsGUI:
 
     def __on_selection_changed(self, record: RunRecord):
         self.__detail_frame.load_record(record)
+        if record is None:
+            return
+
+        # Clear stale values immediately, then try loading metrics for the new selection.
+        self.__detail_frame.set_metrics_values({})
+        self.__on_read_metrics(record, notify_if_busy=False)
 
     def __on_record_saved(self, record: RunRecord):
         self.__results_frame.refresh_record(record)
+
+    def __on_read_metrics(self, record: RunRecord, notify_if_busy: bool = True):
+        if self.__metrics_read_worker is not None and self.__metrics_read_worker.is_alive():
+            if notify_if_busy:
+                messagebox.showinfo("Read Metrics", "A metrics read operation is already in progress.")
+            return
+
+        run_uuid = record.get_state().get_uuid()
+        self.__status_var.set(f"Reading development metrics ...{str(run_uuid)[-8:]}")
+
+        self.__metrics_read_worker = threading.Thread(
+            target=self.__read_metrics_thread,
+            args=(record,),
+            daemon=True,
+        )
+        self.__metrics_read_worker.start()
+
+    def __read_metrics_thread(self, record: RunRecord):
+        run_uuid = record.get_state().get_uuid()
+        try:
+            data = self.__dev_metrics.read_ellipsometry_data(run_uuid)
+            self.__metrics_queue.put(("read_ok", record, data))
+        except Exception as e:
+            self.__metrics_queue.put(("read_err", record, e))
+
+    @staticmethod
+    def __is_missing_metrics_file_error(err: Exception) -> bool:
+        if isinstance(err, FileNotFoundError):
+            return True
+
+        msg = str(err).lower()
+        has_missing_hint = ("no such file" in msg) or ("not found" in msg) or ("does not exist" in msg)
+        mentions_metrics_file = "ellipsometry.json" in msg
+        return has_missing_hint and mentions_metrics_file
+
+    def __on_save_metrics(self, record: RunRecord, exposed: list[float], blank: list[float], gof: list[float]):
+        if self.__metrics_save_worker is not None and self.__metrics_save_worker.is_alive():
+            messagebox.showinfo("Save Metrics", "A metrics save operation is already in progress.")
+            return
+
+        run_uuid = record.get_state().get_uuid()
+        self.__status_var.set(f"Saving development metrics ...{str(run_uuid)[-8:]}")
+
+        self.__metrics_save_worker = threading.Thread(
+            target=self.__save_metrics_thread,
+            args=(record, exposed, blank, gof),
+            daemon=True,
+        )
+        self.__metrics_save_worker.start()
+
+    def __save_metrics_thread(self, record: RunRecord, exposed: list[float], blank: list[float], gof: list[float]):
+        run_uuid = record.get_state().get_uuid()
+        try:
+            self.__dev_metrics.save_ellipsometry_data(run_uuid, exposed, blank, gof)
+            self.__metrics_queue.put(("save_ok", record))
+        except Exception as e:
+            self.__metrics_queue.put(("save_err", record, str(e)))
 
     def __on_export_selected_experiments(self):
         records = self.__results_frame.get_selected_records()
@@ -1143,6 +1434,43 @@ class ExperimentsGUI:
         except Empty:
             pass
 
+        try:
+            while True:
+                msg = self.__metrics_queue.get_nowait()
+                m_type = msg[0]
+
+                if m_type == "read_ok":
+                    _t, record, data = msg
+                    if self.__detail_frame.is_showing_record(record):
+                        self.__detail_frame.set_metrics_values(data)
+                    self.__status_var.set(f"Development metrics loaded for ...{str(record.get_state().get_uuid())[-8:]}")
+
+                elif m_type == "read_err":
+                    _t, record, err = msg
+                    if self.__is_missing_metrics_file_error(err):
+                        if self.__detail_frame.is_showing_record(record):
+                            self.__detail_frame.set_metrics_values({})
+                        self.__status_var.set(f"No development metrics for ...{str(record.get_state().get_uuid())[-8:]}")
+                    else:
+                        self.__status_var.set(f"Read metrics failed for ...{str(record.get_state().get_uuid())[-8:]}")
+                        messagebox.showerror("Read Metrics Failed", str(err))
+
+                elif m_type == "save_ok":
+                    _t, record = msg
+                    self.__status_var.set(f"Development metrics saved for ...{str(record.get_state().get_uuid())[-8:]}")
+                    if self.__detail_frame.is_showing_record(record):
+                        self.__detail_frame.load_record(record)
+                    self.__results_frame.refresh_record(record)
+                    messagebox.showinfo("Save Metrics", "Development metrics saved.")
+
+                elif m_type == "save_err":
+                    _t, record, err = msg
+                    self.__status_var.set(f"Save metrics failed for ...{str(record.get_state().get_uuid())[-8:]}")
+                    messagebox.showerror("Save Metrics Failed", err)
+
+        except Empty:
+            pass
+
         self.root.after(200, self.__updater)
 
     def __close_dose_dialog(self):
@@ -1153,7 +1481,9 @@ class ExperimentsGUI:
     def on_close(self):
         self.__hide_loading_dialog()
         self.__reader.close()
-        self.root.destroy()
+        self.__dev_metrics.close()
+        if self.__own_window and hasattr(self.root, "destroy"):
+            self.root.destroy()
 
 
 if __name__ == "__main__":
