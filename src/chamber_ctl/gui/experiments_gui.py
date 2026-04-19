@@ -227,6 +227,8 @@ class ResultsFrame(ttk.LabelFrame):
     _COLS = (
         "name",
         "description",
+        "sample",
+        "target_dose",
         "date",
         "uuid",
         "dose",
@@ -265,6 +267,8 @@ class ResultsFrame(ttk.LabelFrame):
 
         self.__tree.heading("name", text="Name")
         self.__tree.heading("description", text="Description")
+        self.__tree.heading("sample", text="Sample")
+        self.__tree.heading("target_dose", text="Target Dose")
         self.__tree.heading("date", text="Created")
         self.__tree.heading("uuid", text="UUID")
         self.__tree.heading("dose", text="Dose")
@@ -276,6 +280,8 @@ class ResultsFrame(ttk.LabelFrame):
 
         self.__tree.column("name", width=140, minwidth=70)
         self.__tree.column("description", width=200, minwidth=80)
+        self.__tree.column("sample", width=130, minwidth=80)
+        self.__tree.column("target_dose", width=110, minwidth=80)
         self.__tree.column("date", width=150, minwidth=100)
         self.__tree.column("uuid", width=80, minwidth=60)
         self.__tree.column("dose", width=110, minwidth=80)
@@ -306,6 +312,8 @@ class ResultsFrame(ttk.LabelFrame):
             status = (end_meta or {}).get("status", "Active")
             dose = self.__dose_display(record)
             runtime = self.__runtime_display(record)
+            sample = self.__sample_display(record)
+            target_dose = self.__target_dose_display(record)
             effective_dose_rate = self.__effective_dose_rate_display(record)
             avg_exposed_thickness = self.__avg_exposed_thickness_display(record)
             avg_blank_thickness = self.__avg_blank_thickness_display(record)
@@ -319,6 +327,8 @@ class ResultsFrame(ttk.LabelFrame):
                 values=(
                     name,
                     desc,
+                    sample,
+                    target_dose,
                     date_str,
                     uuid_str,
                     dose,
@@ -344,6 +354,8 @@ class ResultsFrame(ttk.LabelFrame):
                 status = (end_meta or {}).get("status", "Active")
                 dose = self.__dose_display(record)
                 runtime = self.__runtime_display(record)
+                sample = self.__sample_display(record)
+                target_dose = self.__target_dose_display(record)
                 effective_dose_rate = self.__effective_dose_rate_display(record)
                 avg_exposed_thickness = self.__avg_exposed_thickness_display(record)
                 avg_blank_thickness = self.__avg_blank_thickness_display(record)
@@ -356,6 +368,8 @@ class ResultsFrame(ttk.LabelFrame):
                     values=(
                         name,
                         desc,
+                        sample,
+                        target_dose,
                         date_str,
                         uuid_str,
                         dose,
@@ -389,6 +403,25 @@ class ResultsFrame(ttk.LabelFrame):
             return f"{float(runtime):.6g}"
         except (TypeError, ValueError):
             return str(runtime)
+
+    @staticmethod
+    def __sample_display(record: RunRecord) -> str:
+        tags = record.get_tags() or {}
+        sample = tags.get("sample")
+        if sample is None:
+            return "None"
+        return str(sample)
+
+    @staticmethod
+    def __target_dose_display(record: RunRecord) -> str:
+        tags = record.get_tags() or {}
+        target_dose = tags.get("target_dose")
+        if target_dose is None:
+            return "None"
+        try:
+            return f"{float(target_dose):.6g}"
+        except (TypeError, ValueError):
+            return str(target_dose)
 
     @staticmethod
     def __effective_dose_rate_display(record: RunRecord) -> str:
