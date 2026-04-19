@@ -154,13 +154,13 @@ class DevelopmentMetricsBridgeSubsystem:
 
     def __query_exposures_for_date_with_reader(self, exp_reader: ExperimentReader, date_str: str) -> list[dict]:
         ts_min, ts_max = self.__start_end_for_date_str(date_str)
-        runs = exp_reader.list_runs()
+        runs = exp_reader.query({"created_min": ts_min, "created_max": ts_max})
 
         out = []
         for record in runs:
             meta = record.get_metadata() or {}
             created_at = self.__to_float(meta.get("created_at"))
-            if created_at is None or created_at < ts_min or created_at >= ts_max:
+            if created_at is None:
                 continue
 
             state = record.get_state()
