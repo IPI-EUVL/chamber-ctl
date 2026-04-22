@@ -5,6 +5,7 @@ import threading
 import time
 import tkinter as tk
 import uuid
+import os
 from tkinter import ttk, messagebox
 
 import ipi_ecs.core.tcp as tcp
@@ -26,6 +27,8 @@ def _fmt_timestamp(ts) -> str:
 		return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
 	except (TypeError, ValueError):
 		return str(ts)
+	
+ECS_IP = os.environ.get("ECS_HOST", "127.0.0.1")
 
 
 class DevelopmentMetricsDDSClient:
@@ -43,11 +46,11 @@ class DevelopmentMetricsDDSClient:
 
 		c_uuid = uuid.uuid4()
 		self.__logger_sock = tcp.TCPClientSocket()
-		self.__logger_sock.connect(("127.0.0.1", 11751))
+		self.__logger_sock.connect((ECS_IP, 11751))
 		self.__logger_sock.start()
 
 		self.__logger = LogClient(self.__logger_sock, origin_uuid=c_uuid)
-		self.__client = client.DDSClient(c_uuid, logger=self.__logger)
+		self.__client = client.DDSClient(c_uuid, logger=self.__logger, ip=ECS_IP)
 		self.__client.when_ready().then(self.__on_ready)
 
 		self.__daemon = daemon.Daemon(exception_handler=self.__on_exception)
