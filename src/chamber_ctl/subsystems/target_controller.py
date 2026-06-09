@@ -58,6 +58,12 @@ class MockTargetMotion(TargetMotion):
     def close(self):
         self.__daemon.stop()
 
+    def set_raw_position(self, l_pos, r_pos):
+        self.__current_l = l_pos
+        self.__current_r = r_pos
+
+        return True
+
     def __motion_thread(self, stop_flag: daemon.StopFlag):
         last_t = time.monotonic()
         last_print_t = last_t
@@ -291,7 +297,7 @@ class TargetMotionController:
         self.__offset_r = 0.0
 
         return True
-
+    
     def set_start_position_to_current(self):
         if not self.can_modify():
             return False # Can't modify while running
@@ -362,6 +368,7 @@ class TargetMotionController:
     def stop(self):
         self.__motion.stop()
         self.__is_running = False
+        self.__should_start = False
 
     def get_current_position(self):
         return self.__motion.get_position()
@@ -423,6 +430,10 @@ class TargetMotionController:
     
     def get_config(self):
         return self.__config
+    
+    def get_motion(self):
+        return self.__motion
+
     
 class TargetMotionControllerState:
     def __init__(self, position: tuple[float, float], target_position: tuple[float, float], is_running: bool, is_jogging: bool, is_homing: bool, is_moving_to_start: bool, current_time: float, current_segment: int, start_position: tuple[float, float], offset_position: tuple[float, float] = (0.0, 0.0)):
@@ -533,18 +544,24 @@ class TargetController(ExperimentClient):
             if not ok:
                 raise RuntimeError(f"Failed to load saved motion state: {payload}")
 
-            b_state, b_start_pos, b_offset_pos = self.__normalize_profile_payload(payload)
+            b_state, b_start_pos, b_offset_pos, b_rot = self.__normalize_profile_payload(payload)
             start_pos = pickle.loads(b_start_pos)
             offset_pos = pickle.loads(b_offset_pos)
+            rot = pickle.loads(b_rot)
             state = MotionState.decode(b_state)
 
             print("Loaded saved motion state:", state)
             print("Loaded saved start position:", start_pos)
             print("Loaded saved offset position:", offset_pos)
+            print("Loaded saved rot actuator position:", rot)
 
             assert self.__motion_controller.set_start_position(*start_pos)
             assert self.__motion_controller.set_offset_position(*offset_pos)
             assert self.__motion_controller.set_state(state)
+
+            current_l = self.__motion_controller.get_motion().get_position()[0]
+            assert self.__motion_controller.get_motion().set_raw_position(current_l, rot)
+
             self.__profile = self.__motion_controller.get_profile()
 
             self.__logger.log(f"Resuming state (current/remaining): {self.__motion_controller.get_current_time()}/{self.__motion_controller.get_state().get_remaining_time()}", level="DEBUG", l_type="CTRL", subsystem="Target Controller")
@@ -560,6 +577,7 @@ class TargetController(ExperimentClient):
             self.__motion_controller.get_state().encode(),
             pickle.dumps(self.__motion_controller.get_start_position()),
             pickle.dumps(self.__motion_controller.get_offset_position()),
+            pickle.dumps(self.__motion_controller.get_motion().get_position()[1]),
         ])
 
     def __get_or_create_profile_record(self, library: db_library.Library):
@@ -582,7 +600,7 @@ class TargetController(ExperimentClient):
         state = MotionState(profile)
         state.set_rep_amount(99)
 
-        return state.encode(), pickle.dumps((0.0, 0.0)), pickle.dumps((0.0, 0.0))
+        return state.encode(), pickle.dumps((0.0, 0.0)), pickle.dumps((0.0, 0.0)), pickle.dumps(0.0)
 
     def __normalize_profile_payload(self, payload):
         if isinstance(payload, tuple) or isinstance(payload, list):
@@ -601,11 +619,17 @@ class TargetController(ExperimentClient):
         if len(decoded) == 2:
             b_state, b_start_pos = decoded
             b_offset_pos = pickle.dumps((0.0, 0.0))
-            return b_state, b_start_pos, b_offset_pos
+            b_rot = pickle.dumps(0.0)
+            return b_state, b_start_pos, b_offset_pos, b_rot
 
-        if len(decoded) >= 3:
+        if len(decoded) == 3:
             b_state, b_start_pos, b_offset_pos = decoded[:3]
-            return b_state, b_start_pos, b_offset_pos
+            b_rot = pickle.dumps(0.0)
+            return b_state, b_start_pos, b_offset_pos, b_rot
+        
+        if len(decoded) == 4:
+            b_state, b_start_pos, b_offset_pos, b_rot = decoded[:4]
+            return b_state, b_start_pos, b_offset_pos, b_rot
 
         raise ValueError("Profile payload is missing required state fields.")
 
@@ -617,24 +641,25 @@ class TargetController(ExperimentClient):
             b_data = res.read()
             res.close()
 
-            b_state, b_start_pos, b_offset_pos = self.__normalize_profile_payload(b_data)
+            b_state, b_start_pos, b_offset_pos, b_rot = self.__normalize_profile_payload(b_data)
 
             MotionState.decode(b_state)
             pickle.loads(b_start_pos)
             pickle.loads(b_offset_pos)
+            pickle.loads(b_rot)
 
-            return b_state, b_start_pos, b_offset_pos
+            return b_state, b_start_pos, b_offset_pos, b_rot
         except (FileNotFoundError, ValueError, IndexError, TypeError, struct.error, pickle.UnpicklingError):
             self.__logger.log("No saved motion state found, or saved state is not valid. Creating new profile.", level="WARN", l_type="CTRL", subsystem="Target Controller")
 
-            b_state, b_start_pos, b_offset_pos = self.__default_profile_payload()
-            bdata = segment_bytes.encode([b_state, b_start_pos, b_offset_pos])
+            b_state, b_start_pos, b_offset_pos, b_rot = self.__default_profile_payload()
+            bdata = segment_bytes.encode([b_state, b_start_pos, b_offset_pos, b_rot])
 
             res = rec.resource("motion_state.bin", "Motion State", "wb")
             res.write(bdata)
             res.close()
 
-            return b_state, b_start_pos, b_offset_pos
+            return b_state, b_start_pos, b_offset_pos, b_rot
 
     def __save_profile(self, library: db_library.Library, bdata: bytes):
         rec = self.__get_or_create_profile_record(library)
@@ -946,8 +971,8 @@ class TargetController(ExperimentClient):
     def __on_stop_move_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
         print("Stop move event called by:", s_uuid, param)
 
-        if not self.__motion_controller.is_running():
-            handle.fail(b"Cannot stop motion while motion is not running.")
+        if (not self.__motion_controller.is_running()) and (not self.__motion_controller.is_moving_to_start()):
+            handle.fail(b"Cannot stop motion while motion is not running or is moving to start position.")
             return
 
         self.__motion_controller.stop()
@@ -959,8 +984,8 @@ class TargetController(ExperimentClient):
     def __on_reset_move_event(self, s_uuid, param: float, handle: client._EventHandler._IncomingEventHandle):
         print("Reset move event called by:", s_uuid, param)
 
-        if self.__motion_controller.is_running():
-            handle.fail(b"Cannot reset motion while motion is running.")
+        if self.__motion_controller.is_running() or self.__motion_controller.is_moving_to_start():
+            handle.fail(b"Cannot reset motion while motion is running or is moving to start position.")
             return
 
         self.__motion_controller.set_time_position(param)

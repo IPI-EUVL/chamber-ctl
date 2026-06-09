@@ -552,6 +552,9 @@ class TargetMotion:
     def get_target_position(self):
         pass
 
+    def set_raw_position(self, l_pos: float, r_pos: float):
+        pass
+
     def set_move(self, do_move: bool):
         pass
 
