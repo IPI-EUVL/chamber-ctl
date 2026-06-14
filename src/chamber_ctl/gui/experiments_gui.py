@@ -29,6 +29,14 @@ def _fmt_timestamp(ts) -> str:
 
 
 def _record_run_uuid(record: RunRecord) -> uuid.UUID:
+    tagged_uuid = _record_run_uuid_from_tags(record)
+    if tagged_uuid is not None:
+        return tagged_uuid
+
+    return record.get_state().get_uuid()
+
+
+def _record_run_uuid_from_tags(record: RunRecord) -> uuid.UUID | None:
     tags = record.get_tags() or {}
     run_uuid = tags.get("run")
     if run_uuid is not None:
@@ -36,7 +44,7 @@ def _record_run_uuid(record: RunRecord) -> uuid.UUID:
             return uuid.UUID(str(run_uuid))
         except (TypeError, ValueError, AttributeError):
             pass
-    return record.get_state().get_uuid()
+    return None
 
 
 class ExperimentReaderThread:
@@ -90,6 +98,36 @@ class ExperimentReaderThread:
 
     def add_tag(self, record: RunRecord, key: str, value):
         self.__enqueue_sync(lambda: record.add_tag(key, value))
+
+    def read_deferred_details_async(self, record: RunRecord) -> Queue:
+        return self.__enqueue(lambda: self.__read_deferred_details(record))
+
+    @staticmethod
+    def __read_deferred_details(record: RunRecord) -> dict:
+        details = {}
+
+        try:
+            state = record.get_state()
+            details["settings"] = ("ok", state.get_settings().get_dict() if state else {})
+        except Exception as e:
+            details["settings"] = ("err", e)
+
+        try:
+            meta = record.get_metadata() or {}
+            end_meta = record.get_end_metadata()
+            meta_items = {"Created": _fmt_timestamp(meta.get("created_at"))}
+            if end_meta:
+                meta_items["Status"] = end_meta.get("status", "?")
+                meta_items["Ended"] = _fmt_timestamp(end_meta.get("end_time"))
+                meta_items["Reason"] = end_meta.get("end_reason", "")
+            else:
+                meta_items["Status"] = "Active"
+            meta_items["Version"] = meta.get("version", "?")
+            details["metadata"] = ("ok", meta_items)
+        except Exception as e:
+            details["metadata"] = ("err", e)
+
+        return details
 
     def ok(self) -> bool:
         return self.__daemon.is_ok()
@@ -506,12 +544,13 @@ class ResultsFrame(ttk.LabelFrame):
 
 
 class DetailFrame(ttk.LabelFrame):
-    def __init__(self, parent, reader: ExperimentReaderThread, on_saved, on_read_metrics, on_save_metrics):
+    def __init__(self, parent, reader: ExperimentReaderThread, on_saved, on_read_metrics, on_save_metrics, on_read_details):
         super().__init__(parent, text="Experiment Detail", padding=8)
         self.__reader = reader
         self.__on_saved = on_saved
         self.__on_read_metrics = on_read_metrics
         self.__on_save_metrics = on_save_metrics
+        self.__on_read_details = on_read_details
         self.__record: RunRecord = None
         self.__build()
 
@@ -671,6 +710,16 @@ class DetailFrame(ttk.LabelFrame):
         )
         ttk.Button(frame, text="Retry", command=on_retry).grid(row=2, column=0, sticky=tk.W, padx=2, pady=(2, 0))
 
+    @staticmethod
+    def __populate_reading_frame(frame: ttk.Frame):
+        DetailFrame.__clear_frame(frame)
+        ttk.Label(frame, text="Reading data...", foreground="gray", wraplength=420, justify=tk.LEFT).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, padx=2, pady=(0, 4)
+        )
+        progress = ttk.Progressbar(frame, mode="indeterminate")
+        progress.grid(row=1, column=0, columnspan=2, sticky=tk.EW, padx=2, pady=(0, 4))
+        progress.start(10)
+
     def load_record(self, record: RunRecord):
         self.__record = record
 
@@ -702,31 +751,44 @@ class DetailFrame(ttk.LabelFrame):
         for k, v in tags.items():
             self.__tags_tree.insert("", tk.END, values=(str(k), str(v)))
 
+        self.__populate_reading_frame(self.__settings_lf)
+        self.__populate_reading_frame(self.__meta_lf)
+        self.__on_read_details(record)
+
+    def set_deferred_details(self, record: RunRecord, details: dict):
+        if self.__record is not record:
+            return
+
         def _retry(record=record):
             if self.__record is record:
-                self.load_record(record)
+                self.__populate_reading_frame(self.__settings_lf)
+                self.__populate_reading_frame(self.__meta_lf)
+                self.__on_read_details(record)
 
-        try:
-            state = record.get_state()
-            config = state.get_settings().get_dict() if state else {}
-            self.__populate_kv_frame(self.__settings_lf, config)
-        except Exception as e:
-            self.__populate_read_error_frame(self.__settings_lf, e, _retry)
+        settings_status, settings_data = details.get("settings", ("ok", {}))
+        if settings_status == "ok":
+            self.__populate_kv_frame(self.__settings_lf, settings_data)
+        else:
+            self.__populate_read_error_frame(self.__settings_lf, settings_data, _retry)
 
-        try:
-            meta = record.get_metadata() or {}
-            end_meta = record.get_end_metadata()
-            meta_items = {"Created": _fmt_timestamp(meta.get("created_at"))}
-            if end_meta:
-                meta_items["Status"] = end_meta.get("status", "?")
-                meta_items["Ended"] = _fmt_timestamp(end_meta.get("end_time"))
-                meta_items["Reason"] = end_meta.get("end_reason", "")
-            else:
-                meta_items["Status"] = "Active"
-            meta_items["Version"] = meta.get("version", "?")
-            self.__populate_kv_frame(self.__meta_lf, meta_items)
-        except Exception as e:
-            self.__populate_read_error_frame(self.__meta_lf, e, _retry)
+        metadata_status, metadata_data = details.get("metadata", ("ok", {}))
+        if metadata_status == "ok":
+            self.__populate_kv_frame(self.__meta_lf, metadata_data)
+        else:
+            self.__populate_read_error_frame(self.__meta_lf, metadata_data, _retry)
+
+    def set_deferred_details_error(self, record: RunRecord, err: Exception):
+        if self.__record is not record:
+            return
+
+        def _retry(record=record):
+            if self.__record is record:
+                self.__populate_reading_frame(self.__settings_lf)
+                self.__populate_reading_frame(self.__meta_lf)
+                self.__on_read_details(record)
+
+        self.__populate_read_error_frame(self.__settings_lf, err, _retry)
+        self.__populate_read_error_frame(self.__meta_lf, err, _retry)
 
     def set_metrics_values(self, data: dict):
         exposed = data.get("exposed_area_thickness_nm", [])
@@ -922,6 +984,9 @@ class ExperimentsGUI:
         self.__metrics_read_worker = None
         self.__metrics_save_worker = None
 
+        self.__detail_queue: Queue = None
+        self.__detail_record: RunRecord = None
+
         self.__dose_dialog = None
         self.__dose_progressbar = None
         self.__dose_progress_var = tk.DoubleVar(value=0.0)
@@ -1000,6 +1065,7 @@ class ExperimentsGUI:
             on_saved=self.__on_record_saved,
             on_read_metrics=self.__on_read_metrics,
             on_save_metrics=self.__on_save_metrics,
+            on_read_details=self.__on_read_details,
         )
         self.__detail_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
@@ -1060,6 +1126,8 @@ class ExperimentsGUI:
     def __on_selection_changed(self, record: RunRecord):
         self.__detail_frame.load_record(record)
         if record is None:
+            self.__detail_queue = None
+            self.__detail_record = None
             return
 
         # Clear stale values immediately, then try loading metrics for the new selection.
@@ -1069,29 +1137,38 @@ class ExperimentsGUI:
     def __on_record_saved(self, record: RunRecord):
         self.__results_frame.refresh_record(record)
 
+    def __on_read_details(self, record: RunRecord):
+        self.__detail_record = record
+        self.__detail_queue = self.__reader.read_deferred_details_async(record)
+
     def __on_read_metrics(self, record: RunRecord, notify_if_busy: bool = True):
         if self.__metrics_read_worker is not None and self.__metrics_read_worker.is_alive():
             if notify_if_busy:
                 messagebox.showinfo("Read Metrics", "A metrics read operation is already in progress.")
             return
 
-        run_uuid = _record_run_uuid(record)
+        run_uuid = _record_run_uuid_from_tags(record)
+        if run_uuid is None:
+            self.__status_var.set("Cannot read development metrics: selected run has no run UUID tag.")
+            if notify_if_busy:
+                messagebox.showerror("Read Metrics Failed", "Selected run has no run UUID tag.")
+            return
+
         self.__status_var.set(f"Reading development metrics ...{str(run_uuid)[-8:]}")
 
         self.__metrics_read_worker = threading.Thread(
             target=self.__read_metrics_thread,
-            args=(record,),
+            args=(record, run_uuid),
             daemon=True,
         )
         self.__metrics_read_worker.start()
 
-    def __read_metrics_thread(self, record: RunRecord):
-        run_uuid = _record_run_uuid(record)
+    def __read_metrics_thread(self, record: RunRecord, run_uuid: uuid.UUID):
         try:
             data = self.__dev_metrics.read_ellipsometry_data(run_uuid)
-            self.__metrics_queue.put(("read_ok", record, data))
+            self.__metrics_queue.put(("read_ok", record, run_uuid, data))
         except Exception as e:
-            self.__metrics_queue.put(("read_err", record, e))
+            self.__metrics_queue.put(("read_err", record, run_uuid, e))
 
     @staticmethod
     def __is_missing_metrics_file_error(err: Exception) -> bool:
@@ -1108,23 +1185,34 @@ class ExperimentsGUI:
             messagebox.showinfo("Save Metrics", "A metrics save operation is already in progress.")
             return
 
-        run_uuid = _record_run_uuid(record)
+        run_uuid = _record_run_uuid_from_tags(record)
+        if run_uuid is None:
+            self.__status_var.set("Cannot save development metrics: selected run has no run UUID tag.")
+            messagebox.showerror("Save Metrics Failed", "Selected run has no run UUID tag.")
+            return
+
         self.__status_var.set(f"Saving development metrics ...{str(run_uuid)[-8:]}")
 
         self.__metrics_save_worker = threading.Thread(
             target=self.__save_metrics_thread,
-            args=(record, exposed, blank, gof),
+            args=(record, run_uuid, exposed, blank, gof),
             daemon=True,
         )
         self.__metrics_save_worker.start()
 
-    def __save_metrics_thread(self, record: RunRecord, exposed: list[float], blank: list[float], gof: list[float]):
-        run_uuid = _record_run_uuid(record)
+    def __save_metrics_thread(
+        self,
+        record: RunRecord,
+        run_uuid: uuid.UUID,
+        exposed: list[float],
+        blank: list[float],
+        gof: list[float],
+    ):
         try:
             self.__dev_metrics.save_ellipsometry_data(run_uuid, exposed, blank, gof)
-            self.__metrics_queue.put(("save_ok", record))
+            self.__metrics_queue.put(("save_ok", record, run_uuid))
         except Exception as e:
-            self.__metrics_queue.put(("save_err", record, str(e)))
+            self.__metrics_queue.put(("save_err", record, run_uuid, str(e)))
 
     def __on_export_selected_experiments(self):
         records = self.__results_frame.get_selected_records()
@@ -1446,6 +1534,20 @@ class ExperimentsGUI:
             except Empty:
                 pass
 
+        if self.__detail_queue is not None:
+            try:
+                status, result = self.__detail_queue.get_nowait()
+                record = self.__detail_record
+                self.__detail_queue = None
+                self.__detail_record = None
+
+                if status == "ok":
+                    self.__detail_frame.set_deferred_details(record, result)
+                else:
+                    self.__detail_frame.set_deferred_details_error(record, result)
+            except Empty:
+                pass
+
         try:
             while True:
                 msg = self.__dose_recalc_queue.get_nowait()
@@ -1622,32 +1724,32 @@ class ExperimentsGUI:
                 m_type = msg[0]
 
                 if m_type == "read_ok":
-                    _t, record, data = msg
+                    _t, record, run_uuid, data = msg
                     if self.__detail_frame.is_showing_record(record):
                         self.__detail_frame.set_metrics_values(data)
-                    self.__status_var.set(f"Development metrics loaded for ...{str(_record_run_uuid(record))[-8:]}")
+                    self.__status_var.set(f"Development metrics loaded for ...{str(run_uuid)[-8:]}")
 
                 elif m_type == "read_err":
-                    _t, record, err = msg
+                    _t, record, run_uuid, err = msg
                     if self.__is_missing_metrics_file_error(err):
                         if self.__detail_frame.is_showing_record(record):
                             self.__detail_frame.set_metrics_values({})
-                        self.__status_var.set(f"No development metrics for ...{str(_record_run_uuid(record))[-8:]}")
+                        self.__status_var.set(f"No development metrics for ...{str(run_uuid)[-8:]}")
                     else:
-                        self.__status_var.set(f"Read metrics failed for ...{str(_record_run_uuid(record))[-8:]}")
+                        self.__status_var.set(f"Read metrics failed for ...{str(run_uuid)[-8:]}")
                         messagebox.showerror("Read Metrics Failed", str(err))
 
                 elif m_type == "save_ok":
-                    _t, record = msg
-                    self.__status_var.set(f"Development metrics saved for ...{str(_record_run_uuid(record))[-8:]}")
+                    _t, record, run_uuid = msg
+                    self.__status_var.set(f"Development metrics saved for ...{str(run_uuid)[-8:]}")
                     if self.__detail_frame.is_showing_record(record):
                         self.__detail_frame.load_record(record)
                     self.__results_frame.refresh_record(record)
                     messagebox.showinfo("Save Metrics", "Development metrics saved.")
 
                 elif m_type == "save_err":
-                    _t, record, err = msg
-                    self.__status_var.set(f"Save metrics failed for ...{str(_record_run_uuid(record))[-8:]}")
+                    _t, record, run_uuid, err = msg
+                    self.__status_var.set(f"Save metrics failed for ...{str(run_uuid)[-8:]}")
                     messagebox.showerror("Save Metrics Failed", err)
 
         except Empty:
