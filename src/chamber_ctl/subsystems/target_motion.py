@@ -142,9 +142,9 @@ class TargetMotionProfile:
 
         p_time = frac_t * len_t + self.segment_begin_time(segment_num)
 
-        assert (p_time + 1e-3) >= 0.0, "Calculated time is negative!" + str(locals())
+        assert (p_time + 1e-2) >= 0.0, "Calculated time is negative!" + str(locals())
 
-        return max(p_time, 1e-3)
+        return max(p_time, 1e-2)
 
     def time_until_end_at_position(self, l_pos: float, r_pos: float, segment_num: int):
         (start_l, start_r) = (
@@ -422,9 +422,9 @@ class MotionState:
         # print("Offset positions:", off_l, off_r)
         # print("Current position before update:", self.__current_position)
 
-        if segment_time < p_len - 1e-3:
+        if segment_time < p_len - 1e-2:
             self.__current_position = segment_time
-            if self.get_time_until_end_of_segment() < 1e-3:
+            if self.get_time_until_end_of_segment() < 1e-2:
                 self.finish_segment()
         else:
             self.finish_segment()

@@ -466,7 +466,7 @@ class ScopeReader(OscilloscopeStream):
 
     def __read_thread(self, stop_flag: StopFlag):
         while stop_flag.run():
-            print("Read thread waiting for capture signal...")
+            #print("Read thread waiting for capture signal...")
             if not self.__do_capture and self.__is_capturing:
                 print("Capture deactivated, stopping any ongoing capture...")
                 self.scope.write(":STOP")
@@ -695,6 +695,44 @@ def calculate_doses_of_segments(e_uuid: uuid.UUID, d_reader: "DataReader"):
 
     return doses, times
 
+def calculate_peak_voltages_of_experiment(e_uuid: uuid.UUID, d_reader: "DataReader"):
+    segments = d_reader.get_snapshots(e_uuid)
+
+    volts = np.array([])
+    times = np.array([])
+
+    for uid, (snapshot_file, snapshot_meta) in segments.items():
+        try:
+            snap_array = np.load(snapshot_file)
+
+            meta = json.load(snapshot_meta)
+        except Exception as e:
+            print(f"Error loading snapshot {uid}: {e}. Skipping this segment.")
+            continue
+
+        start = meta["start"]# - (3600 * 6) * 1e9 # adjust for timezone to match scope's naive timestamps
+        end = meta["end"]
+
+        print(f"Processing segment {uid} with start={start / 1e9} s, end={end / 1e9} s, duration={(end - start) / 1e9} s")
+
+        if abs(start - end) > 10 * 1e9:
+            print(f"Segment {uid} has invalid timestamps: start={start}, end={end}. Skipping.")
+            continue
+
+        data = snap_array["data"]
+        indexes = snap_array["indexes"]
+
+        try:
+            peak_volts = calculate_peak_volts(data, indexes)
+        except Exception as e:
+            print(f"Error calculating peak voltages for segment {uid}: {e}. Skipping.")
+            continue
+
+        volts = np.append(volts, peak_volts[:, 1])
+        times = np.append(times, peak_volts[:, 0])
+
+    return volts, times
+
 def calculate_dose_raw(start, end, data, indexes):
     __REP_RATE_HZ = 100
 
@@ -708,10 +746,30 @@ def calculate_dose_raw(start, end, data, indexes):
         #print(f"Non-continuous dose calculation: {total} mJ/cm2 average per pulse, not scaled by time. Realtime: {realtime} seconds")
         total *= realtime * __REP_RATE_HZ
         return total, realtime
+    
+def calculate_peak_volts(data, indexes):
+    pulse_peaks = []
+
+    indexes = np.array(indexes)
+    data = np.array(data)
+
+    if len(indexes) < 2:
+        return 0.0, False, 0.0
+    
+    pulse_size = int(indexes[1, 0] - indexes[0, 0])
+
+    for index, begin_time in indexes:
+        index = int(index)
+        pulse = data[index:index+pulse_size, :]
+        pulse_peaks.append((begin_time, np.max(pulse[:, 1])))
+
+    pulse_peaks = np.array(pulse_peaks)
+    
+    return pulse_peaks
 
 
 def calculate_avg_pulsedose(data, indexes):
-    __OFF_NUM = 98
+    __OFF_NUM = 25
     __SAMPLE_dT = 10 / 1e9
     __RESISTOR_OHMS = 50.0
     __RESP_A_PER_W = 0.14
@@ -1038,7 +1096,7 @@ class DataReader:
         return None
 
 class OscilloscopeSubsystem(exp_client.ExperimentClient):
-    __STEP_DOSE_TGT = 2.0 # mJ/cm2, start stepping once dose is within this range of target
+    __STEP_DOSE_TGT = 1.0 # mJ/cm2, start stepping once dose is within this range of target
     def __init__(self, scope: OscilloscopeStream):
         self.__out_queue = queue.Queue()
 
@@ -1146,7 +1204,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                     time.sleep(0.1)
                 
                 time.sleep(0.1)
-                payload = struct.pack('d', float(1.0))
+                payload = struct.pack('d', float(2.0))
                 self.__timed_exposure_handle = self.__do_timed_exposure_event.call(payload, [uuids.UUID_LASER_CONTROLLER])
                 self.__did_read = False
                 self.osc.capture_once()
@@ -1155,8 +1213,13 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                 while self.__timed_exposure_handle.is_in_progress():
                     time.sleep(0.1)
 
-                while not self.__did_read:
+                start_t = time.monotonic()
+                while not self.__did_read and (time.monotonic() - start_t) < 10.0:
                     time.sleep(0.1)
+
+                if not self.__did_read:
+                    print("Timed exposure completed but no oscilloscope data was read, something may have gone wrong.")
+                    self.__logger.log("Timed exposure completed but no oscilloscope data was read, something may have gone wrong.", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
 
                 print("Step exposure completed.")
                 print(f"Step result: {self.__timed_exposure_handle.get_result(uuids.UUID_LASER_CONTROLLER)}")
@@ -1370,8 +1433,8 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
 
 def main(stop_event: "multiprocessing.Event"):
-    #osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
-    osc = DummyOscilloscope()
+    osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
+    #osc = DummyOscilloscope()
     subsystem = OscilloscopeSubsystem(osc)
     print("Oscilloscope subsystem initializing...")
     #proc = RealtimeDoseCalc(osc)
@@ -1389,5 +1452,10 @@ def main(stop_event: "multiprocessing.Event"):
         osc.close()
         subsystem.close()
 
+def test_main():
+    osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
+    osc.start()
+    osc.set_active(True)
+
 if __name__ == "__main__":
-    main(multiprocessing.Event())
+    test_main()

@@ -462,7 +462,7 @@ class ExposureControllerGUI():
 
         name = str(settings.get("name", "")).strip() or "(unnamed)"
         operator = str(settings.get("operator", "")).strip() or "-"
-        sample = str(settings.get("sample", "")).strip() or "-"
+        sample = str(int(settings.get("sample", 0)) + 1).strip() or "-"
 
         target_label = "time"
         target_value = settings.get("target_time", 0)

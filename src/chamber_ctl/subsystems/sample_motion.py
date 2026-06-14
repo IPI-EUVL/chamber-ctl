@@ -14,7 +14,7 @@ import ipi_ecs.dds.client as client
 import ipi_ecs.dds.magics as magics
 import ipi_ecs.dds.types as types
 from ipi_ecs.subsystems.experiment_client import ExperimentClient, RunState
-
+from ipi_ecs.dds.subsystem import StatusItem
 from ipi_ecs.dds.magics import OP_OK
 from ipi_ecs.logging.client import LogClient
 
@@ -25,7 +25,7 @@ from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 STEPS_PER_ROT = 1600.0
 LIN_LENGTH = 90.0 / (2.54 / STEPS_PER_ROT) # Length / (pitch / steps per revolution)
 
-PI_ADDR = ("10.193.124.226", 11755)
+PI_ADDR = ("10.11.13.225", 11755)
 PORT = 11756
 
 STATE_IDLE = 0
@@ -35,11 +35,11 @@ STATE_OFFLINE = 3
 
 #print(LIN_LENGTH)
 
-EXPOSURE_OFFSET_Z = 101
-EXPOSURE_OFFSET_X = -15
+EXPOSURE_OFFSET_Z = 107
+EXPOSURE_OFFSET_X = -19
 
 HOME_POS = 80.0
-HOME_ANGLE = -2
+HOME_ANGLE = -0.6
 
 #SAMPLE_SLOT_ORDER = [11, 4, 10, 3, 0, 5, 9, 2, 1, 6, 8, 7]
 SAMPLE_SLOT_ORDER = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
@@ -53,6 +53,8 @@ def _angle_delta(a: float, b: float) -> float:
 def move_r_to_x_y(radius, x, y):
     if y == 0:
         return (0, radius)
+    
+    print(f"move_r_to_x_y: radius={radius}, x={x}, y={y}")
     
     #print(y / radius)
     angle = math.asin(y / radius)
@@ -236,6 +238,7 @@ class StepperClient:
         return self.__enabled
     
 def calc_target_pose_for_sample_index(sample_index: int, offset = [0, 0], samples = None):
+    print(f"Calculating target pose for sample index {sample_index} with offset {offset}")
     sample = samples[sample_index]
     th, z = move_r_to_x_y(
         sample['radius'],
@@ -664,7 +667,7 @@ class SampleMotionSubsystem(ExperimentClient):
 
         #use_mock = os.environ.get("SAMPLE_MOTION_USE_MOCK", "0").strip().lower() in ("1", "true", "yes")
         #if use_mock:
-        self.__stage: StageProvider = MockStageController()
+        self.__stage: StageProvider = PiStageController(StepperClient(PORT, PI_ADDR))
         self.__log("Initialized sample motion with mock stage backend.")
         #else:
         #    self.__stage = PiStageController(StepperClient(PORT, PI_ADDR))
@@ -730,6 +733,10 @@ class SampleMotionSubsystem(ExperimentClient):
         )
         handle.add_event_handler(b"home_sample").on_called(self.__on_home_event)
         handle.add_event_handler(b"home_rot_sample").on_called(self.__on_home_rot_event)
+
+        handle.put_status_item(StatusItem(StatusItem.STATE_INFO, 0, "Test status item"))
+        handle.put_status_item(StatusItem(StatusItem.STATE_INFO, 1, "Test status item 2"))
+
 
         self._setup_subsystem(handle)
 
@@ -811,7 +818,13 @@ class SampleMotionSubsystem(ExperimentClient):
         best_slot = -1
         best_err = None
         for slot in range(self.__stage.get_slot_count()):
-            s_th, s_z = self.__stage.calc_target_pose_for_slot(slot, self.__offset)
+            try:
+                s_th, s_z = self.__stage.calc_target_pose_for_slot(slot, self.__offset)
+            except Exception as e:
+                # Slot cannot be reached physically
+                continue
+
+            
             th_err = abs(_angle_delta(th, s_th))
             z_err = abs(z - s_z)
 

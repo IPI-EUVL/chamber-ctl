@@ -254,7 +254,7 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__SAVE_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
         self.__load_config()
 
-        self.__sync: LaserSyncProvider = DummyLaserSyncProvider()
+        self.__sync: LaserSyncProvider = WFLaserSyncProvider()
         ok, status = self.__sync.set_initial_phase(self.__initial_phase)
         if not ok:
             raise RuntimeError(f"Failed to set initial phase during startup: {status}")

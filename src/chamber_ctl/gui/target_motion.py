@@ -406,10 +406,12 @@ class TargetControlGUI:
                 l_offset, r_offset = state.offset_position
 
         cur_time = 0.0
+        repeats = 0
 
-        while off_l < LIN_LENGTH:
+        while off_l < LIN_LENGTH and off_r < 6.28 and repeats < 100 and state is not None:
             c_l = 0
             c_r = 0
+            repeats += 1
 
             for segment in segments:
                 l_t = abs((segment.lin_target - c_l) / segment.lin_velocity) if segment.lin_velocity > 0 else 0

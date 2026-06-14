@@ -27,7 +27,7 @@ from ipi_ecs.subsystems.experiment_client import ExperimentClient, RunState
 
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.target_motion import TargetMotion, TargetMotionConfig, TargetMotionProfile, MotionSegment, MotionState
-#from chamber_ctl.subsystems.ljs_target_motion import LJSerialTargetMotion
+from chamber_ctl.subsystems.ljs_target_motion import LJSerialTargetMotion
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 
 
@@ -159,8 +159,8 @@ class TargetMotionController:
         self.__config = TargetMotionConfig(max_l_size=300.0)
 
         self.__state = MotionState()
-        #self.__motion = LJSerialTargetMotion(self.__config, logger, port="COM3")
-        self.__motion = MockTargetMotion(self.__config)
+        self.__motion = LJSerialTargetMotion(self.__config, logger, port="COM3")
+        #self.__motion = MockTargetMotion(self.__config)
         self.__start_l = 0.0
         self.__start_r = 0.0
         self.__offset_l = 0.0
@@ -211,14 +211,14 @@ class TargetMotionController:
                 self.run_profile()
 
             elif self.__should_start:
-                print("Moving to path start position...")
+                #print("path start position...")
 
                 l_c, r_c = self.__state.get_current_position()
-                print(f"Path start position: ({l_c:.3f}, {r_c:.3f})")
+                #print(f"Path start position: ({l_c:.3f}, {r_c:.3f})")
                 eff_start_l, eff_start_r = self.__effective_start()
                 t_l, t_r = l_c + eff_start_l, r_c + eff_start_r
 
-                print(f"Moving to position: ({t_l:.3f}, {t_r:.3f}) from current position: {self.__motion.get_position()}")
+                #print(f"Moving to position: ({t_l:.3f}, {t_r:.3f}) from current position: {self.__motion.get_position()}")
 
                 self.__motion.move_to_position(t_l, t_r, self.__traverse_speed[0], self.__traverse_speed[1])
 
@@ -235,9 +235,9 @@ class TargetMotionController:
             
     def run_profile(self):
         t_l, t_r, v_l, v_r = self.__state.get_current_motion_command()
-        #print(f"Running profile command: target=({t_l:.3f}, {t_r:.3f}) velocity=({v_l:.3f}, {v_r:.3f})")
-        #print(f"Current position: {self.__motion.get_position()[0] - self.__start_l}, {self.__motion.get_position()[1] - self.__start_r}")
-        #print(f"Current time: {self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment():.3f}s until end of segment")
+        print(f"Running profile command: target=({t_l:.3f}, {t_r:.3f}) velocity=({v_l:.3f}, {v_r:.3f})")
+        print(f"Current position: {self.__motion.get_position()[0] - self.__start_l}, {self.__motion.get_position()[1] - self.__start_r}")
+        print(f"Current time: {self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment():.3f}s until end of segment")
         
         eff_start_l, eff_start_r = self.__effective_start()
         self.__motion.move_to_position(t_l + eff_start_l, t_r + eff_start_r, v_l, v_r)
@@ -250,10 +250,11 @@ class TargetMotionController:
         l_pos, r_pos = self.__motion.get_position()
         self.__state.update_position(l_pos - eff_start_l, r_pos - eff_start_r)
 
-        #print(f"Motion Profile @ time={self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment()} pos=({l_pos:.3f}, {r_pos:.3f})")
+        print(f"Motion Profile @ time={self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment()} pos=({l_pos - eff_start_l:.3f}, {r_pos - eff_start_r:.3f})")
 
         if self.__state.get_current_repetition() > self.__state.get_max_repetitions():
             self.__is_running = False
+            print("Completed all repetitions of motion profile. Stopping motion.")
 
     def is_running(self):
         return self.__is_running
@@ -1085,6 +1086,7 @@ class TargetController(ExperimentClient):
         if not ok:
             self.__logger.log(f"Failed to close target motion saver thread cleanly: {reason}", level="WARN", l_type="CTRL", subsystem="Target Controller", event="save_profile")
 
+        self.__motion_controller.close()
         self.__daemon.stop()
         self.__config_daemon.stop()
 

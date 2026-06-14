@@ -43,6 +43,7 @@ class LJSerialTargetMotion(TargetMotion):
         self.__r_offset = 0.0
         self.__rot_connection = None
         self.__rot_process = None
+        self.__stop_event = None
 
         self.__l_speed = 0.0
         self.__r_speed = 0.0
@@ -95,29 +96,37 @@ class LJSerialTargetMotion(TargetMotion):
     def close(self):
         if self.__rot_process is not None:
             print("Closing LabJack connection.")
+            self.__stop_event.set()
+            time.sleep(0.1)
             self.__rot_process.terminate()
             self.__rot_process.join(10.0)
             self.__rot_process = None
 
             self.__rot_connection.close()
             self.__rot_connection = None
-
         print("LabJack connection closed.")
+
+        print("Stopping LIN thread.")
+        self.__daemon.stop()
+        time.sleep(0.5)
+        print("LIN thread stopped.")
+
         if self.__l_serial is not None:
             print("Closing LIN serial connection.")
-            self.__stop_lin()
             self.__l_serial.close()
             self.__l_serial = None
         
-        self.__daemon.stop()
 
     def __init_rot(self):
         parent_conn, child_conn = multiprocessing.Pipe()
         self.__rot_connection = parent_conn
         log_queue = multiprocessing.Queue()
+        stop_event = multiprocessing.Event()
 
-        self.__rot_process = multiprocessing.Process(target=_make_labjack_handler_subprocess, args=(child_conn, log_queue, ))
+        self.__rot_process = multiprocessing.Process(target=_make_labjack_handler_subprocess, args=(child_conn, log_queue, stop_event, ))
         self.__rot_process.start()
+
+        self.__stop_event = stop_event
 
     def __rot_thread(self, stop_flag: daemon.StopFlag):
         while stop_flag.run():
@@ -127,8 +136,9 @@ class LJSerialTargetMotion(TargetMotion):
                 self.__update_r()
 
     def __update_r(self):
-        pos, = self.__rot_connection.recv()
-        self.__current_r = pos + self.__r_offset
+        while self.__rot_connection.poll():
+            pos, = self.__rot_connection.recv()
+            self.__current_r = pos + self.__r_offset
 
         #print("Sending to LabJack subprocess:", (self.__target_r, self.__r_speed, self.__jog_r, self.__set_r))
         self.__rot_connection.send((self.__target_r - self.__r_offset, self.__r_speed, self.__jog_r, self.__set_r))
@@ -274,6 +284,9 @@ class LJSerialTargetMotion(TargetMotion):
                 self.__l_serial = None
                 time.sleep(1.0)
                 self.__init_lin()
+
+        print("LIN thread stopping, sending stop command.")
+        self.__stop_lin()
             
 
     def __update_l(self):
@@ -382,19 +395,20 @@ class LabJackHandlerSubprocess:
     PUL_MIN = "FIO5"
     DIR_PLUS = "FIO6"
     DIR_MIN = "FIO7"
-    def __init__(self, conn, log_queue):
+    def __init__(self, conn, log_queue, stop_event):
         print("LabJack Handler subprocess started.")
         self.__conn = conn
         self.__log_queue = log_queue
+        self.__stop_event = stop_event
         self.__init_lj()
 
-        print("LabJack Handler subprocess started.")
+        #print("LabJack Handler subprocess started.")
         self.__target_r = float('nan')
         self.__r_speed = 0.0
         self.__jog_r = 0.0
         self.__current_r = 0.0
 
-        print("LabJack Handler subprocess started.")
+        #print("LabJack Handler subprocess started.")
         self.__daemon = daemon.Daemon()
         self.__daemon.add(target=self.__conn_thread)
         self.__daemon.add(target=self.__rot_thread)
@@ -418,13 +432,14 @@ class LabJackHandlerSubprocess:
 
     def __conn_thread(self, stop_flag: daemon.StopFlag):
         #print("LabJack Handler connection thread started.")
-        while stop_flag.run():
+        while stop_flag.run() and not self.__stop_event.is_set():
             time.sleep(0.02)
 
-            target_r, r_speed, jog_r, set_pos = self.__conn.recv()
-            self.__target_r = target_r
-            self.__r_speed = r_speed
-            self.__jog_r = jog_r
+            while self.__conn.poll():
+                target_r, r_speed, jog_r, set_pos = self.__conn.recv()
+                self.__target_r = target_r
+                self.__r_speed = max(min(r_speed, 1.0), -1.0)
+                self.__jog_r = jog_r
 
             #print(f"LabJack Handler received target_r: {target_r}, r_speed: {r_speed}, jog_r: {jog_r}, set_pos: {set_pos}")
 
@@ -432,8 +447,9 @@ class LabJackHandlerSubprocess:
                 self.__current_r = set_pos
 
     def __send_thread(self, stop_flag: daemon.StopFlag):
-        while stop_flag.run():
+        while stop_flag.run() and not self.__stop_event.is_set():
             time.sleep(0.02)
+            #print(f"LabJack Handler sending current_r: {self.__current_r}")
             self.__conn.send((self.__current_r, ))
 
     def __direction_set(self, direction):
@@ -455,7 +471,9 @@ class LabJackHandlerSubprocess:
         target_r = 0
         current_r = 0.0
 
-        while stop_flag.run():
+        has_reset = False
+
+        while stop_flag.run() and not self.__stop_event.is_set():
             t = time.monotonic()
             dt = t - l_t
             l_t = t
@@ -483,10 +501,18 @@ class LabJackHandlerSubprocess:
                 time.sleep(0.01)
                 continue
 
+            """if not has_reset and abs(target_r) > 0.01:
+                print("Resetting LabJack position to target:", target_r)
+                has_reset = True
+                target_r = self.__target_r
+                current_r = target_r
+                self.__current_r = current_r"""
+            
+
+            #print(f"LabJack Handler - Target R: {self.__target_r}, Current R: {self.__current_r}, Target R (internal): {target_r}, R Speed: {self.__r_speed}, Jog R: {self.__jog_r}")
+            
             if current_r != target_r * RADS_TO_STEPS:
                 steps = floor(abs(current_r - target_r * RADS_TO_STEPS))
-                if steps == 0:
-                    continue
 
                 direction = (target_r * RADS_TO_STEPS) > current_r
                 self.__direction_set(direction)
@@ -501,9 +527,9 @@ class LabJackHandlerSubprocess:
                 if abs(self.__current_r - self.__target_r) < 5e-3:
                     self.__current_r = self.__target_r
 
-def _make_labjack_handler_subprocess(p, log_queue):
+def _make_labjack_handler_subprocess(p, log_queue, stop_event):
     print("Starting LabJack handler subprocess...")
-    _ph = LabJackHandlerSubprocess(p, log_queue)
+    _ph = LabJackHandlerSubprocess(p, log_queue, stop_event)
 
     while _ph.ok():
         time.sleep(1)

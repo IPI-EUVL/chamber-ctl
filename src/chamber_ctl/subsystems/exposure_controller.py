@@ -27,7 +27,6 @@ from chamber_ctl.subsystems import uuids
 class ExposureSettings(RunSettings):
     def __init__(self, target_time: float = 0.0, target_dose: float = 0.0, operator: str = "", zr_filter: str = "", sample: str = "", sample_type: str = "", base_pressure: float = 0.0, operating_pressure: float = 0.0, flow_sccm: float = 0.0):
         super().__init__()
-        print(f"Initializing ExposureSettings with target_time={target_time}, target_dose={target_dose}, operator='{operator}', zr_filter='{zr_filter}', sample='{sample}', sample_type='{sample_type}'")
         self.data["target_time"] = target_time
         self.data["target_dose"] = target_dose
         self.data["operator"] = operator
@@ -39,8 +38,6 @@ class ExposureSettings(RunSettings):
         self.data["flow_sccm"] = flow_sccm
 
     def set_attr(self, key, value):
-        print(f"Setting {key} to {value} of type {type(value)}")
-
         if (self.data["target_time"] is not None and key == "target_dose" and float(value) > 0.1) and self.data["target_time"] >= 0.1:
             raise ValueError("Cannot set target_dose when target_time is already set. Please clear target_time before setting target_dose.")
         if (self.data["target_dose"] is not None and self.data["target_dose"] >= 0.1) and key == "target_time" and float(value) > 0.1:
