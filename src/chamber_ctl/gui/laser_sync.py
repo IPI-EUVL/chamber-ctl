@@ -19,6 +19,7 @@ import ipi_ecs.dds.types as types
 from ipi_ecs.logging.client import LogClient
 from ipi_ecs.cli.captive_cli import wait_for
 
+from chamber_ctl import ECS_IP, ECS_PORT
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.laser import LaserSyncStatus
 
@@ -229,7 +230,7 @@ class LaserSyncTestGUI:
             sh = self.__client.register_subsystem("__laser_sync_gui", uuid.uuid4(), temporary=True)
             self.__on_got_subsystem(sh)
 
-        self.__client = client.DDSClient(c_uuid, logger=self.__logger)
+        self.__client = client.DDSClient(c_uuid, logger=self.__logger, ip=ECS_IP)
         self.__client.when_ready().then(_on_ready)
 
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):

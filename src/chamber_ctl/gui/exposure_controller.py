@@ -13,6 +13,7 @@ from ipi_ecs.logging.client import LogClient
 from ipi_ecs.gui.experiment_controller_gui import ExperimentInterface, ExperimentControllerGUI
 from ipi_ecs.cli.captive_cli import wait_for
 
+from chamber_ctl import ECS_IP, ECS_PORT
 from chamber_ctl.gui.sample_motion_gui import draw_sample_stage, build_sample_data, RING_RADII
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
@@ -114,7 +115,7 @@ class ExposureControllerGUI():
             self.__on_got_subsystem(sh)
 
         #print("Registering subsystem...")
-        self.__client = client.DDSClient(c_uuid, logger=self.__logger)
+        self.__client = client.DDSClient(c_uuid, logger=self.__logger, ip=ECS_IP)
         self.__client.when_ready().then(_on_ready)
 
         self.initialize_component()

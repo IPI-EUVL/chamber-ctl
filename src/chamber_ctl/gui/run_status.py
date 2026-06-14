@@ -17,6 +17,7 @@ import ipi_ecs.dds.types as types
 import ipi_ecs.dds.magics as magics
 
 from ipi_ecs.logging.client import LogClient
+from chamber_ctl import ECS_IP, ECS_PORT
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.interfaces.scope_interface import PhosphorScopeTk
 from chamber_ctl.subsystems.oscilloscope import calculate_dose_of_experiment, DataReader, calculate_dose_of_segment
@@ -53,7 +54,7 @@ class ScopeClient:
             self.__on_got_subsystem(sh)
 
         #print("Registering subsystem...")
-        self.__client = client.DDSClient(c_uuid, logger=self.__logger)
+        self.__client = client.DDSClient(c_uuid, logger=self.__logger, ip=ECS_IP)
         self.__client.when_ready().then(_on_ready)
 
         self.__daemon = daemon.Daemon()

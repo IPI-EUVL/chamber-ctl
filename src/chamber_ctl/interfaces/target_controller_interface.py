@@ -16,6 +16,7 @@ import ipi_ecs.dds.types as types
 from ipi_ecs.cli.captive_cli import CaptiveCLITemplate, wait_for, wait_for_event
 from ipi_ecs.logging.client import LogClient
 
+from chamber_ctl import ECS_IP, ECS_PORT
 from chamber_ctl.subsystems.uuids import UUID_TARGET_CONTROLLER
 
 class TargetClient:
@@ -61,7 +62,7 @@ class TargetClient:
             self.__on_got_subsystem(sh)
 
         #print("Registering subsystem...")
-        self.__client = client.DDSClient(c_uuid, logger=self.__logger)
+        self.__client = client.DDSClient(c_uuid, logger=self.__logger, ip=ECS_IP)
         self.__client.when_ready().then(_on_ready)
 
         self.__on_data = mt_events.Event()

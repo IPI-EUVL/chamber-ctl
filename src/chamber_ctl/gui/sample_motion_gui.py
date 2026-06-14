@@ -15,6 +15,7 @@ from ipi_ecs.cli.captive_cli import wait_for
 from ipi_ecs.core import daemon
 from ipi_ecs.logging.client import LogClient
 
+from chamber_ctl import ECS_IP, ECS_PORT
 import chamber_ctl.subsystems.sample_motion as stage_client
 from chamber_ctl.subsystems import uuids
 
@@ -78,7 +79,7 @@ class SampleMotionDDSClient:
 
         self.__logger = LogClient(self.__logger_sock, origin_uuid=c_uuid)
 
-        self.__client = client.DDSClient(c_uuid, logger=self.__logger)
+        self.__client = client.DDSClient(c_uuid, logger=self.__logger, ip=ECS_IP)
         self.__client.when_ready().then(self.__on_ready)
 
         self.__daemon = daemon.Daemon()
