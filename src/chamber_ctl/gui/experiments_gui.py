@@ -3,12 +3,18 @@ from tkinter import ttk, messagebox, filedialog
 import os
 import time
 import threading
+import uuid
 from queue import Queue, Empty
 import plotly.graph_objects as go
 
 from ipi_ecs.core import daemon
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader, RunRecord
-from chamber_ctl.subsystems.oscilloscope import DataReader, calculate_dose_of_experiment, calculate_doses_of_segments
+from chamber_ctl.subsystems.oscilloscope import (
+    DataReader,
+    calculate_dose_of_experiment,
+    calculate_doses_of_segments,
+    calculate_peak_voltages_of_experiment,
+)
 from chamber_ctl.subsystems.development_metrics import DevelopmentMetrics
 from ipi_ecs.util.export_experiment import export_experiment_data
 
@@ -20,6 +26,17 @@ def _fmt_timestamp(ts) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
     except (TypeError, ValueError):
         return str(ts)
+
+
+def _record_run_uuid(record: RunRecord) -> uuid.UUID:
+    tags = record.get_tags() or {}
+    run_uuid = tags.get("run")
+    if run_uuid is not None:
+        try:
+            return uuid.UUID(str(run_uuid))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return record.get_state().get_uuid()
 
 
 class ExperimentReaderThread:
@@ -305,39 +322,10 @@ class ResultsFrame(ttk.LabelFrame):
         self.__records.clear()
 
         for record in records:
-            meta = record.get_metadata() or {}
-            end_meta = record.get_end_metadata()
-            date_str = _fmt_timestamp(meta.get("created_at"))
-            uuid_str = str(record.get_state().get_uuid())[-8:]
-            status = (end_meta or {}).get("status", "Active")
-            dose = self.__dose_display(record)
-            runtime = self.__runtime_display(record)
-            sample = self.__sample_display(record)
-            target_dose = self.__target_dose_display(record)
-            effective_dose_rate = self.__effective_dose_rate_display(record)
-            avg_exposed_thickness = self.__avg_exposed_thickness_display(record)
-            avg_blank_thickness = self.__avg_blank_thickness_display(record)
-            name = record.get_name() or ""
-            desc = record.get_description() or ""
-            if len(desc) > 60:
-                desc = desc[:57] + "..."
             iid = self.__tree.insert(
                 "",
                 tk.END,
-                values=(
-                    name,
-                    desc,
-                    sample,
-                    target_dose,
-                    date_str,
-                    uuid_str,
-                    dose,
-                    runtime,
-                    effective_dose_rate,
-                    avg_exposed_thickness,
-                    avg_blank_thickness,
-                    status,
-                ),
+                values=self.__row_values(record),
             )
             self.__records[iid] = record
 
@@ -347,44 +335,64 @@ class ResultsFrame(ttk.LabelFrame):
     def refresh_record(self, record: RunRecord):
         for iid, rec in self.__records.items():
             if rec is record:
-                meta = record.get_metadata() or {}
-                end_meta = record.get_end_metadata()
-                date_str = _fmt_timestamp(meta.get("created_at"))
-                uuid_str = str(record.get_state().get_uuid())[-8:]
-                status = (end_meta or {}).get("status", "Active")
-                dose = self.__dose_display(record)
-                runtime = self.__runtime_display(record)
-                sample = self.__sample_display(record)
-                target_dose = self.__target_dose_display(record)
-                effective_dose_rate = self.__effective_dose_rate_display(record)
-                avg_exposed_thickness = self.__avg_exposed_thickness_display(record)
-                avg_blank_thickness = self.__avg_blank_thickness_display(record)
-                name = record.get_name() or ""
-                desc = record.get_description() or ""
-                if len(desc) > 60:
-                    desc = desc[:57] + "..."
                 self.__tree.item(
                     iid,
-                    values=(
-                        name,
-                        desc,
-                        sample,
-                        target_dose,
-                        date_str,
-                        uuid_str,
-                        dose,
-                        runtime,
-                        effective_dose_rate,
-                        avg_exposed_thickness,
-                        avg_blank_thickness,
-                        status,
-                    ),
+                    values=self.__row_values(record),
                 )
                 break
 
     @staticmethod
-    def __dose_display(record: RunRecord) -> str:
+    def __row_values(record: RunRecord) -> tuple:
+        """Build a result row from database-backed fields and tags only.
+
+        Avoid record.get_state(), record.get_metadata(), and record.get_end_metadata()
+        here; those load deferred per-experiment files and should only happen when an
+        experiment is selected into the detail pane.
+        """
+        name = record.get_name() or ""
+        desc = record.get_description() or ""
+        if len(desc) > 60:
+            desc = desc[:57] + "..."
+
         tags = record.get_tags() or {}
+        date_str = ResultsFrame.__entry_date_display(record)
+        uuid_str = ResultsFrame.__uuid_display_from_tags(tags)
+        status = str(tags.get("status", "Active"))
+
+        return (
+            name,
+            desc,
+            ResultsFrame.__sample_display_from_tags(tags),
+            ResultsFrame.__target_dose_display_from_tags(tags),
+            date_str,
+            uuid_str,
+            ResultsFrame.__dose_display_from_tags(tags),
+            ResultsFrame.__runtime_display_from_tags(tags),
+            ResultsFrame.__effective_dose_rate_display_from_tags(tags),
+            ResultsFrame.__format_numeric_tag(tags.get("avg_exposed_area_thickness_nm")),
+            ResultsFrame.__format_numeric_tag(tags.get("avg_blank_area_thickness_nm")),
+            status,
+        )
+
+    @staticmethod
+    def __entry_date_display(record: RunRecord) -> str:
+        try:
+            entry = record.get_record()
+            return _fmt_timestamp(entry.get_timestamp()) if entry is not None else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def __uuid_display_from_tags(tags: dict) -> str:
+        run_uuid = tags.get("run")
+        return str(run_uuid)[-8:] if run_uuid is not None else ""
+
+    @staticmethod
+    def __dose_display(record: RunRecord) -> str:
+        return ResultsFrame.__dose_display_from_tags(record.get_tags() or {})
+
+    @staticmethod
+    def __dose_display_from_tags(tags: dict) -> str:
         dose = tags.get("dose")
         if dose is None:
             return "None"
@@ -395,7 +403,10 @@ class ResultsFrame(ttk.LabelFrame):
 
     @staticmethod
     def __runtime_display(record: RunRecord) -> str:
-        tags = record.get_tags() or {}
+        return ResultsFrame.__runtime_display_from_tags(record.get_tags() or {})
+
+    @staticmethod
+    def __runtime_display_from_tags(tags: dict) -> str:
         runtime = tags.get("runtime")
         if runtime is None:
             return "None"
@@ -406,7 +417,10 @@ class ResultsFrame(ttk.LabelFrame):
 
     @staticmethod
     def __sample_display(record: RunRecord) -> str:
-        tags = record.get_tags() or {}
+        return ResultsFrame.__sample_display_from_tags(record.get_tags() or {})
+
+    @staticmethod
+    def __sample_display_from_tags(tags: dict) -> str:
         sample = tags.get("sample")
         if sample is None:
             return "None"
@@ -414,7 +428,10 @@ class ResultsFrame(ttk.LabelFrame):
 
     @staticmethod
     def __target_dose_display(record: RunRecord) -> str:
-        tags = record.get_tags() or {}
+        return ResultsFrame.__target_dose_display_from_tags(record.get_tags() or {})
+
+    @staticmethod
+    def __target_dose_display_from_tags(tags: dict) -> str:
         target_dose = tags.get("target_dose")
         if target_dose is None:
             return "None"
@@ -425,7 +442,10 @@ class ResultsFrame(ttk.LabelFrame):
 
     @staticmethod
     def __effective_dose_rate_display(record: RunRecord) -> str:
-        tags = record.get_tags() or {}
+        return ResultsFrame.__effective_dose_rate_display_from_tags(record.get_tags() or {})
+
+    @staticmethod
+    def __effective_dose_rate_display_from_tags(tags: dict) -> str:
         dose = tags.get("dose")
         runtime = tags.get("runtime")
         if dose is None or runtime is None:
@@ -781,7 +801,7 @@ class DetailFrame(ttk.LabelFrame):
     def __copy_experiment_id(self):
         if self.__record is None:
             return
-        run_uuid = self.__record.get_state().get_uuid()
+        run_uuid = _record_run_uuid(self.__record)
         uuid_text = str(run_uuid)
         self.clipboard_clear()
         self.clipboard_append(uuid_text)
@@ -890,6 +910,9 @@ class ExperimentsGUI:
         self.__plot_queue: Queue = Queue()
         self.__plot_worker = None
 
+        self.__volts_plot_queue: Queue = Queue()
+        self.__volts_plot_worker = None
+
         self.__loading_dialog = None
         self.__loading_progressbar = None
         self.__loading_progress_var = tk.DoubleVar(value=0.0)
@@ -933,6 +956,11 @@ class ExperimentsGUI:
             self.__actions_frame,
             text="Plot Dose Graph (Selected)",
             command=self.__on_plot_selected_dose_graph,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            self.__actions_frame,
+            text="Plot Volts Graph (Selected)",
+            command=self.__on_plot_selected_volts_graph,
         ).pack(side=tk.LEFT, padx=2)
 
         self.__results_frame = ResultsFrame(left, on_selection_changed=self.__on_selection_changed)
@@ -1022,7 +1050,7 @@ class ExperimentsGUI:
                 messagebox.showinfo("Read Metrics", "A metrics read operation is already in progress.")
             return
 
-        run_uuid = record.get_state().get_uuid()
+        run_uuid = _record_run_uuid(record)
         self.__status_var.set(f"Reading development metrics ...{str(run_uuid)[-8:]}")
 
         self.__metrics_read_worker = threading.Thread(
@@ -1033,7 +1061,7 @@ class ExperimentsGUI:
         self.__metrics_read_worker.start()
 
     def __read_metrics_thread(self, record: RunRecord):
-        run_uuid = record.get_state().get_uuid()
+        run_uuid = _record_run_uuid(record)
         try:
             data = self.__dev_metrics.read_ellipsometry_data(run_uuid)
             self.__metrics_queue.put(("read_ok", record, data))
@@ -1055,7 +1083,7 @@ class ExperimentsGUI:
             messagebox.showinfo("Save Metrics", "A metrics save operation is already in progress.")
             return
 
-        run_uuid = record.get_state().get_uuid()
+        run_uuid = _record_run_uuid(record)
         self.__status_var.set(f"Saving development metrics ...{str(run_uuid)[-8:]}")
 
         self.__metrics_save_worker = threading.Thread(
@@ -1066,7 +1094,7 @@ class ExperimentsGUI:
         self.__metrics_save_worker.start()
 
     def __save_metrics_thread(self, record: RunRecord, exposed: list[float], blank: list[float], gof: list[float]):
-        run_uuid = record.get_state().get_uuid()
+        run_uuid = _record_run_uuid(record)
         try:
             self.__dev_metrics.save_ellipsometry_data(run_uuid, exposed, blank, gof)
             self.__metrics_queue.put(("save_ok", record))
@@ -1092,7 +1120,7 @@ class ExperimentsGUI:
             "Overwrite existing experiment folders if they already exist?",
         )
 
-        run_ids = [record.get_state().get_uuid() for record in records]
+        run_ids = [_record_run_uuid(record) for record in records]
         self.__show_loading_dialog(
             f"Exporting {len(run_ids)} experiment(s)...",
             determinate=True,
@@ -1214,7 +1242,7 @@ class ExperimentsGUI:
             messagebox.showinfo("Plot Dose Graph", "A graph is already being prepared.")
             return
 
-        run_ids = [record.get_state().get_uuid() for record in records]
+        run_ids = [_record_run_uuid(record) for record in records]
         self.__show_loading_dialog(
             f"Preparing dose graph for {len(run_ids)} experiment(s)...",
             determinate=True,
@@ -1228,6 +1256,31 @@ class ExperimentsGUI:
             daemon=True,
         )
         self.__plot_worker.start()
+
+    def __on_plot_selected_volts_graph(self):
+        records = self.__results_frame.get_selected_records()
+        if not records:
+            messagebox.showinfo("Plot Volts Graph", "Select one or more experiments from the list first.")
+            return
+
+        if self.__volts_plot_worker is not None and self.__volts_plot_worker.is_alive():
+            messagebox.showinfo("Plot Volts Graph", "A graph is already being prepared.")
+            return
+
+        run_ids = [_record_run_uuid(record) for record in records]
+        self.__show_loading_dialog(
+            f"Preparing volts graph for {len(run_ids)} experiment(s)...",
+            determinate=True,
+            maximum=len(run_ids),
+        )
+        self.__status_var.set(f"Preparing volts graph for {len(run_ids)} experiment(s)...")
+
+        self.__volts_plot_worker = threading.Thread(
+            target=self.__plot_volts_selected_thread,
+            args=(run_ids,),
+            daemon=True,
+        )
+        self.__volts_plot_worker.start()
 
     def __plot_selected_thread(self, run_ids: list):
         data_reader = DataReader(self.__data_path)
@@ -1260,6 +1313,30 @@ class ExperimentsGUI:
                 self.__plot_queue.put(("error", idx, total, run_uuid, str(e)))
 
         self.__plot_queue.put(("done", traces, errors, total))
+
+    def __plot_volts_selected_thread(self, run_ids: list):
+        data_reader = DataReader(self.__data_path)
+        exp_reader = ExperimentReader(self.__data_path, self.__exp_name)
+        traces = []
+        errors = []
+        total = len(run_ids)
+
+        for idx, run_uuid in enumerate(run_ids, start=1):
+            try:
+                run = exp_reader.locate_run_by_uuid(run_uuid)
+                name = f"{run.get_name()}:{run.get_description()}"
+
+                volts, times = calculate_peak_voltages_of_experiment(run_uuid, data_reader)
+                if len(times) > 0:
+                    times = times - times[0]
+
+                traces.append((name, times, volts))
+                self.__volts_plot_queue.put(("progress", idx, total, run_uuid))
+            except Exception as e:
+                errors.append((run_uuid, str(e)))
+                self.__volts_plot_queue.put(("error", idx, total, run_uuid, str(e)))
+
+        self.__volts_plot_queue.put(("done", traces, errors, total))
 
     def __open_dose_progress_dialog(self, total_count: int):
         if self.__dose_dialog is not None and self.__dose_dialog.winfo_exists():
@@ -1314,16 +1391,16 @@ class ExperimentsGUI:
             if self.__dose_recalc_cancel.is_set():
                 break
 
-            run_uuid = record.get_state().get_uuid()
+            run_uuid = _record_run_uuid(record)
             try:
                 dose, runtime = calculate_dose_of_experiment(run_uuid, data_reader)
                 self.__reader.add_tag(record, "dose", float(dose))
                 self.__reader.add_tag(record, "runtime", float(runtime))
                 processed += 1
-                self.__dose_recalc_queue.put(("progress", i, total, record, float(dose), float(runtime)))
+                self.__dose_recalc_queue.put(("progress", i, total, record, run_uuid, float(dose), float(runtime)))
             except Exception as e:
                 errors += 1
-                self.__dose_recalc_queue.put(("error", i, total, record, str(e)))
+                self.__dose_recalc_queue.put(("error", i, total, record, run_uuid, str(e)))
 
         canceled = self.__dose_recalc_cancel.is_set()
         self.__dose_recalc_queue.put(("done", processed, total, errors, canceled))
@@ -1350,21 +1427,21 @@ class ExperimentsGUI:
                 m_type = msg[0]
 
                 if m_type == "progress":
-                    _t, done, total, record, dose, runtime = msg
+                    _t, done, total, record, run_uuid, dose, runtime = msg
                     self.__dose_progress_var.set(done)
                     self.__dose_status_var.set(f"Calculated: {done} | Remaining: {max(total - done, 0)}")
                     self.__dose_info_var.set(
-                        f"...{str(record.get_state().get_uuid())[-8:]}  dose={dose:.6g} mJ/cm2  runtime={runtime:.6g} s"
+                        f"...{str(run_uuid)[-8:]}  dose={dose:.6g} mJ/cm2  runtime={runtime:.6g} s"
                     )
                     self.__results_frame.refresh_record(record)
                     if self.__detail_frame.is_showing_record(record):
                         self.__detail_frame.load_record(record)
 
                 elif m_type == "error":
-                    _t, done, total, record, err = msg
+                    _t, done, total, record, run_uuid, err = msg
                     self.__dose_progress_var.set(done)
                     self.__dose_status_var.set(f"Calculated: {done} | Remaining: {max(total - done, 0)}")
-                    self.__dose_info_var.set(f"Failed ...{str(record.get_state().get_uuid())[-8:]}: {err}")
+                    self.__dose_info_var.set(f"Failed ...{str(run_uuid)[-8:]}: {err}")
 
                 elif m_type == "done":
                     _t, processed, total, errors, canceled = msg
@@ -1469,6 +1546,53 @@ class ExperimentsGUI:
 
         try:
             while True:
+                msg = self.__volts_plot_queue.get_nowait()
+                m_type = msg[0]
+
+                if m_type == "progress":
+                    _t, done, total, run_uuid = msg
+                    self.__loading_progress_var.set(done)
+                    self.__status_var.set(f"Preparing volts graph {done}/{total} (...{str(run_uuid)[-8:]})")
+
+                elif m_type == "error":
+                    _t, done, total, run_uuid, err = msg
+                    self.__loading_progress_var.set(done)
+                    self.__status_var.set(f"Volts graph {done}/{total}: failed ...{str(run_uuid)[-8:]} ({err})")
+
+                elif m_type == "done":
+                    _t, traces, errors, total = msg
+                    self.__hide_loading_dialog()
+
+                    if traces:
+                        fig = go.Figure()
+                        for name, times, volts in traces:
+                            fig.add_trace(go.Scatter(x=times, y=volts, mode="lines", name=name))
+                        fig.update_layout(
+                            title="Peak Voltages vs Time",
+                            xaxis_title="Time (s)",
+                            yaxis_title="Voltage (V)",
+                        )
+                        fig.show()
+
+                    if errors:
+                        success = len(traces)
+                        self.__status_var.set(
+                            f"Volts graph ready with errors: {success}/{total} experiments plotted."
+                        )
+                        first_uuid, first_err = errors[0]
+                        messagebox.showwarning(
+                            "Plot Volts Graph",
+                            f"Plotted {success}/{total} experiment(s). "
+                            f"First error (...{str(first_uuid)[-8:]}): {first_err}",
+                        )
+                    else:
+                        self.__status_var.set(f"Volts graph ready: {len(traces)}/{total} experiments plotted.")
+
+        except Empty:
+            pass
+
+        try:
+            while True:
                 msg = self.__metrics_queue.get_nowait()
                 m_type = msg[0]
 
@@ -1476,21 +1600,21 @@ class ExperimentsGUI:
                     _t, record, data = msg
                     if self.__detail_frame.is_showing_record(record):
                         self.__detail_frame.set_metrics_values(data)
-                    self.__status_var.set(f"Development metrics loaded for ...{str(record.get_state().get_uuid())[-8:]}")
+                    self.__status_var.set(f"Development metrics loaded for ...{str(_record_run_uuid(record))[-8:]}")
 
                 elif m_type == "read_err":
                     _t, record, err = msg
                     if self.__is_missing_metrics_file_error(err):
                         if self.__detail_frame.is_showing_record(record):
                             self.__detail_frame.set_metrics_values({})
-                        self.__status_var.set(f"No development metrics for ...{str(record.get_state().get_uuid())[-8:]}")
+                        self.__status_var.set(f"No development metrics for ...{str(_record_run_uuid(record))[-8:]}")
                     else:
-                        self.__status_var.set(f"Read metrics failed for ...{str(record.get_state().get_uuid())[-8:]}")
+                        self.__status_var.set(f"Read metrics failed for ...{str(_record_run_uuid(record))[-8:]}")
                         messagebox.showerror("Read Metrics Failed", str(err))
 
                 elif m_type == "save_ok":
                     _t, record = msg
-                    self.__status_var.set(f"Development metrics saved for ...{str(record.get_state().get_uuid())[-8:]}")
+                    self.__status_var.set(f"Development metrics saved for ...{str(_record_run_uuid(record))[-8:]}")
                     if self.__detail_frame.is_showing_record(record):
                         self.__detail_frame.load_record(record)
                     self.__results_frame.refresh_record(record)
@@ -1498,7 +1622,7 @@ class ExperimentsGUI:
 
                 elif m_type == "save_err":
                     _t, record, err = msg
-                    self.__status_var.set(f"Save metrics failed for ...{str(record.get_state().get_uuid())[-8:]}")
+                    self.__status_var.set(f"Save metrics failed for ...{str(_record_run_uuid(record))[-8:]}")
                     messagebox.showerror("Save Metrics Failed", err)
 
         except Empty:
