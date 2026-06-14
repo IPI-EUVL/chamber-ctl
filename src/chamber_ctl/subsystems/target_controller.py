@@ -27,7 +27,7 @@ from ipi_ecs.subsystems.experiment_client import ExperimentClient, RunState
 
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.target_motion import TargetMotion, TargetMotionConfig, TargetMotionProfile, MotionSegment, MotionState
-from chamber_ctl.subsystems.ljs_target_motion import LJSerialTargetMotion
+#from chamber_ctl.subsystems.ljs_target_motion import LJSerialTargetMotion
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 
 
@@ -173,8 +173,8 @@ class TargetMotionController:
         self.__config = TargetMotionConfig(max_l_size=300.0)
 
         self.__state = MotionState()
-        self.__motion = LJSerialTargetMotion(self.__config, logger, port="COM3")
-        #self.__motion = MockTargetMotion(self.__config)
+        #self.__motion = LJSerialTargetMotion(self.__config, logger, port="COM3")
+        self.__motion = MockTargetMotion(self.__config)
         self.__start_l = 0.0
         self.__start_r = 0.0
         self.__offset_l = 0.0
