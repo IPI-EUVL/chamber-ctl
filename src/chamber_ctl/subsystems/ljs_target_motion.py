@@ -40,6 +40,7 @@ class LJSerialTargetMotion(TargetMotion):
 
 
         self.__set_r = 0.0
+        self.__r_offset = 0.0
         self.__rot_connection = None
         self.__rot_process = None
 
@@ -69,6 +70,14 @@ class LJSerialTargetMotion(TargetMotion):
         self.__init_lin()
 
         self.__daemon.start()
+
+    def set_raw_position(self, l_pos: float, r_pos: float):
+        if l_pos != self.__current_l:
+            raise ValueError("Cannot set raw position for L axis, it is controlled by the LIN actuator and cannot be directly set.")
+
+        self.__r_offset = r_pos - self.__current_r
+
+        return True
 
     def handle_exception(self, e: Exception):
         self.__log("Caught exception on daemon thread!", level="ERROR")
@@ -119,10 +128,10 @@ class LJSerialTargetMotion(TargetMotion):
 
     def __update_r(self):
         pos, = self.__rot_connection.recv()
-        self.__current_r = pos
+        self.__current_r = pos + self.__r_offset
 
         #print("Sending to LabJack subprocess:", (self.__target_r, self.__r_speed, self.__jog_r, self.__set_r))
-        self.__rot_connection.send((self.__target_r, self.__r_speed, self.__jog_r, self.__set_r))
+        self.__rot_connection.send((self.__target_r - self.__r_offset, self.__r_speed, self.__jog_r, self.__set_r))
 
         if self.__set_r is not None:
             self.__set_r = None
