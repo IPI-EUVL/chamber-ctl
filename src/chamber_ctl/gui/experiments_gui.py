@@ -656,6 +656,21 @@ class DetailFrame(ttk.LabelFrame):
                 row=i, column=0, sticky=tk.W, padx=2, pady=1)
             ttk.Label(frame, text=str(v)).grid(row=i, column=1, sticky=tk.W, padx=2, pady=1)
 
+    @staticmethod
+    def __populate_read_error_frame(frame: ttk.Frame, err: Exception, on_retry):
+        DetailFrame.__clear_frame(frame)
+        msg = (
+            "Failed to read deferred experiment data. It may still be downloading "
+            "or may be stored in an older format."
+        )
+        ttk.Label(frame, text=msg, foreground="orange red", wraplength=420, justify=tk.LEFT).grid(
+            row=0, column=0, columnspan=2, sticky=tk.W, padx=2, pady=(0, 4)
+        )
+        ttk.Label(frame, text=f"{type(err).__name__}: {err}", wraplength=420, justify=tk.LEFT).grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, padx=2, pady=(0, 4)
+        )
+        ttk.Button(frame, text="Retry", command=on_retry).grid(row=2, column=0, sticky=tk.W, padx=2, pady=(2, 0))
+
     def load_record(self, record: RunRecord):
         self.__record = record
 
@@ -682,26 +697,36 @@ class DetailFrame(ttk.LabelFrame):
         self.__name_var.set(record.get_name() or "")
         self.__desc_var.set(record.get_description() or "")
 
-        state = record.get_state()
-        config = state.get_settings().get_dict() if state else {}
-        self.__populate_kv_frame(self.__settings_lf, config)
-
         self.__tags_tree.delete(*self.__tags_tree.get_children())
         tags = record.get_tags() or {}
         for k, v in tags.items():
             self.__tags_tree.insert("", tk.END, values=(str(k), str(v)))
 
-        meta = record.get_metadata() or {}
-        end_meta = record.get_end_metadata()
-        meta_items = {"Created": _fmt_timestamp(meta.get("created_at"))}
-        if end_meta:
-            meta_items["Status"] = end_meta.get("status", "?")
-            meta_items["Ended"] = _fmt_timestamp(end_meta.get("end_time"))
-            meta_items["Reason"] = end_meta.get("end_reason", "")
-        else:
-            meta_items["Status"] = "Active"
-        meta_items["Version"] = meta.get("version", "?")
-        self.__populate_kv_frame(self.__meta_lf, meta_items)
+        def _retry(record=record):
+            if self.__record is record:
+                self.load_record(record)
+
+        try:
+            state = record.get_state()
+            config = state.get_settings().get_dict() if state else {}
+            self.__populate_kv_frame(self.__settings_lf, config)
+        except Exception as e:
+            self.__populate_read_error_frame(self.__settings_lf, e, _retry)
+
+        try:
+            meta = record.get_metadata() or {}
+            end_meta = record.get_end_metadata()
+            meta_items = {"Created": _fmt_timestamp(meta.get("created_at"))}
+            if end_meta:
+                meta_items["Status"] = end_meta.get("status", "?")
+                meta_items["Ended"] = _fmt_timestamp(end_meta.get("end_time"))
+                meta_items["Reason"] = end_meta.get("end_reason", "")
+            else:
+                meta_items["Status"] = "Active"
+            meta_items["Version"] = meta.get("version", "?")
+            self.__populate_kv_frame(self.__meta_lf, meta_items)
+        except Exception as e:
+            self.__populate_read_error_frame(self.__meta_lf, e, _retry)
 
     def set_metrics_values(self, data: dict):
         exposed = data.get("exposed_area_thickness_nm", [])
