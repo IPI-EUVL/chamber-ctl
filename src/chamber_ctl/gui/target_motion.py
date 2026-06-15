@@ -57,6 +57,10 @@ class TargetControlGUI:
         self.__cmd_queue = queue.Queue()
 
         self.__itf = itf
+        self.__profile = None
+        self.__config = None
+        self.__profile_refresh_pending = False
+        self.__profile_refresh_interval_ms = 2000
 
         self.__initialize_component()
         self.handle_window()
@@ -65,6 +69,7 @@ class TargetControlGUI:
         self.__worker.start()
 
         self.root.after(100, self.__ui_tick)
+        self.root.after(100, self.__profile_refresh_tick)
         self.root.after(200, self.__refresh_view)
 
     def __initialize_component(self):
@@ -215,7 +220,13 @@ class TargetControlGUI:
                         self.__ui_queue.put(("result", "Jog stopped."))
                     else:
                         self.__ui_queue.put(("result", "Failed to stop jog."))
+                elif cmd == "refresh_profile":
+                    ok, msg = self.__itf.refresh_profile(timeout=5.0)
+                    self.__ui_queue.put(("profile", (ok, msg, self.__itf.get_cached_profile(), self.__itf.get_cached_config())))
             except Exception as exc:
+                if cmd == "refresh_profile":
+                    self.__ui_queue.put(("profile", (False, str(exc), self.__itf.get_cached_profile(), self.__itf.get_cached_config())))
+                    continue
                 self.__ui_queue.put(("result", f"Action failed: {exc}"))
 
     def __run_event(self, label: str, awaiter, timeout: float):
@@ -241,9 +252,22 @@ class TargetControlGUI:
             msg, payload = self.__ui_queue.get()
             if msg == "result":
                 self.__result_label.config(text=f"Last action: {payload}")
+            elif msg == "profile":
+                _, _, profile, config = payload
+                self.__profile_refresh_pending = False
+                self.__profile = profile
+                self.__config = config
 
         if self.__run:
             self.root.after(100, self.__ui_tick)
+
+    def __profile_refresh_tick(self):
+        if not self.__profile_refresh_pending:
+            self.__profile_refresh_pending = True
+            self.__cmd_queue.put(("refresh_profile", None))
+
+        if self.__run:
+            self.root.after(self.__profile_refresh_interval_ms, self.__profile_refresh_tick)
 
     def __refresh_view(self):
         connected = self.__itf.is_connected()
@@ -275,7 +299,7 @@ class TargetControlGUI:
             offset_pos = state.offset_position if hasattr(state, "offset_position") else (0.0, 0.0)
             self.__offset_label.config(text=f"Offset: L={offset_pos[0]:.3f} R={offset_pos[1]:.3f}")
 
-        self.__draw_stage()
+        self.__draw_stage(state)
 
         if self.__run:
             self.root.after(200, self.__refresh_view)
@@ -354,7 +378,7 @@ class TargetControlGUI:
 
         self.canvas.create_line(start_x, start_y, end_x, end_y, fill=color, width=2)
 
-    def __draw_stage(self):
+    def __draw_stage(self, state=None):
         self.canvas.delete("all")
                 
         self.vis_scale_l = 10.0
@@ -363,8 +387,7 @@ class TargetControlGUI:
         self.center_x = self.canvas.winfo_width() / 2 - (LIN_LENGTH * self.vis_scale_l) / 2
         self.center_y = self.canvas.winfo_height() / 2 + (6.28 * self.vis_scale_r) / 2
 
-        profile = self.__itf.get_profile()
-        state = self.__itf.get_state()
+        profile = self.__profile
 
         if profile is None:
             self.canvas.update_idletasks()

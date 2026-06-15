@@ -1,6 +1,8 @@
 import argparse
+import pickle
 import sys
 import time
+import threading
 import uuid
 from typing import Iterable
 
@@ -39,6 +41,10 @@ class TargetClient:
 
         self.__current_state = None
         self.__motion_state = None
+
+        self.__profile_lock = threading.Lock()
+        self.__profile = None
+        self.__config = None
 
         self.__status_kv = None
         self.__profile_kv = None
@@ -111,41 +117,70 @@ class TargetClient:
     def get_motion_state(self) -> MotionState:
         return self.__motion_state
 
+    def __update_profile_cache(self, value: bytes) -> tuple[bool, str]:
+        try:
+            b_profile_data, b_config_data = segment_bytes.decode(value)
+
+            profile = TargetMotionProfile.decode(b_profile_data) if b_profile_data is not None else None
+            config = TargetMotionConfig.decode(b_config_data) if b_config_data is not None else None
+        except (TypeError, ValueError, IndexError, pickle.PickleError, EOFError) as exc:
+            return False, f"Failed to decode profile: {exc}"
+
+        with self.__profile_lock:
+            self.__profile = profile
+            self.__config = config
+
+        return profile is not None, "No profile set." if profile is None else "Profile refreshed."
+
+    def refresh_profile(self, timeout: float = 5.0) -> tuple[bool, str]:
+        if self.__profile_kv is None:
+            return False, "Profile control is unavailable."
+
+        awaiter = self.__profile_kv.try_get()
+        if awaiter is None:
+            return False, "Profile request could not be sent."
+
+        try:
+            value, _, reason = wait_for(awaiter, timeout)
+        except TimeoutError:
+            return False, "Timed out while reading profile."
+
+        if value is None:
+            return False, str(reason or "No profile returned.")
+
+        return self.__update_profile_cache(value)
+
+    def get_cached_profile(self) -> TargetMotionProfile:
+        with self.__profile_lock:
+            return self.__profile
+
+    def get_cached_config(self) -> TargetMotionConfig:
+        with self.__profile_lock:
+            return self.__config
+
     def get_profile(self) -> TargetMotionProfile:
-        if self.__profile_kv is not None:
-            if self.__profile_kv.value is None:
-                return None
-
-            try:
-                b_profile_data, b_config_data = segment_bytes.decode(self.__profile_kv.value)
-
-                if b_profile_data is not None:
-                    return TargetMotionProfile.decode(b_profile_data)
-            except (TypeError, ValueError, IndexError):
-                return None
-            
-        return None
+        self.refresh_profile()
+        return self.get_cached_profile()
     
     def get_config(self) -> TargetMotionConfig:
-        if self.__profile_kv is not None:
-            if self.__profile_kv.value is None:
-                return None
-
-            try:
-                b_profile_data, b_config_data = segment_bytes.decode(self.__profile_kv.value)
-
-                if b_config_data is not None:
-                    return TargetMotionConfig.decode(b_config_data)
-            except (TypeError, ValueError, IndexError):
-                return None
-            
-        return None
+        self.refresh_profile()
+        return self.get_cached_config()
     
     def set_profile(self, profile: TargetMotionProfile, config: TargetMotionConfig) -> mt_events.Awaiter:
         if self.__profile_kv is not None:
-            return self.__profile_kv.try_set(segment_bytes.encode([profile.encode(), config.encode()]))
+            awaiter = self.__profile_kv.try_set(segment_bytes.encode([profile.encode(), config.encode()]))
+
+            if awaiter is not None:
+                awaiter.then(lambda _: self.__set_profile_cache(profile, config))
+
+            return awaiter
         
         return None
+
+    def __set_profile_cache(self, profile: TargetMotionProfile, config: TargetMotionConfig):
+        with self.__profile_lock:
+            self.__profile = profile
+            self.__config = config
     
     def start_motion(self):
         if self.__start_event_sender is not None:
