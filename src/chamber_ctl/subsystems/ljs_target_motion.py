@@ -10,7 +10,11 @@ import mt_events
 import serial
 
 from threading import Lock
-from labjack import ljm
+try:
+    from labjack import ljm
+except ImportError:
+    print("LabJack LJM library not found, LabJack functionality will be unavailable.")
+    ljm = None
 
 from ipi_ecs.core import daemon
 from ipi_ecs.core import tcp
