@@ -465,15 +465,15 @@ class ExposureControllerGUI():
         operator = str(settings.get("operator", "")).strip() or "-"
         sample = str(int(settings.get("sample", 0)) + 1).strip() or "-"
 
-        target_label = "time"
+        target_label = "sec"
         target_value = settings.get("target_time", 0)
         try:
             if float(settings.get("target_dose", 0)) > 0:
-                target_label = "dose"
+                target_label = "mj/cm²"
                 target_value = settings.get("target_dose", 0)
         except (TypeError, ValueError):
             if str(settings.get("target_dose", "")).strip() not in ("", "0", "0.0"):
-                target_label = "dose"
+                target_label = "mj/cm²"
                 target_value = settings.get("target_dose", "")
 
         return f"{index + 1:02d}. {name} | {target_label}={target_value} | op={operator} | sample={sample}"
