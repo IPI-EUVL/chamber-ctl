@@ -1484,9 +1484,9 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         return self.__daemon.is_ok() and self.osc.ok()
 
 
-def main(stop_event):
-    osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
-    #osc = DummyOscilloscope()
+def main(stop_event: "multiprocessing.Event"):
+    #osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
+    osc = DummyOscilloscope()
     subsystem = OscilloscopeSubsystem(osc)
     print("Oscilloscope subsystem initializing...")
     #proc = RealtimeDoseCalc(osc)

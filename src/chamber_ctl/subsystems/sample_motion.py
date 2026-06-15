@@ -707,8 +707,9 @@ class SampleMotionSubsystem(ExperimentClient):
 
         #use_mock = os.environ.get("SAMPLE_MOTION_USE_MOCK", "0").strip().lower() in ("1", "true", "yes")
         #if use_mock:
-        self.__stage: StageProvider = PiStageController(StepperClient(PORT, PI_ADDR))
-        self.__log("Initialized sample motion with mock stage backend.")
+        #self.__stage: StageProvider = PiStageController(StepperClient(PORT, PI_ADDR))
+        #self.__log("Initialized sample motion with mock stage backend.")
+        self.__stage: StageProvider = MockStageController()
         #else:
         #    self.__stage = PiStageController(StepperClient(PORT, PI_ADDR))
         #    self.__log("Initialized sample motion with PI stage backend.")
