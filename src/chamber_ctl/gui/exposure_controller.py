@@ -158,7 +158,7 @@ class ExposureControllerGUI():
             if target_type == "time":
                 self.__target_type_label.config(text="seconds")
             else:
-                self.__target_type_label.config(text="dose")
+                self.__target_type_label.config(text="mj/cm2")
 
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):
         self.__position_kv = handle.add_remote_kv(
