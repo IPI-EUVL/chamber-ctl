@@ -235,9 +235,9 @@ class TargetMotionController:
             
     def run_profile(self):
         t_l, t_r, v_l, v_r = self.__state.get_current_motion_command()
-        print(f"Running profile command: target=({t_l:.3f}, {t_r:.3f}) velocity=({v_l:.3f}, {v_r:.3f})")
-        print(f"Current position: {self.__motion.get_position()[0] - self.__start_l}, {self.__motion.get_position()[1] - self.__start_r}")
-        print(f"Current time: {self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment():.3f}s until end of segment")
+        #print(f"Running profile command: target=({t_l:.3f}, {t_r:.3f}) velocity=({v_l:.3f}, {v_r:.3f})")
+        #print(f"Current position: {self.__motion.get_position()[0] - self.__start_l}, {self.__motion.get_position()[1] - self.__start_r}")
+        #print(f"Current time: {self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment():.3f}s until end of segment")
         
         eff_start_l, eff_start_r = self.__effective_start()
         self.__motion.move_to_position(t_l + eff_start_l, t_r + eff_start_r, v_l, v_r)
@@ -250,7 +250,7 @@ class TargetMotionController:
         l_pos, r_pos = self.__motion.get_position()
         self.__state.update_position(l_pos - eff_start_l, r_pos - eff_start_r)
 
-        print(f"Motion Profile @ time={self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment()} pos=({l_pos - eff_start_l:.3f}, {r_pos - eff_start_r:.3f})")
+        #print(f"Motion Profile @ time={self.__state.get_current_time():.3f}s / {self.__state.get_time_until_end_of_segment()} pos=({l_pos - eff_start_l:.3f}, {r_pos - eff_start_r:.3f})")
 
         if self.__state.get_current_repetition() > self.__state.get_max_repetitions():
             self.__is_running = False

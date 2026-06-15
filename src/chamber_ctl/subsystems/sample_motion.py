@@ -54,7 +54,7 @@ def move_r_to_x_y(radius, x, y):
     if y == 0:
         return (0, radius)
     
-    print(f"move_r_to_x_y: radius={radius}, x={x}, y={y}")
+    #print(f"move_r_to_x_y: radius={radius}, x={x}, y={y}")
     
     #print(y / radius)
     angle = math.asin(y / radius)
@@ -238,7 +238,7 @@ class StepperClient:
         return self.__enabled
     
 def calc_target_pose_for_sample_index(sample_index: int, offset = [0, 0], samples = None):
-    print(f"Calculating target pose for sample index {sample_index} with offset {offset}")
+    #print(f"Calculating target pose for sample index {sample_index} with offset {offset}")
     sample = samples[sample_index]
     th, z = move_r_to_x_y(
         sample['radius'],
