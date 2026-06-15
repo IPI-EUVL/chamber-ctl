@@ -6,6 +6,7 @@ import uuid
 from queue import Empty, Queue
 import time
 
+from chamber_ctl import ECS_IP
 from chamber_ctl.gui.experiments_gui import ExperimentsGUI
 from chamber_ctl.gui.exposure_controller import ExposureControllerGUI
 from chamber_ctl.gui.laser_sync import LaserSyncTestGUI
@@ -37,7 +38,7 @@ def _known_subsystems_from_uuids() -> list[tuple[str, uuid.UUID]]:
 
 
 class SubsystemStatusMonitor:
-	def __init__(self, known_subsystems: list[tuple[str, uuid.UUID]], dds_ip: str = "127.0.0.1"):
+	def __init__(self, known_subsystems: list[tuple[str, uuid.UUID]], dds_ip: str = ECS_IP):
 		self.__known_subsystems = known_subsystems
 		self.__dds_ip = dds_ip
 
@@ -709,7 +710,7 @@ class CentralGUI:
 		tab = ttk.Frame(self.__notebook)
 		self.__notebook.add(tab, text="Lifecycle")
 		try:
-			comp = LifecycleGUI(tab, DEFAULT_LIFECYCLE_UUID, own_window=False)
+			comp = LifecycleGUI(tab, DEFAULT_LIFECYCLE_UUID, own_window=False, dds_ip=ECS_IP)
 			self.__register_component("Lifecycle", comp, "on_close")
 		except Exception as exc:
 			self.__add_error_content(tab, "Lifecycle", exc)
