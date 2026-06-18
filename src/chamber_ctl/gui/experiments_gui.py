@@ -291,6 +291,7 @@ class ResultsFrame(ttk.LabelFrame):
         "effective_dose_rate",
         "avg_exposed_thickness",
         "avg_blank_thickness",
+        "percent_development",
         "status",
     )
 
@@ -331,6 +332,7 @@ class ResultsFrame(ttk.LabelFrame):
         self.__tree.heading("effective_dose_rate", text="Eff. Dose Rate")
         self.__tree.heading("avg_exposed_thickness", text="Avg Exposed (nm)")
         self.__tree.heading("avg_blank_thickness", text="Avg Blank (nm)")
+        self.__tree.heading("percent_development", text="% Development")
         self.__tree.heading("status", text="Status")
 
         self.__tree.column("name", width=140, minwidth=70)
@@ -344,6 +346,7 @@ class ResultsFrame(ttk.LabelFrame):
         self.__tree.column("effective_dose_rate", width=130, minwidth=90)
         self.__tree.column("avg_exposed_thickness", width=130, minwidth=90)
         self.__tree.column("avg_blank_thickness", width=130, minwidth=90)
+        self.__tree.column("percent_development", width=120, minwidth=90)
         self.__tree.column("status", width=80, minwidth=60)
 
         self.__tree.grid(row=0, column=0, sticky=tk.NSEW)
@@ -409,6 +412,7 @@ class ResultsFrame(ttk.LabelFrame):
             ResultsFrame.__effective_dose_rate_display_from_tags(tags),
             ResultsFrame.__format_numeric_tag(tags.get("avg_exposed_area_thickness_nm")),
             ResultsFrame.__format_numeric_tag(tags.get("avg_blank_area_thickness_nm")),
+            ResultsFrame.__percent_development_display_from_tags(tags),
             status,
         )
 
@@ -505,6 +509,20 @@ class ResultsFrame(ttk.LabelFrame):
     def __avg_blank_thickness_display(record: RunRecord) -> str:
         tags = record.get_tags() or {}
         return ResultsFrame.__format_numeric_tag(tags.get("avg_blank_area_thickness_nm"))
+
+    @staticmethod
+    def __percent_development_display_from_tags(tags: dict) -> str:
+        exposed = tags.get("avg_exposed_area_thickness_nm")
+        blank = tags.get("avg_blank_area_thickness_nm")
+        if exposed is None or blank is None:
+            return "None"
+        try:
+            blank_f = float(blank)
+            if blank_f == 0.0:
+                return "None"
+            return f"{(1.0 - (float(exposed) / blank_f)) * 100.0:.6g}%"
+        except (TypeError, ValueError):
+            return "None"
 
     @staticmethod
     def __format_numeric_tag(value) -> str:
