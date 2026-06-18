@@ -587,12 +587,12 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__stop_setup_pending = False
             return
 
-        ok, status = self.__provider_set(handle, "Turning chopper off", self.__sync.set_chopper_on, False)
-        if not ok:
-            handle.fail(b"Stop failed: " + status)
-            self.__stop_handle = None
-            self.__stop_setup_pending = False
-            return
+        #ok, status = self.__provider_set(handle, "Turning chopper off", self.__sync.set_chopper_on, False)
+        #if not ok:
+        #    handle.fail(b"Stop failed: " + status)
+        #    self.__stop_handle = None
+        #    self.__stop_setup_pending = False
+        #    return
 
         ok, status = self.__reset_to_initial_phase(handle)
         if not ok:
