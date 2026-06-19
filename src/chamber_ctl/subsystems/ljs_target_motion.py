@@ -80,7 +80,7 @@ class LJSerialTargetMotion(TargetMotion):
         if l_pos != self.__current_l:
             raise ValueError("Cannot set raw position for L axis, it is controlled by the LIN actuator and cannot be directly set.")
 
-        self.__r_offset = r_pos - self.__current_r
+        self.__r_offset = r_pos - (self.__current_r - self.__r_offset)
 
         return True
 

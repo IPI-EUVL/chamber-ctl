@@ -358,6 +358,23 @@ class TargetMotionController:
             return False # Can't modify while running
         
         self.__state.resume_from(time_pos)
+        return True
+
+    def reset_motion(self):
+        if not self.can_modify():
+            return False
+
+        if not self.set_time_position(0.0):
+            return False
+
+        l_pos, _ = self.__motion.get_position()
+        if not self.__motion.set_raw_position(l_pos, 0.0):
+            return False
+
+        if not self.clear_offset_position():
+            return False
+
+        return True
 
     def continue_move(self):
         if not self.can_modify():
@@ -996,6 +1013,24 @@ class TargetController(ExperimentClient):
 
         handle.ret(OP_OK + b": position set.")
 
+    def __on_reset_motion_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
+        print("Reset motion event called by:", s_uuid, param)
+
+        if not self.__motion_controller.can_modify():
+            handle.fail(b"Cannot reset motion while motion is running or not ready.")
+            return
+
+        ok = self.__motion_controller.reset_motion()
+        if not ok:
+            handle.fail(b"Failed to reset motion state.")
+            return
+
+        self.__request_profile_save()
+
+        self.__logger.log("Reset target motion state to start time with rot raw position at zero.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="reset_motion")
+
+        handle.ret(OP_OK + b": motion reset.")
+
     def __on_home_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
         print("Home event called by:", s_uuid, param)
 
@@ -1018,6 +1053,7 @@ class TargetController(ExperimentClient):
         handle.add_event_handler(b"set_target_offset_here").on_called(self.__on_set_offset_here_event)
         handle.add_event_handler(b"clear_target_offset").on_called(self.__on_clear_offset_event)
         handle.add_event_handler(b"home_target").on_called(self.__on_home_event)
+        handle.add_event_handler(b"reset_target_motion").on_called(self.__on_reset_motion_event)
         handle.add_event_handler(b"set_target_position").on_called(self.__on_reset_move_event).set_types(types.FloatTypeSpecifier(), types.ByteTypeSpecifier())
 
         self.__jog_value= handle.get_kv_property(b"jog", True, False, False)
