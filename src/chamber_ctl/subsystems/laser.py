@@ -12,6 +12,7 @@ from ipi_ecs.core import daemon
 from ipi_ecs.dds.magics import OP_OK
 import ipi_ecs.dds.client as client
 import ipi_ecs.dds.magics as magics
+from ipi_ecs.dds.subsystem import StatusItem
 import ipi_ecs.dds.types as types
 import ipi_ecs.core.tcp as tcp
 import ipi_ecs.db.db_library as db_library
@@ -237,6 +238,7 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__laser_warmup_time = 5.0
         self.__chopper_startup_time = 5.0
         self.__status_publisher = None
+        self.__status_item_cache = dict()
 
         self.__setter_queue = queue.Queue()
 
@@ -466,6 +468,72 @@ class LaserSyncSubsystem(ExperimentClient):
 
         return bool(ok), b_status
 
+    def __put_status_item_if_changed(self, code: int, severity: int, message: str):
+        if self.__subsystem is None:
+            return
+
+        status = (severity, message)
+        if self.__status_item_cache.get(code) == status:
+            return
+
+        self.__subsystem.put_status_item(StatusItem(severity, code, message))
+        self.__status_item_cache[code] = status
+
+    def __clear_status_item_if_exists(self, code: int):
+        if self.__subsystem is None:
+            return
+
+        if self.__subsystem.get_status_item_exists(code):
+            self.__subsystem.clear_status_item(code)
+
+        self.__status_item_cache.pop(code, None)
+
+    def __record_chopper_on_result(self, ok: bool, status: bytes | str | None):
+        if ok:
+            self.__clear_status_item_if_exists(200)
+            return
+
+        msg = self.__to_bytes(status).decode("utf-8", errors="replace")
+        self.__put_status_item_if_changed(200, StatusItem.STATE_ALARM, f"Chopper failed to turn on: {msg}")
+
+    def __update_status_items(self):
+        laser_on = self.__sync.get_laser_on()
+        chopper_on = self.__sync.get_chopper_on()
+        laser_warming = self.__sync.get_laser_warming_up()
+        chopper_starting = self.__sync.get_chopper_starting_up()
+
+        if laser_warming:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Warming up")
+        elif chopper_starting:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Starting")
+        elif laser_on and chopper_on and not self.__phase_at(self.__sync.get_target_phase()):
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Moving phase")
+        elif laser_on and chopper_on:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Ready")
+        elif laser_on or chopper_on:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Starting")
+        else:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Idle")
+
+        if chopper_on:
+            self.__put_status_item_if_changed(1, StatusItem.STATE_INFO, "Chopper on")
+        else:
+            self.__clear_status_item_if_exists(1)
+
+        if laser_on:
+            self.__put_status_item_if_changed(2, StatusItem.STATE_INFO, "Laser on")
+        else:
+            self.__clear_status_item_if_exists(2)
+
+        if laser_warming and chopper_starting:
+            self.__put_status_item_if_changed(3, StatusItem.STATE_INFO, "Laser warming, chopper starting")
+        elif laser_warming:
+            self.__put_status_item_if_changed(3, StatusItem.STATE_INFO, "Laser warming")
+        elif chopper_starting:
+            self.__put_status_item_if_changed(3, StatusItem.STATE_INFO, "Chopper starting")
+        else:
+            self.__clear_status_item_if_exists(3)
+
     def __reset_to_initial_phase(self, handle=None):
         ok, status = self.__provider_set(handle, "Setting initial target phase", self.__sync.set_target_phase, self.__initial_phase)
         if not ok:
@@ -540,6 +608,7 @@ class LaserSyncSubsystem(ExperimentClient):
             return
 
         ok, status = self.__provider_set(handle, "Turning chopper on", self.__sync.set_chopper_on, True)
+        self.__record_chopper_on_result(ok, status)
         if not ok:
             handle.fail(b"Preinit failed: " + status)
             self.__preinit_handle = None
@@ -619,6 +688,7 @@ class LaserSyncSubsystem(ExperimentClient):
             return
 
         ok, status = self.__provider_set(handle, "Turning chopper on", self.__sync.set_chopper_on, True)
+        self.__record_chopper_on_result(ok, status)
         if not ok:
             self.__test_active = False
             handle.fail(status)
@@ -667,12 +737,12 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__test_stop_setup_pending = False
             return
 
-        ok, status = self.__provider_set(handle, "Turning chopper off", self.__sync.set_chopper_on, False)
-        if not ok:
-            handle.fail(status)
-            self.__test_stop_handle = None
-            self.__test_stop_setup_pending = False
-            return
+        #ok, status = self.__provider_set(handle, "Turning chopper off", self.__sync.set_chopper_on, False)
+        #if not ok:
+        #    handle.fail(status)
+        #    self.__test_stop_handle = None
+        #    self.__test_stop_setup_pending = False
+        #    return
 
         ok, status = self.__reset_to_initial_phase(handle)
         if not ok:
@@ -725,6 +795,7 @@ class LaserSyncSubsystem(ExperimentClient):
 
         ok, status = self.__provider_set(handle, "Turning chopper on", self.__sync.set_chopper_on, True)
         self.__test_chopper_on_handle = None
+        self.__record_chopper_on_result(ok, status)
         if not ok:
             handle.fail(status)
             return
@@ -843,8 +914,8 @@ class LaserSyncSubsystem(ExperimentClient):
                 self.__start_handle = None
 
             if self.__stop_handle is not None:
-                if not self.__stop_setup_pending and not self.__sync.get_laser_on() and not self.__sync.get_chopper_on():
-                    self._on_did_stop(b"Laser and chopper disabled.")
+                if not self.__stop_setup_pending and not self.__sync.get_laser_on():
+                    self._on_did_stop(b"Laser disabled.")
                     self.__stop_handle = None
                     self.__experiment_active = False
 
@@ -857,7 +928,7 @@ class LaserSyncSubsystem(ExperimentClient):
                 self.__test_init_handle = None
 
             if self.__test_stop_handle is not None:
-                if not self.__test_stop_setup_pending and not self.__sync.get_laser_on() and not self.__sync.get_chopper_on():
+                if not self.__test_stop_setup_pending and not self.__sync.get_laser_on():
                     self.__test_stop_handle.ret(OP_OK + b": test stop complete.")
                     self.__test_stop_handle = None
                     self.__test_active = False
@@ -865,6 +936,7 @@ class LaserSyncSubsystem(ExperimentClient):
             if self.__status_publisher is not None and (time.monotonic() - last_status_publish) > 0.1:
                 last_status_publish = time.monotonic()
                 self.__status_publisher.value = self.__get_status().encode()
+                self.__update_status_items()
 
     def __get_status(self) -> LaserSyncStatus:
         return LaserSyncStatus(
@@ -960,14 +1032,6 @@ class LaserSyncSubsystem(ExperimentClient):
         )
 
     def __on_test_preinit(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
-        if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
-            handle.fail(b"Cannot start laser test preinit while experiment control is active.")
-            return
-
-        if self.__test_in_progress():
-            handle.fail(b"Laser test sequence already in progress.")
-            return
-
         self.__test_active = True
         self.__test_preinit_handle = handle
         self.__test_preinit_setup_pending = True
@@ -975,14 +1039,6 @@ class LaserSyncSubsystem(ExperimentClient):
         handle.feedback(magics.OP_IN_PROGRESS + b": test preinit started.")
 
     def __on_test_init(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
-        if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
-            handle.fail(b"Cannot start laser test init while experiment control is active.")
-            return
-
-        if self.__test_in_progress():
-            handle.fail(b"Laser test sequence already in progress.")
-            return
-
         self.__test_active = True
         self.__test_init_handle = handle
         self.__test_init_setup_pending = True
@@ -990,80 +1046,32 @@ class LaserSyncSubsystem(ExperimentClient):
         handle.feedback(magics.OP_IN_PROGRESS + b": test init started.")
 
     def __on_test_stop(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
-        if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
-            handle.fail(b"Cannot stop laser test while experiment control is active.")
-            return
-
-        if self.__test_in_progress():
-            handle.fail(b"Laser test sequence already in progress.")
-            return
-
         self.__test_stop_handle = handle
         self.__test_stop_setup_pending = True
         self.__enqueue_setter_job("test_stop")
         handle.feedback(magics.OP_IN_PROGRESS + b": test stop started.")
 
     def __on_test_laser_on(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
-        if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
-            handle.fail(b"Cannot manually turn laser on while experiment control is active.")
-            return
-
-        if self.__test_in_progress():
-            handle.fail(b"Laser test control already in progress.")
-            return
-
         self.__test_laser_on_handle = handle
         self.__enqueue_setter_job("test_laser_on")
         handle.feedback(magics.OP_IN_PROGRESS + b": manual laser on started.")
 
     def __on_test_laser_off(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
-        if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
-            handle.fail(b"Cannot manually turn laser off while experiment control is active.")
-            return
-
-        if self.__test_in_progress():
-            handle.fail(b"Laser test control already in progress.")
-            return
-
         self.__test_laser_off_handle = handle
         self.__enqueue_setter_job("test_laser_off")
         handle.feedback(magics.OP_IN_PROGRESS + b": manual laser off started.")
 
     def __on_test_chopper_on(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
-        if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
-            handle.fail(b"Cannot manually turn chopper on while experiment control is active.")
-            return
-
-        if self.__test_in_progress():
-            handle.fail(b"Laser test control already in progress.")
-            return
-
         self.__test_chopper_on_handle = handle
         self.__enqueue_setter_job("test_chopper_on")
         handle.feedback(magics.OP_IN_PROGRESS + b": manual chopper on started.")
 
     def __on_test_chopper_off(self, _s_uuid, _param, handle: client._EventHandler._IncomingEventHandle):
-        if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
-            handle.fail(b"Cannot manually turn chopper off while experiment control is active.")
-            return
-
-        if self.__test_in_progress():
-            handle.fail(b"Laser test control already in progress.")
-            return
-
         self.__test_chopper_off_handle = handle
         self.__enqueue_setter_job("test_chopper_off")
         handle.feedback(magics.OP_IN_PROGRESS + b": manual chopper off started.")
 
     def __on_test_set_phase(self, _s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
-        if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
-            handle.fail(b"Cannot manually set phase while experiment control is active.")
-            return
-
-        if self.__test_in_progress():
-            handle.fail(b"Laser test control already in progress.")
-            return
-
         self.__test_set_phase_handle = handle
         try:
             phase = float(pickle.loads(param))

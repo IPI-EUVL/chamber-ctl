@@ -281,6 +281,12 @@ class StageProvider:
     
     def is_at_limit(self):
         return False
+
+    def get_homing_error(self):
+        return None
+    
+    def clear_homing_error(self):
+        pass
     
     def close(self):
         pass
@@ -346,6 +352,7 @@ class PiStageController(StageProvider):
 
         self.__busy = False
         self.__state = STATE_IDLE
+        self.__last_homing_error = None
 
         self.__daemon = daemon.Daemon()
         self.__daemon.add(self.__worker)
@@ -363,7 +370,16 @@ class PiStageController(StageProvider):
 
             if not self.__opqueue.empty():
                 func, args = self.__opqueue.get()
-                func(*args)
+                try:
+                    func(*args)
+                    if func.__name__ in ("__homing_routine", "__rot_homing_routine"):
+                        self.__last_homing_error = None
+                except Exception as exc:
+                    if func.__name__ in ("__homing_routine", "__rot_homing_routine"):
+                        self.__last_homing_error = str(exc)
+                    self.__state = STATE_IDLE
+                    print(f"Sample motion operation failed: {exc}")
+                    continue
                 self.__state = STATE_IDLE
 
             time.sleep(0.1)
@@ -545,6 +561,12 @@ class PiStageController(StageProvider):
     def is_at_limit(self):
         return (-self.__client.get_position(1) * (2.54 / STEPS_PER_ROT)) >= 89.45
     
+    def get_homing_error(self):
+        return self.__last_homing_error
+    
+    def clear_homing_error(self):
+        self.__last_homing_error = None
+    
     def close(self):
         self.__daemon.stop()
         self.__client.close()
@@ -626,6 +648,12 @@ class MockStageController(StageProvider):
     def is_enabled(self):
         return self.__state != STATE_IDLE
     
+    def get_homing_error(self):
+        return None
+    
+    def clear_homing_error(self):
+        pass
+    
     def close(self):
         self.__daemon.stop()
 
@@ -645,6 +673,7 @@ class SampleMotionSubsystem(ExperimentClient):
         self.__sample_kv = None
         self.__enabled_publisher = None
         self.__status_publisher = None
+        self.__status_item_cache = dict()
 
         self.__op_queue = queue.Queue()
 
@@ -734,10 +763,6 @@ class SampleMotionSubsystem(ExperimentClient):
         handle.add_event_handler(b"home_sample").on_called(self.__on_home_event)
         handle.add_event_handler(b"home_rot_sample").on_called(self.__on_home_rot_event)
 
-        handle.put_status_item(StatusItem(StatusItem.STATE_INFO, 0, "Test status item"))
-        handle.put_status_item(StatusItem(StatusItem.STATE_INFO, 1, "Test status item 2"))
-
-
         self._setup_subsystem(handle)
 
         self.__connected = True
@@ -811,6 +836,52 @@ class SampleMotionSubsystem(ExperimentClient):
         if self.__preinit_handle is not None:
             self.__preinit_handle.fail(reason)
             self.__preinit_handle = None
+
+    def __put_status_item_if_changed(self, code: int, severity: int, message: str):
+        if self.__subsystem is None:
+            return
+
+        status = (severity, message)
+        if self.__status_item_cache.get(code) == status:
+            return
+
+        self.__subsystem.put_status_item(StatusItem(severity, code, message))
+        self.__status_item_cache[code] = status
+
+    def __clear_status_item_if_exists(self, code: int):
+        if self.__subsystem is None:
+            return
+
+        if self.__subsystem.get_status_item_exists(code):
+            self.__subsystem.clear_status_item(code)
+
+        self.__status_item_cache.pop(code, None)
+
+    def __update_status_items(self):
+        state = self.__stage.get_state()
+        if state == STATE_HOMING:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Homing")
+        elif state == STATE_MOVING:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Moving")
+        elif state == STATE_OFFLINE:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_WARN, "Offline")
+        else:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Idle")
+
+        current_slot = -1 if state == STATE_OFFLINE else self.__resolve_current_slot()
+        current_sample_msg = f"Current sample: {current_slot}" if current_slot >= 0 else "Current sample: unknown"
+        self.__put_status_item_if_changed(1, StatusItem.STATE_INFO, current_sample_msg)
+
+        if state == STATE_OFFLINE:
+            self.__put_status_item_if_changed(100, StatusItem.STATE_WARN, "Sample stage offline")
+        else:
+            self.__clear_status_item_if_exists(100)
+
+        homing_error = self.__stage.get_homing_error()
+        if homing_error:
+            self.__put_status_item_if_changed(200, StatusItem.STATE_ALARM, f"Homing error: {homing_error}")
+        else:
+            self.__clear_status_item_if_exists(200)
 
     def __resolve_current_slot(self):
         th, z = self.__stage.get_position()
@@ -954,6 +1025,10 @@ class SampleMotionSubsystem(ExperimentClient):
                     if not self.__wait_for_idle(handle=handle, feedback_msg="homing stage"):
                         handle.fail(b"Timed out waiting for home completion.")
                         continue
+                    if self.__stage.get_homing_error():
+                        handle.fail(self.__stage.get_homing_error().encode("utf-8", errors="replace"))
+                        continue
+                    self.__stage.clear_homing_error()
                     self.__target_slot = -1
                     handle.ret(OP_OK + b": home complete.")
 
@@ -962,6 +1037,10 @@ class SampleMotionSubsystem(ExperimentClient):
                     if not self.__wait_for_idle(handle=handle, feedback_msg="homing rotational axis"):
                         handle.fail(b"Timed out waiting for rotational home completion.")
                         continue
+                    if self.__stage.get_homing_error():
+                        handle.fail(self.__stage.get_homing_error().encode("utf-8", errors="replace"))
+                        continue
+                    self.__stage.clear_homing_error()
                     self.__target_slot = -1
                     handle.ret(OP_OK + b": rotational home complete.")
 
@@ -983,6 +1062,10 @@ class SampleMotionSubsystem(ExperimentClient):
                     if not self.__wait_for_idle(handle=handle, feedback_msg="preinit homing rotational axis"):
                         self.__fail_preinit(b"Timed out while homing rotational axis.")
                         continue
+                    if self.__stage.get_homing_error():
+                        self.__fail_preinit(self.__stage.get_homing_error().encode("utf-8", errors="replace"))
+                        continue
+                    self.__stage.clear_homing_error()
 
                     self.__target_slot = slot
                     sample_index = self.__stage.slot_to_sample_index(slot)
@@ -1013,6 +1096,8 @@ class SampleMotionSubsystem(ExperimentClient):
             if self.__position_publisher is not None:
                 th, z = self.__stage.get_position()
                 self.__position_publisher.value = [float(th), float(z)]
+
+            self.__update_status_items()
 
             if self.__start_handle is not None:
                 self._on_did_start(OP_OK + b": sample motion start complete.")

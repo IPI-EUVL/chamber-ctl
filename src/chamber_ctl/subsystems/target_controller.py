@@ -529,6 +529,7 @@ class TargetController(ExperimentClient):
         self.__jog_value = None
 
         self.__status_publisher = None
+        self.__status_item_cache = dict()
         self.__last_status_update = time.monotonic()
 
         self.__last_jog_write = 0.0
@@ -861,13 +862,40 @@ class TargetController(ExperimentClient):
     def __update_status_items(self):
         if self.__subsystem is None:
             return
+
+        if self.__motion_controller.is_homing():
+            self.__put_status_item_if_changed(0, subsystem.StatusItem.STATE_INFO, "Homing")
+        elif self.__motion_controller.is_moving_to_start() or self.__preinit_handle is not None or self.__start_handle is not None:
+            self.__put_status_item_if_changed(0, subsystem.StatusItem.STATE_INFO, "Starting")
+        elif self.__motion_controller.is_running():
+            self.__put_status_item_if_changed(0, subsystem.StatusItem.STATE_INFO, "Running")
+        else:
+            self.__put_status_item_if_changed(0, subsystem.StatusItem.STATE_INFO, "Idle")
         
         if self.__motion_controller.get_start_position() == (0.0, 0.0):
-            if not self.__subsystem.get_status_item_exists(1):
-                self.__subsystem.put_status_item(subsystem.StatusItem(subsystem.StatusItem.STATE_INFO, 1, "Start position is not defined"))
+            self.__put_status_item_if_changed(1, subsystem.StatusItem.STATE_INFO, "Start position is not defined")
         else:
-            if self.__subsystem.get_status_item_exists(1):
-                self.__subsystem.clear_status_item(1)
+            self.__clear_status_item_if_exists(1)
+
+    def __put_status_item_if_changed(self, code: int, severity: int, message: str):
+        if self.__subsystem is None:
+            return
+
+        status = (severity, message)
+        if self.__status_item_cache.get(code) == status:
+            return
+
+        self.__subsystem.put_status_item(subsystem.StatusItem(severity, code, message))
+        self.__status_item_cache[code] = status
+
+    def __clear_status_item_if_exists(self, code: int):
+        if self.__subsystem is None:
+            return
+
+        if self.__subsystem.get_status_item_exists(code):
+            self.__subsystem.clear_status_item(code)
+
+        self.__status_item_cache.pop(code, None)
 
     def __can_start_motion(self):
         #if self.__motion_controller.get_start_position() == (0.0, 0.0):

@@ -29,6 +29,7 @@ from ipi_ecs.logging.client import LogClient
 
 import ipi_ecs.core.tcp as tcp
 import ipi_ecs.dds.client as client
+from ipi_ecs.dds.subsystem import StatusItem
 import ipi_ecs.dds.types as types
 import ipi_ecs.subsystems.experiment_client as exp_client
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader, RunRecord, RunState
@@ -1118,6 +1119,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__do_run = False
         self.__did_read = True
         self.__subsystem = None
+        self.__status_item_cache = dict()
 
         self.__exp_id = None
 
@@ -1144,6 +1146,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__dose_publisher = None
         self.__time_publisher = None
         self.__timed_exposure_handle = None
+        self.__doing_step_exposure = False
 
         def _on_ready():
             if self.__did_config:
@@ -1189,42 +1192,90 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         if not self.__is_laser_on():
             self.__last_laser_off_time = time.time_ns()
 
+    def __put_status_item_if_changed(self, code: int, severity: int, message: str):
+        if self.__subsystem is None:
+            return
+
+        status = (severity, message)
+        if self.__status_item_cache.get(code) == status:
+            return
+
+        self.__subsystem.put_status_item(StatusItem(severity, code, message))
+        self.__status_item_cache[code] = status
+
+    def __clear_status_item_if_exists(self, code: int):
+        if self.__subsystem is None:
+            return
+
+        if self.__subsystem.get_status_item_exists(code):
+            self.__subsystem.clear_status_item(code)
+
+        self.__status_item_cache.pop(code, None)
+
+    def __update_status_items(self):
+        if self.__doing_step_exposure:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Step exposure")
+        elif self.__do_run:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Running")
+        else:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Idle")
+
+        laser_on = self.__is_laser_on()
+        if self.__do_run and laser_on:
+            self.__put_status_item_if_changed(1, StatusItem.STATE_INFO, "Laser on")
+            self.__clear_status_item_if_exists(100)
+        elif self.__do_run:
+            self.__clear_status_item_if_exists(1)
+            self.__put_status_item_if_changed(100, StatusItem.STATE_WARN, "Laser off")
+        else:
+            self.__clear_status_item_if_exists(1)
+            self.__clear_status_item_if_exists(100)
+
+        if not self.osc.ok():
+            self.__put_status_item_if_changed(101, StatusItem.STATE_WARN, "Oscilloscope not OK")
+        else:
+            self.__clear_status_item_if_exists(101)
+
     def __capt_thread(self, stop_flag: StopFlag):
         while stop_flag.run():
             time.sleep(0.1)
             #print("Checking if step exposure should be triggered...")
             #print(f"Current dose: {self.__current_dose} mJ/cm2, target dose: {self.__target_dose} mJ/cm2, do run: {self.__do_run}")
             if self.__do_run and self.__target_dose is not None and self.__current_dose >= (self.__target_dose - self.__STEP_DOSE_TGT) and self.__current_dose < self.__target_dose:
-                #print(f"Current dose {self.__current_dose} mJ/cm2 is within {self.__STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...")
-                self.__logger.log(f"Current dose {self.__current_dose} mJ/cm2 is within {self.__STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...", level="INFO", l_type="EXP", subsystem="Oscilloscope")
-                self.osc.set_active(False)
+                self.__doing_step_exposure = True
+                try:
+                    #print(f"Current dose {self.__current_dose} mJ/cm2 is within {self.__STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...")
+                    self.__logger.log(f"Current dose {self.__current_dose} mJ/cm2 is within {self.__STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...", level="INFO", l_type="EXP", subsystem="Oscilloscope")
+                    self.osc.set_active(False)
 
-                time.sleep(0.1)
-                while self.osc.is_capturing():
                     time.sleep(0.1)
-                
-                time.sleep(0.1)
-                payload = struct.pack('d', float(2.0))
-                self.__timed_exposure_handle = self.__do_timed_exposure_event.call(payload, [uuids.UUID_LASER_CONTROLLER])
-                self.__did_read = False
-                self.osc.capture_once()
-                time.sleep(0.1)
-
-                while self.__timed_exposure_handle.is_in_progress():
+                    while self.osc.is_capturing():
+                        time.sleep(0.1)
+                    
                     time.sleep(0.1)
-
-                start_t = time.monotonic()
-                while not self.__did_read and (time.monotonic() - start_t) < 10.0:
+                    payload = struct.pack('d', float(2.0))
+                    self.__timed_exposure_handle = self.__do_timed_exposure_event.call(payload, [uuids.UUID_LASER_CONTROLLER])
+                    self.__did_read = False
+                    self.osc.capture_once()
                     time.sleep(0.1)
 
-                if not self.__did_read:
-                    print("Timed exposure completed but no oscilloscope data was read, something may have gone wrong.")
-                    self.__logger.log("Timed exposure completed but no oscilloscope data was read, something may have gone wrong.", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
+                    while self.__timed_exposure_handle.is_in_progress():
+                        time.sleep(0.1)
 
-                print("Step exposure completed.")
-                print(f"Step result: {self.__timed_exposure_handle.get_result(uuids.UUID_LASER_CONTROLLER)}")
+                    start_t = time.monotonic()
+                    while not self.__did_read and (time.monotonic() - start_t) < 10.0:
+                        time.sleep(0.1)
 
-                self.__timed_exposure_handle = None
+                    if not self.__did_read:
+                        print("Timed exposure completed but no oscilloscope data was read, something may have gone wrong.")
+                        self.__logger.log("Timed exposure completed but no oscilloscope data was read, something may have gone wrong.", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
+
+                    print("Step exposure completed.")
+                    print(f"Step result: {self.__timed_exposure_handle.get_result(uuids.UUID_LASER_CONTROLLER)}")
+
+                    self.__timed_exposure_handle = None
+                finally:
+                    self.__doing_step_exposure = False
 
 
     def __thread(self, stop_flag: StopFlag):
@@ -1251,6 +1302,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
             #    self.__stop_exp()
 
             self.__update_laser_status()
+            self.__update_status_items()
 
             if not self.__osc_queue.empty() and not self.__exp_id is None:
                 self.__did_read = True
@@ -1432,7 +1484,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         return self.__daemon.is_ok() and self.osc.ok()
 
 
-def main(stop_event: "multiprocessing.Event"):
+def main(stop_event):
     osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
     #osc = DummyOscilloscope()
     subsystem = OscilloscopeSubsystem(osc)
