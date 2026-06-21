@@ -24,6 +24,7 @@ class WFLaserSyncProvider(LaserSyncProvider):
         self.__current_phase = 0
         self.__initial_phase = 0
 
+        self.__last_chopper_read_time = 0
 
         self.__port = serial.Serial(PORT, 115200, 8, "N", 1)
         self.waveform = pyvisa.ResourceManager().open_resource('USB0::0x0957::0x1507::MY48009073::INSTR')
@@ -61,6 +62,8 @@ class WFLaserSyncProvider(LaserSyncProvider):
             return None
 
     def __set_chopper(self, state):
+        print(f"Setting chopper {'ON' if state else 'OFF'}...")
+
         if self.__send_chopper_cmd(f"enable={1 if state else 0}"):
             self.__chopper_on = state
             return True
@@ -120,9 +123,12 @@ class WFLaserSyncProvider(LaserSyncProvider):
         return self.__current_phase
     
     def get_current_chopper_frequency(self):
+        print("Querying chopper frequency...")
         response = self.__send_and_read_chopper_cmd("refoutfreq?")
         if response is None:
             return None
+        
+        print(f"Received chopper frequency response: '{response}'")
         
         try:
             freq = float(response)
@@ -134,15 +140,15 @@ class WFLaserSyncProvider(LaserSyncProvider):
     def __run_chopper(self):
         for _ in range(5):
             self.__set_chopper(True)
-            time.sleep(5)
-            freq = self.get_current_chopper_frequency()
-            if freq is None:
-                continue
+            for __ in range(5):
+                time.sleep(1)
 
-            if freq == 0:
-                continue
+                if not self.read_chopper_on():
+                    print("Chopper stopped, probably due to overspeed, retrying...")
+                    continue
 
-            return True, 'Chopper enabled and running at {:.2f} Hz.'.format(freq)
+            if self.read_chopper_on():
+                return True, 'Chopper enabled and running at {:.2f} Hz.'.format(self.get_current_chopper_frequency())
         
         self.__set_chopper(False)
         return False, 'Failed to start chopper after multiple attempts.'
@@ -151,17 +157,28 @@ class WFLaserSyncProvider(LaserSyncProvider):
         self.__chopper_on = on
 
         if on:
-            self.__run_chopper()
+            ok, r = self.__run_chopper()
+            self.__chopper_started_time = time.monotonic()
+            return ok, r
         else:
             self.__set_chopper(False)
+            return True, "Chopper disabled."
+    
+    def read_chopper_on(self):
+        fx = self.get_current_chopper_frequency()
 
-        self.__chopper_started_time = time.monotonic() if on else None
+        if fx is not None and fx > 10:
+            self.__chopper_on = True
+        else:
+            self.__chopper_on = False
 
-        if on:
-            return True, "Chopper enabled, startup in progress."
-        return True, "Chopper disabled."
+        return self.__chopper_on
 
     def get_chopper_on(self):
+        if time.monotonic() - self.__last_chopper_read_time > 1:
+            self.__last_chopper_read_time = time.monotonic()
+            self.read_chopper_on()
+
         return self.__chopper_on
 
     def get_chopper_starting_up(self):

@@ -96,7 +96,7 @@ class DummyLaserSyncProvider:
         self.__chopper_on = on
         self.__chopper_started_time = time.monotonic() if on else None
         if on:
-            return True, "Chopper enabled, startup in progress."
+            return True, "Chopper enabled."
         return True, "Chopper disabled."
 
     def get_chopper_on(self):
@@ -257,6 +257,7 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__load_config()
 
         self.__sync: LaserSyncProvider = WFLaserSyncProvider()
+        print(self.__sync)
         ok, status = self.__sync.set_initial_phase(self.__initial_phase)
         if not ok:
             raise RuntimeError(f"Failed to set initial phase during startup: {status}")
@@ -789,6 +790,7 @@ class LaserSyncSubsystem(ExperimentClient):
         handle.ret(OP_OK + b": " + status)
 
     def __execute_test_chopper_on_setters(self):
+        print("Executing test chopper on setters")
         handle = self.__test_chopper_on_handle
         if handle is None:
             return
@@ -804,6 +806,7 @@ class LaserSyncSubsystem(ExperimentClient):
         handle.ret(OP_OK + b": " + status)
 
     def __execute_test_chopper_off_setters(self):
+        print("Executing test chopper off setters")
         handle = self.__test_chopper_off_handle
         if handle is None:
             return
