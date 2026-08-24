@@ -123,12 +123,10 @@ class WFLaserSyncProvider(LaserSyncProvider):
         return self.__current_phase
     
     def get_current_chopper_frequency(self):
-        print("Querying chopper frequency...")
+        #print("Querying chopper frequency...")
         response = self.__send_and_read_chopper_cmd("refoutfreq?")
         if response is None:
             return None
-        
-        print(f"Received chopper frequency response: '{response}'")
         
         try:
             freq = float(response)
