@@ -329,7 +329,7 @@ class ResultsFrame(ttk.LabelFrame):
         self.__tree.heading("uuid", text="UUID")
         self.__tree.heading("dose", text="Dose")
         self.__tree.heading("runtime", text="Runtime")
-        self.__tree.heading("effective_dose_rate", text="Eff. Dose Rate")
+        self.__tree.heading("effective_dose_rate", text="Eff. Dose Rate (per min)")
         self.__tree.heading("avg_exposed_thickness", text="Avg Exposed (nm)")
         self.__tree.heading("avg_blank_thickness", text="Avg Blank (nm)")
         self.__tree.heading("percent_development", text="% Development")
@@ -496,7 +496,7 @@ class ResultsFrame(ttk.LabelFrame):
             runtime_f = float(runtime)
             if runtime_f == 0.0:
                 return "None"
-            return f"{float(dose) / runtime_f:.6g}"
+            return f"{(float(dose) / runtime_f) * 60.0:.6g}"
         except (TypeError, ValueError):
             return "None"
 
