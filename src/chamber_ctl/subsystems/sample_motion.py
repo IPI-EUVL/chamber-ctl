@@ -35,11 +35,11 @@ STATE_OFFLINE = 3
 
 #print(LIN_LENGTH)
 
-EXPOSURE_OFFSET_Z = 107
-EXPOSURE_OFFSET_X = -19
+EXPOSURE_OFFSET_Z = 88
+EXPOSURE_OFFSET_X = -1
 
-HOME_POS = 80.0
-HOME_ANGLE = -0.6
+HOME_POS = 70
+HOME_ANGLE = -53
 
 #SAMPLE_SLOT_ORDER = [11, 4, 10, 3, 0, 5, 9, 2, 1, 6, 8, 7]
 SAMPLE_SLOT_ORDER = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
@@ -282,6 +282,9 @@ class StageProvider:
     def is_at_limit(self):
         return False
 
+    def is_linear_homed(self):
+        return False
+
     def get_homing_error(self):
         return None
     
@@ -353,6 +356,7 @@ class PiStageController(StageProvider):
         self.__busy = False
         self.__state = STATE_IDLE
         self.__last_homing_error = None
+        self.__linear_homed = False
 
         self.__daemon = daemon.Daemon()
         self.__daemon.add(self.__worker)
@@ -435,6 +439,7 @@ class PiStageController(StageProvider):
         self.__client.queue_set(1, 0)
         self.__client.queue_move(1, 0)
         self.__client.wait_ack()
+        self.__linear_homed = True
        
     def __home_rot(self):
         self.__move_blocking(1, -HOME_POS / (2.54 / STEPS_PER_ROT))
@@ -560,6 +565,9 @@ class PiStageController(StageProvider):
     
     def is_at_limit(self):
         return (-self.__client.get_position(1) * (2.54 / STEPS_PER_ROT)) >= 89.45
+
+    def is_linear_homed(self):
+        return self.__linear_homed
     
     def get_homing_error(self):
         return self.__last_homing_error
@@ -647,6 +655,9 @@ class MockStageController(StageProvider):
     
     def is_enabled(self):
         return self.__state != STATE_IDLE
+
+    def is_linear_homed(self):
+        return True
     
     def get_homing_error(self):
         return None
@@ -728,7 +739,7 @@ class SampleMotionSubsystem(ExperimentClient):
             return
 
         self.__did_config = True
-        handle = self.__client.register_subsystem("Sample Motion Controller", uuids.UUID_SAMPLE_MOTION_CONTROLLER)
+        handle = self.__client.register_subsystem("Sample Motion", uuids.UUID_SAMPLE_MOTION_CONTROLLER)
         self.__on_got_subsystem(handle)
 
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):
@@ -787,13 +798,16 @@ class SampleMotionSubsystem(ExperimentClient):
 
         return slot
 
-    def _can_preinit(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
+    def _can_start(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
         slot = self.__parse_selected_slot(settings)
         if slot is None:
             return False, b"Experiment sample must be a valid 0-based slot index."
 
         if self.__stage.get_state() == STATE_OFFLINE:
-            return False, b"Sample motion stage is offline."
+            return False, b"Stage is offline."
+
+        if not self.__stage.is_linear_homed():
+            return False, b"Linear axis is not homed."
 
         self.__exp_selected_slot = slot
         return True, OP_OK
@@ -809,12 +823,12 @@ class SampleMotionSubsystem(ExperimentClient):
 
     def _on_start(self, handle):
         self.__start_handle = handle
-        return True, b": sample motion start acknowledged."
+        return True, b": start acknowledged."
 
     def _on_stop(self, handle):
         self.__stop_handle = handle
         self.__pending_stop = True
-        return True, b": sample motion stop acknowledged."
+        return True, b": stop acknowledged."
 
     def _on_continue_state(self):
         print(f"Continue state check: preinit_handle={self.__preinit_handle}, start_handle={self.__start_handle}, stop_handle={self.__stop_handle}, exp_active={self.__exp_active}, exp_selected_slot={self.__exp_selected_slot}")
@@ -822,7 +836,7 @@ class SampleMotionSubsystem(ExperimentClient):
             return True, self.EXP_IN_PROGRESS
 
         if not self.__exp_active or self.__exp_selected_slot is None:
-            return False, b"Sample motion experiment state is not active."
+            return False, b"Experiment state is not active."
 
         current_slot = self.__resolve_current_slot()
         if current_slot == self.__exp_selected_slot:
@@ -876,6 +890,11 @@ class SampleMotionSubsystem(ExperimentClient):
             self.__put_status_item_if_changed(100, StatusItem.STATE_WARN, "Sample stage offline")
         else:
             self.__clear_status_item_if_exists(100)
+
+        if not self.__stage.is_linear_homed():
+            self.__put_status_item_if_changed(101, StatusItem.STATE_WARN, "Linear axis not homed")
+        else:
+            self.__clear_status_item_if_exists(101)
 
         homing_error = self.__stage.get_homing_error()
         if homing_error:
@@ -965,7 +984,7 @@ class SampleMotionSubsystem(ExperimentClient):
             if handle is not None and (time.monotonic() - last_feedback) > 5.0:
                 remaining = max(0.0, timeout - (time.monotonic() - begin))
                 msg = feedback_msg if feedback_msg else f"waiting for sample slot {slot}"
-                handle.feedback(magics.OP_IN_PROGRESS + f": {msg} ({remaining:.0f}s remaining).".encode("utf-8"))
+                handle.feedback(magics.OP_IN_PROGRESS + f": {msg}".encode("utf-8"))
                 last_feedback = time.monotonic()
 
             time.sleep(0.1)
@@ -982,7 +1001,7 @@ class SampleMotionSubsystem(ExperimentClient):
             if handle is not None and (time.monotonic() - last_feedback) > 5.0:
                 remaining = max(0.0, timeout - (time.monotonic() - begin))
                 msg = feedback_msg if feedback_msg else "waiting for stage idle"
-                handle.feedback(magics.OP_IN_PROGRESS + f": {msg} ({remaining:.0f}s remaining).".encode("utf-8"))
+                handle.feedback(magics.OP_IN_PROGRESS + f": {msg}".encode("utf-8"))
                 last_feedback = time.monotonic()
 
             time.sleep(0.1)
@@ -1079,7 +1098,7 @@ class SampleMotionSubsystem(ExperimentClient):
                     self.__preinit_handle = None
 
             except Exception as exc:
-                self.__log(f"Sample motion operation failed: {exc}", level="ERROR")
+                self.__log(f"Operation failed: {exc}", level="ERROR")
                 if op == "exp_preinit":
                     self.__fail_preinit(str(exc).encode("utf-8", errors="replace"))
                 else:
@@ -1100,17 +1119,17 @@ class SampleMotionSubsystem(ExperimentClient):
             self.__update_status_items()
 
             if self.__start_handle is not None:
-                self._on_did_start(OP_OK + b": sample motion start complete.")
+                self._on_did_start(OP_OK + b": start complete.")
                 self.__start_handle = None
 
             if self.__pending_stop and self.__stop_handle is not None:
                 self.__pending_stop = False
                 self.__exp_active = False
                 self.__exp_selected_slot = None
-                self._on_did_stop(OP_OK + b": sample motion experiment state cleared.")
+                self._on_did_stop(OP_OK + b": experiment state cleared.")
                 self.__stop_handle = None
 
-            time.sleep(0.2)
+            time.sleep(0.1)
 
     def ok(self):
         return self.__run and self.__client.ok() and self.__daemon.is_ok()
