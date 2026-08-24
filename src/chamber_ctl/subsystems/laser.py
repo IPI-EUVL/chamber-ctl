@@ -511,10 +511,19 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Moving phase")
         elif laser_on and chopper_on:
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Ready")
-        elif laser_on or chopper_on:
-            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Starting")
+        elif laser_on:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Laser on")
+        elif chopper_on:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Chopper on")
         else:
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Idle")
+
+        if laser_on and not chopper_on:
+            self.__put_status_item_if_changed(100, StatusItem.STATE_WARN, "Laser on, but chopper off!")
+            self.__put_status_item_if_changed(101, StatusItem.STATE_WARN, "Laser has no sync source!")
+        else:
+            self.__clear_status_item_if_exists(100)
+            self.__clear_status_item_if_exists(101)
 
         if chopper_on:
             self.__put_status_item_if_changed(1, StatusItem.STATE_INFO, "Chopper on")
