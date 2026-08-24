@@ -691,7 +691,7 @@ class SampleMotionSubsystem(ExperimentClient):
 
         self.__logger = LogClient(self.__logger_sock, origin_uuid=c_uuid)
 
-        super().__init__("exposure", "Sample Motion Controller", self.__logger)
+        super().__init__("exposure", "Sample Motion", self.__logger)
         self.register_experiment_settings_type(ExposureSettings)
 
         #use_mock = os.environ.get("SAMPLE_MOTION_USE_MOCK", "0").strip().lower() in ("1", "true", "yes")

@@ -506,11 +506,11 @@ class TargetController(ExperimentClient):
                 return
             
             self.__did_config = True
-            sh = self.__client.register_subsystem("Target Controller", uuids.UUID_TARGET_CONTROLLER)
+            sh = self.__client.register_subsystem("Target", uuids.UUID_TARGET_CONTROLLER)
 
             self.__on_got_subsystem(sh)
 
-        super().__init__("exposure", "Target Controller", self.__logger)
+        super().__init__("exposure", "Target", self.__logger)
         self.register_experiment_settings_type(ExposureSettings)
 
         #print("Registering subsystem...")

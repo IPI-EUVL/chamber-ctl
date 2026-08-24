@@ -283,7 +283,7 @@ class LaserSyncSubsystem(ExperimentClient):
                 return
 
             self.__did_config = True
-            sh = self.__client.register_subsystem("Laser Sync Controller", uuids.UUID_LASER_CONTROLLER)
+            sh = self.__client.register_subsystem("Laser Sync", uuids.UUID_LASER_CONTROLLER)
             self.__on_got_subsystem(sh)
 
         self.__client = client.DDSClient(c_uuid, logger=self.__logger)
@@ -295,7 +295,7 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__daemon.add(target=self.__config_saver_thread)
         self.__daemon.start()
 
-        super().__init__("exposure", "Laser Sync Controller", self.__logger)
+        super().__init__("exposure", "Laser Sync", self.__logger)
         self.register_experiment_settings_type(ExposureSettings)
 
     def handle_exception(self, e: Exception):

@@ -60,7 +60,7 @@ class DevelopmentMetricsBridgeSubsystem:
         self.__did_config = True
 
         handle = self.__client.register_subsystem(
-            "Development Metrics Controller",
+            "Development Metrics",
             uuids.UUID_DEVELOPMENT_METRICS_CONTROLLER,
         )
         self.__on_got_subsystem(handle)

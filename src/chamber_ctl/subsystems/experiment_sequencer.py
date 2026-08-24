@@ -59,7 +59,7 @@ class ExposureQueueSubsystem:
 				return
 
 			self.__did_config = True
-			sh = self.__client.register_subsystem("Exposure Queue Controller", uuids.UUID_EXPERIMENT_QUEUE_CONTROLLER)
+			sh = self.__client.register_subsystem("Exposure Queue", uuids.UUID_EXPERIMENT_QUEUE_CONTROLLER)
 			self.__on_got_subsystem(sh)
 
 		self.__client = client.DDSClient(c_uuid, logger=self.__logger)

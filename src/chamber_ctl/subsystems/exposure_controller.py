@@ -95,7 +95,7 @@ class ExposureSettings(RunSettings):
 
 def main(stop_event: "multiprocessing.Event"):
     __SAVE_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
-    m_run_controller = ExperimentController("ExposureController", uuids.UUID_EXPOSURE_CONTROLLER, "exposure", __SAVE_PATH)
+    m_run_controller = ExperimentController("Exposure Controller", uuids.UUID_EXPOSURE_CONTROLLER, "exposure", __SAVE_PATH)
     m_run_controller.add_required_subsystem(uuids.UUID_TARGET_CONTROLLER, "Target Controller")
     m_run_controller.add_required_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER, "Oscilloscope Controller")
     m_run_controller.add_required_subsystem(uuids.UUID_LASER_CONTROLLER, "Laser Controller")

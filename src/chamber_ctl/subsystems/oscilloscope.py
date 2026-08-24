@@ -1153,7 +1153,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                 return
             
             self.__did_config = True
-            sh = self.__client.register_subsystem("Oscilloscope Controller", uuids.UUID_OSCILLOSCOPE_CONTROLLER)
+            sh = self.__client.register_subsystem("Oscilloscope", uuids.UUID_OSCILLOSCOPE_CONTROLLER)
 
             self.__on_got_subsystem(sh)
 
