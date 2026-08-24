@@ -566,3 +566,9 @@ class TargetMotion:
 
     def stop(self):
         pass
+
+    def get_status(self) -> tuple[bool, str]:
+        pass
+
+    def reset(self):
+        pass

@@ -112,7 +112,8 @@ class TargetControlGUI:
         tk.Button(button_frame, text="Home", width=12, command=self.__on_home).grid(row=1, column=1, padx=4, pady=4)
         tk.Button(button_frame, text="Start", width=12, command=self.__on_start).grid(row=2, column=0, padx=4, pady=4)
         tk.Button(button_frame, text="Stop", width=12, command=self.__on_stop).grid(row=2, column=1, padx=4, pady=4)
-        tk.Button(button_frame, text="Reset", width=12, command=self.__on_reset).grid(row=3, column=0, columnspan=2, padx=4, pady=4)
+        tk.Button(button_frame, text="Reset", width=12, command=self.__on_reset).grid(row=3, column=0, padx=4, pady=4)
+        tk.Button(button_frame, text="Clear Error", width=12, command=self.__on_clear_error).grid(row=3, column=1, padx=4, pady=4)
 
         set_time_frame = tk.LabelFrame(left, text="Set Time Position", padx=10, pady=8)
         set_time_frame.pack(fill=tk.X, pady=(10, 0))
@@ -195,6 +196,8 @@ class TargetControlGUI:
                     self.__run_event("Stop", self.__itf.stop_motion(), 10.0)
                 elif cmd == "reset":
                     self.__run_event("Reset", self.__itf.reset_motion(), 10.0)
+                elif cmd == "clear_error":
+                    self.__run_event("Clear Error", self.__itf.clear_error(), 10.0)
                 elif cmd == "set_time":
                     self.__run_event(f"Set time to {payload:.3f}s", self.__itf.set_current_position(payload), 10.0)
                 elif cmd == "goto":
@@ -331,6 +334,11 @@ class TargetControlGUI:
         if not messagebox.askyesno("Confirm Reset", "Reset target motion to time zero and set raw rotation to zero?"):
             return
         self.__cmd_queue.put(("reset", None))
+
+    def __on_clear_error(self):
+        if not messagebox.askyesno("Confirm Clear Error", "Clear the target motion hardware error state?"):
+            return
+        self.__cmd_queue.put(("clear_error", None))
 
     def __on_set_time(self):
         try:

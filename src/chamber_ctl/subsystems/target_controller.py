@@ -153,6 +153,20 @@ class MockTargetMotion(TargetMotion):
     def stop(self):
         self.__target_l = self.__current_l
         self.__target_r = self.__current_r
+
+    def get_status(self) -> tuple[bool, str]:
+        return True, "OK"
+    
+    def reset(self):
+        self.__current_l = 0.0
+        self.__current_r = 0.0
+        self.__target_l = 0.0
+        self.__target_r = 0.0
+        self.__l_speed = 0.0
+        self.__r_speed = 0.0
+        self.__jog_l = 0.0
+        self.__jog_r = 0.0
+        self.__homing = False
     
 class TargetMotionController:
     def __init__(self, logger: LogClient = None):
@@ -232,6 +246,14 @@ class TargetMotionController:
                 self.stop()
             elif self.__jog_speed != (0.0, 0.0):
                 self.__motion.jog(self.__jog_speed[0], self.__jog_speed[1])
+
+            status, reason = self.__motion.get_status()
+            if not status:
+                #self.__log(f"Motion controller error: {reason}", level="ERROR")
+                self.__is_running = False
+                self.__should_start = False
+                self.__jog_speed = (0.0, 0.0)
+                self.stop()
             
     def run_profile(self):
         t_l, t_r, v_l, v_r = self.__state.get_current_motion_command()
@@ -374,6 +396,13 @@ class TargetMotionController:
         if not self.clear_offset_position():
             return False
 
+        return True
+
+    def clear_motion_error(self):
+        if not self.can_modify():
+            return False
+
+        self.__motion.reset()
         return True
 
     def continue_move(self):
@@ -683,9 +712,9 @@ class TargetController(ExperimentClient):
     def __save_profile(self, library: db_library.Library, bdata: bytes):
         rec = self.__get_or_create_profile_record(library)
 
-        self.__logger.log(f"Saving state (current/remaining): {self.__motion_controller.get_current_time()}/{self.__motion_controller.get_state().get_remaining_time()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
-        self.__logger.log(f"Start position @ {self.__motion_controller.get_start_position()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
-        self.__logger.log(f"Offset position @ {self.__motion_controller.get_offset_position()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
+        #self.__logger.log(f"Saving state (current/remaining): {self.__motion_controller.get_current_time()}/{self.__motion_controller.get_state().get_remaining_time()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
+        #self.__logger.log(f"Start position @ {self.__motion_controller.get_start_position()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
+        #self.__logger.log(f"Offset position @ {self.__motion_controller.get_offset_position()}", level="DEBUG", l_type="REC", subsystem="Target Controller")
 
         res = rec.resource("motion_state.bin", "Motion State", "wb")
         res.write(bdata)
@@ -877,6 +906,12 @@ class TargetController(ExperimentClient):
         else:
             self.__clear_status_item_if_exists(1)
 
+        status, reason = self.__motion_controller.get_motion().get_status()
+        if not status:
+            self.__put_status_item_if_changed(200, subsystem.StatusItem.STATE_ALARM, f"Motion controller error: {reason}")
+        else:
+            self.__clear_status_item_if_exists(200)
+
     def __put_status_item_if_changed(self, code: int, severity: int, message: str):
         if self.__subsystem is None:
             return
@@ -901,19 +936,27 @@ class TargetController(ExperimentClient):
         #if self.__motion_controller.get_start_position() == (0.0, 0.0):
         #    return False, b"Motion start has not been defined"
         
-        if not self.__motion_controller.can_modify():
+        if not self.__motion_controller.can_modify() and not self.__motion_controller.is_moving_to_start() and not self.__motion_controller.is_running():
             return False, b"Motion controller is busy or not ready for motion"
+        
+        status, reason = self.__motion_controller.get_motion().get_status()
+        if not status:
+            return False, f"Motion controller error: {reason}".encode("utf-8")
         
         return True, b""
     
     def _on_continue_state(self):
+        status, reason = self.__motion_controller.get_motion().get_status()
+        if not status:
+            return False, f"Motion controller error: {reason}".encode("utf-8")
+        
         if self.__motion_controller.is_running():
             return True, b""
         else:
             return False, b"Motion controller is not running."
             
     
-    def _can_preinit(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
+    def _can_start(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
         t_len = settings.get_target_time() if settings.get_target_time() else 0.0
         
         if t_len > self.__motion_controller.get_state().get_remaining_time():
@@ -1059,6 +1102,22 @@ class TargetController(ExperimentClient):
 
         handle.ret(OP_OK + b": motion reset.")
 
+    def __on_clear_error_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
+        print("Clear error event called by:", s_uuid, param)
+
+        if not self.__motion_controller.can_modify():
+            handle.fail(b"Cannot clear motion error while motion is running or not ready.")
+            return
+
+        ok = self.__motion_controller.clear_motion_error()
+        if not ok:
+            handle.fail(b"Failed to clear motion error.")
+            return
+
+        self.__logger.log("Cleared target motion error state.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="clear_motion_error")
+
+        handle.ret(OP_OK + b": target motion error cleared.")
+
     def __on_home_event(self, s_uuid, param, handle: client._EventHandler._IncomingEventHandle):
         print("Home event called by:", s_uuid, param)
 
@@ -1082,6 +1141,7 @@ class TargetController(ExperimentClient):
         handle.add_event_handler(b"clear_target_offset").on_called(self.__on_clear_offset_event)
         handle.add_event_handler(b"home_target").on_called(self.__on_home_event)
         handle.add_event_handler(b"reset_target_motion").on_called(self.__on_reset_motion_event)
+        handle.add_event_handler(b"clear_target_error").on_called(self.__on_clear_error_event)
         handle.add_event_handler(b"set_target_position").on_called(self.__on_reset_move_event).set_types(types.FloatTypeSpecifier(), types.ByteTypeSpecifier())
 
         self.__jog_value= handle.get_kv_property(b"jog", True, False, False)

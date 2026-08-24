@@ -57,6 +57,7 @@ class TargetClient:
         self.__clear_offset_event_sender = None
         self.__home_event_sender = None
         self.__reset_event_sender = None
+        self.__clear_error_event_sender = None
         self.__set_position_event_sender = None
 
         def _on_ready():
@@ -99,6 +100,7 @@ class TargetClient:
         self.__clear_offset_event_sender = handle.add_event_provider(b"clear_target_offset")
         self.__home_event_sender = handle.add_event_provider(b"home_target")
         self.__reset_event_sender = handle.add_event_provider(b"reset_target_motion")
+        self.__clear_error_event_sender = handle.add_event_provider(b"clear_target_error")
         self.__set_position_event_sender = handle.add_event_provider(b"set_target_position")
         self.__set_position_event_sender.set_types(types.FloatTypeSpecifier(), types.ByteTypeSpecifier())
 
@@ -217,6 +219,12 @@ class TargetClient:
     def reset_motion(self):
         if self.__reset_event_sender is not None:
             return self.__reset_event_sender.call(bytes(), []).after()
+
+        return None
+
+    def clear_error(self):
+        if self.__clear_error_event_sender is not None:
+            return self.__clear_error_event_sender.call(bytes(), []).after()
 
         return None
 

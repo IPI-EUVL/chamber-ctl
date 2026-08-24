@@ -64,6 +64,9 @@ class LJSerialTargetMotion(TargetMotion):
         self.__port = port
         self.__l_serial = None
 
+        self.__fault_reason = None
+        self.__do_restart = False
+
         self.__lin_lock = Lock()
 
         self.__daemon = daemon.Daemon(exception_handler=self.handle_exception)
@@ -166,6 +169,7 @@ class LJSerialTargetMotion(TargetMotion):
 
         except AssertionError as e:
             self.__logger.log(f"Error initializing LIN communication: {e}", level="ERROR", l_type="SW", subsystem="Target Motion")
+            self.__fault_reason = f"Error initializing LIN communication: {e}"
             time.sleep(0.1)
             raise e
 
@@ -250,6 +254,8 @@ class LJSerialTargetMotion(TargetMotion):
         assert ret is not None and ret.startswith("01:")
 
         op = ret[3:]
+
+        print(f"LIN current operation: {op}")
         return op
     
     def __move_lin_to_position(self, position: int, speed: int):
@@ -283,7 +289,13 @@ class LJSerialTargetMotion(TargetMotion):
                 if self.__l_serial is not None:
                     self.__update_l()
             except AssertionError as e:
-                self.__logger.log(f"LIN communication error: {e}", level="ERROR", l_type="SW", subsystem="Target Motion")
+                self.__logger.log(f"LIN error: {e}", level="ERROR", l_type="SW", subsystem="Target Motion")
+                self.__do_restart = False
+                self.__fault_reason = f"LIN error: {e}"
+
+                while not self.__do_restart and stop_flag.run():
+                    time.sleep(0.1)
+
                 self.__l_serial.close()
                 self.__l_serial = None
                 time.sleep(1.0)
@@ -291,12 +303,23 @@ class LJSerialTargetMotion(TargetMotion):
 
         print("LIN thread stopping, sending stop command.")
         self.__stop_lin()
-            
+
+    def get_status(self):
+        if self.__fault_reason is not None:
+            return False, self.__fault_reason
+
+        return True, "OK"
+    
+    def reset(self):
+        self.__fault_reason = None
+        self.__do_restart = True
 
     def __update_l(self):
         self.__current_l = float(self.__get_lin_position()) / float(MM_TO_STEPS)
-        self.__l_moving = self.__get_lin_current_op() == "Move"
-        self.__l_homing = self.__get_lin_current_op() == "Home to datum"
+
+        c_op = self.__get_lin_current_op()
+        self.__l_moving = c_op == "Move"
+        self.__l_homing = c_op == "Home to datum"
 
         if self.__should_home_l:
             print("Homing LIN axis...")
@@ -314,13 +337,17 @@ class LJSerialTargetMotion(TargetMotion):
         #print(f"LIN Speed: {self.__l_speed} mm/s")
         #print(f"LIN Moving: {self.__l_moving}")
 
-        #self.__logger.log(f"LIN Current Position: {self.__current_l} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
-        #self.__logger.log(f"LIN Target Position: {self.__target_l} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
-        #self.__logger.log(f"LIN Last Position: {self.__last_l / float(MM_TO_STEPS)} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
-        #self.__logger.log(f"LIN Speed: {self.__l_speed} mm/s", level="DEBUG", l_type="REC", subsystem="Target Motion")
-        #self.__logger.log(f"LIN Moving: {self.__l_moving}", level="DEBUG", l_type="REC", subsystem="Target Motion")
-
-        if isnan(self.__jog_l) and not self.__l_moving and (abs((self.__current_l / float(MM_TO_STEPS)) - self.__target_l) > 1e-3 or isnan(self.__last_l)) and self.__l_speed > 0.0:
+        """self.__logger.log(f"LIN Current Position: {self.__current_l} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        self.__logger.log(f"LIN Target Position: {self.__target_l} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        self.__logger.log(f"LIN Last Position: {self.__last_l / float(MM_TO_STEPS)} mm", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        self.__logger.log(f"LIN Speed: {self.__l_speed} mm/s", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        self.__logger.log(f"LIN Moving: {self.__l_moving}", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        self.__logger.log(f"LIN Jog: {self.__jog_l} mm/s", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        self.__logger.log(f"LIN Jog NaN Check: {isnan(self.__jog_l) or abs(self.__jog_l) < 1e-3}", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        self.__logger.log(f"LIN Jog NaN Check: {(abs((self.__current_l / float(MM_TO_STEPS)) - self.__target_l) > 1e-3 or isnan(self.__last_l))}", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        self.__logger.log(f"LIN Jog NaN Check: {self.__l_speed > 0.0}", level="DEBUG", l_type="REC", subsystem="Target Motion")
+        """
+        if (isnan(self.__jog_l) or abs(self.__jog_l) < 1e-3) and (not self.__l_moving) and (abs((self.__current_l / float(MM_TO_STEPS)) - self.__target_l) > 1e-3 or isnan(self.__last_l)) and abs(self.__l_speed) > 0.0:
             self.__move_lin_to_position(int(self.__target_l * MM_TO_STEPS), int(self.__l_speed * MM_TO_STEPS))
             print(f"Reissuing LIN move command issued to position {self.__target_l} mm at speed {self.__l_speed} mm/s.")
             self.__logger.log(f"Reissuing LIN move command issued to position {self.__target_l} mm at speed {self.__l_speed} mm/s.", level="DEBUG", l_type="REC", subsystem="Target Motion")
