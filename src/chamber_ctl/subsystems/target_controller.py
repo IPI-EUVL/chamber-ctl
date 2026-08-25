@@ -26,9 +26,11 @@ from ipi_ecs.logging.client import LogClient
 from ipi_ecs.subsystems.experiment_client import ExperimentClient, RunState
 
 from chamber_ctl.subsystems import uuids
+from chamber_ctl.subsystems.laser import LaserSyncStatus
 from chamber_ctl.subsystems.target_motion import TargetMotion, TargetMotionConfig, TargetMotionProfile, MotionSegment, MotionState
 from chamber_ctl.subsystems.ljs_target_motion import LJSerialTargetMotion
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
+from euv_acquisition.health import AcquisitionHealth
 
 
 class MockTargetMotion(TargetMotion):
@@ -560,6 +562,11 @@ class TargetController(ExperimentClient):
         self.__status_publisher = None
         self.__status_item_cache = dict()
         self.__last_status_update = time.monotonic()
+        self.__acquisition_health = None
+        self.__acquisition_health_received_at = 0.0
+        self.__laser_status = None
+        self.__interlock_paused = False
+        self.__interlock_resume_pending = False
 
         self.__last_jog_write = 0.0
         self.__exp_name = None
@@ -849,6 +856,8 @@ class TargetController(ExperimentClient):
                 self._on_did_stop(OP_OK + b": motion stopped successfully.")
                 self.__stop_handle = None
 
+            self.__update_acquisition_interlock()
+
             if self.__home_handle is not None:
                 if not self.__motion_controller.is_homing():
                     self.__logger.log("Homing complete.", level="INFO", l_type="CTRL", subsystem="Target Controller", event="motion_home_complete")
@@ -946,6 +955,9 @@ class TargetController(ExperimentClient):
         return True, b""
     
     def _on_continue_state(self):
+        if self.__interlock_paused or self.__interlock_resume_pending:
+            return True, b""
+
         status, reason = self.__motion_controller.get_motion().get_status()
         if not status:
             return False, f"Motion controller error: {reason}".encode("utf-8")
@@ -971,6 +983,8 @@ class TargetController(ExperimentClient):
         return state, reason
 
     def _on_preinit(self, handle) -> bytes:
+        self.__interlock_paused = False
+        self.__interlock_resume_pending = False
         self.__motion_controller.continue_move()
         self.__preinit_handle = handle
 
@@ -981,6 +995,8 @@ class TargetController(ExperimentClient):
         return super()._on_start(handle)
     
     def _on_stop(self, handle) -> bytes:
+        self.__interlock_paused = False
+        self.__interlock_resume_pending = False
         self.__motion_controller.stop()
         self.__stop_handle = handle
 
@@ -1151,12 +1167,75 @@ class TargetController(ExperimentClient):
         self.__status_publisher= handle.get_kv_property(b"status", False, True, True)
         self.__status_publisher.set_type(types.VectorTypeSpecifier(types.ByteTypeSpecifier(), 2))
 
+        acquisition_health_kv = handle.add_remote_kv(
+            uuids.UUID_EUV_ACQUISITION_CONTROLLER,
+            subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"acquisition_health", True, True, False),
+        )
+        acquisition_health_kv.on_new_data_received(self.__on_acquisition_health)
+        laser_status_kv = handle.add_remote_kv(
+            uuids.UUID_LASER_CONTROLLER,
+            subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"status", True, True, False),
+        )
+        laser_status_kv.on_new_data_received(self.__on_laser_status)
+
         self.__profile_publisher= handle.add_kv_handler(b"profile")
         self.__profile_publisher.on_set(self.__on_profile_write)
         self.__profile_publisher.on_get(self.__on_profile_read)
         self.__profile_publisher.set_type(types.ByteTypeSpecifier())
 
         self._setup_subsystem(handle)
+
+    def __on_acquisition_health(self, payload: bytes) -> None:
+        try:
+            self.__acquisition_health = AcquisitionHealth.decode(payload)
+        except ValueError:
+            return
+        self.__acquisition_health_received_at = time.monotonic()
+
+    def __on_laser_status(self, payload: bytes) -> None:
+        try:
+            self.__laser_status = LaserSyncStatus.decode(payload)
+        except Exception:
+            return
+
+    def __laser_sample_is_closed(self) -> bool:
+        status = self.__laser_status
+        if status is None:
+            return False
+        try:
+            return abs(float(status.current_phase) - float(status.preinit_phase)) <= 1e-2
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def __update_acquisition_interlock(self) -> None:
+        health = self.__acquisition_health
+        if health is None or time.monotonic() - self.__acquisition_health_received_at > 1.0:
+            return
+        if health.pulse_loss and not self.__interlock_paused and not self.__interlock_resume_pending:
+            if self.__laser_sample_is_closed() and self.__motion_controller.is_running():
+                self.__motion_controller.stop()
+                self.__interlock_paused = True
+                self.__logger.log(
+                    "Target motion paused after acquisition interlock confirmed sample closure.",
+                    level="WARNING",
+                    l_type="CTRL",
+                    subsystem="Target Controller",
+                    event="acquisition_interlock_pause",
+                )
+            return
+        if self.__interlock_paused and health.recovery_ready and health.resume_authorized:
+            if self.__motion_controller.continue_move():
+                self.__interlock_resume_pending = True
+                self.__logger.log(
+                    "Target motion resuming after acquisition interlock recovery authorization.",
+                    level="INFO",
+                    l_type="CTRL",
+                    subsystem="Target Controller",
+                    event="acquisition_interlock_resume",
+                )
+        if self.__interlock_resume_pending and self.__motion_controller.is_running():
+            self.__interlock_paused = False
+            self.__interlock_resume_pending = False
 
     def __on_profile_write(self, h, requester, v):
         try:

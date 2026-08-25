@@ -25,6 +25,7 @@ class WFLaserSyncProvider(LaserSyncProvider):
         self.__initial_phase = 0
 
         self.__last_chopper_read_time = 0
+        self.__chopper_frequency_hz = None
 
         self.__port = serial.Serial(PORT, 115200, 8, "N", 1)
         self.waveform = pyvisa.ResourceManager().open_resource('USB0::0x0957::0x1507::MY48009073::INSTR')
@@ -134,6 +135,14 @@ class WFLaserSyncProvider(LaserSyncProvider):
         except ValueError:
             print(f"Unexpected chopper frequency response: '{response}'")
             return None
+
+    def set_chopper_frequency_hz(self, frequency_hz: float) -> tuple[bool, str]:
+        if frequency_hz <= 0:
+            return False, "Chopper frequency must be positive."
+        return False, "Function-generator chopper-frequency configuration is not validated yet."
+
+    def get_chopper_frequency_hz(self) -> float | None:
+        return self.__chopper_frequency_hz
         
     def __run_chopper(self):
         for _ in range(5):
@@ -164,6 +173,7 @@ class WFLaserSyncProvider(LaserSyncProvider):
     
     def read_chopper_on(self):
         fx = self.get_current_chopper_frequency()
+        self.__chopper_frequency_hz = fx
 
         if fx is not None and fx > 10:
             self.__chopper_on = True

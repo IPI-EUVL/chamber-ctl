@@ -1,6 +1,5 @@
 import time
 import traceback
-import traceback
 import uuid
 import pickle
 import os
@@ -11,6 +10,7 @@ import segment_bytes
 from ipi_ecs.core import daemon
 from ipi_ecs.dds.magics import OP_OK
 import ipi_ecs.dds.client as client
+import ipi_ecs.dds.subsystem as dds_subsystem
 import ipi_ecs.dds.magics as magics
 from ipi_ecs.dds.subsystem import StatusItem
 import ipi_ecs.dds.types as types
@@ -23,7 +23,9 @@ from ipi_ecs.subsystems.experiment_client import ExperimentClient
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 from chamber_ctl.subsystems.laser_provider import LaserSyncProvider
-from chamber_ctl.subsystems.wf_laser import WFLaserSyncProvider
+from euv_acquisition.health import AcquisitionHealth
+from euv_acquisition.timing import LaserTimingState
+#from chamber_ctl.subsystems.wf_laser import WFLaserSyncProvider
 
 class DummyLaserSyncProvider:
     def __init__(self, laser_warmup_time=5, chopper_startup_time=5):
@@ -36,6 +38,7 @@ class DummyLaserSyncProvider:
 
         self.__chopper_on = False
         self.__chopper_started_time = None
+        self.__chopper_frequency_hz = 192.0
 
         self.__skew_rate = 5 # degrees per second
         self.__current_phase = 0
@@ -110,6 +113,15 @@ class DummyLaserSyncProvider:
         
         return (time.monotonic() - self.__chopper_started_time) < self.__chopper_startup_time
 
+    def set_chopper_frequency_hz(self, frequency_hz: float) -> tuple[bool, str]:
+        if frequency_hz <= 0:
+            return False, "Chopper frequency must be positive."
+        self.__chopper_frequency_hz = float(frequency_hz)
+        return True, f"Chopper frequency set to {self.__chopper_frequency_hz:.3f} Hz."
+
+    def get_chopper_frequency_hz(self) -> float:
+        return self.__chopper_frequency_hz
+
     def set_laser_on(self, on):
         self.__laser_on = on
         self.__laser_started_time = time.monotonic() if on else None
@@ -178,13 +190,16 @@ class DummyLaserSyncProvider:
 
 
 class LaserSyncStatus:
-    def __init__(self, laser_on: bool, laser_warming_up: bool, chopper_on: bool, chopper_starting_up: bool, current_phase: float, target_phase: float):
+    def __init__(self, laser_on: bool, laser_warming_up: bool, chopper_on: bool, chopper_starting_up: bool, current_phase: float, target_phase: float, preinit_phase=None, configured_target_phase=None, chopper_frequency_hz=None):
         self.laser_on = laser_on
         self.laser_warming_up = laser_warming_up
         self.chopper_on = chopper_on
         self.chopper_starting_up = chopper_starting_up
         self.current_phase = current_phase
         self.target_phase = target_phase
+        self.preinit_phase = preinit_phase
+        self.configured_target_phase = configured_target_phase
+        self.chopper_frequency_hz = chopper_frequency_hz
 
     def encode(self) -> bytes:
         return pickle.dumps(self)
@@ -237,8 +252,16 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__skew_rate = 1.0
         self.__laser_warmup_time = 5.0
         self.__chopper_startup_time = 5.0
+        self.__requested_chopper_frequency_hz = None
         self.__status_publisher = None
+        self.__timing_status_publisher = None
         self.__status_item_cache = dict()
+        self.__acquisition_health = None
+        self.__acquisition_health_received_at = 0.0
+        self.__target_status = None
+        self.__interlock_closed = False
+        self.__interlock_close_pending = False
+        self.__interlock_reopen_pending = False
 
         self.__setter_queue = queue.Queue()
 
@@ -594,6 +617,10 @@ class LaserSyncSubsystem(ExperimentClient):
                     self.__execute_do_continuous_exposure()
                 elif job_name == "laser_shut":
                     self.__execute_laser_shut()
+                elif job_name == "interlock_close":
+                    self.__execute_interlock_close()
+                elif job_name == "interlock_reopen":
+                    self.__execute_interlock_reopen()
             except Exception as exc:
                 self.__logger.log(
                     f"Setter worker error in {job_name}: {exc}",
@@ -607,6 +634,19 @@ class LaserSyncSubsystem(ExperimentClient):
         handle = self.__preinit_handle
         if handle is None:
             self.__preinit_setup_pending = False
+            return
+
+        ok, status = self.__provider_set(
+            handle,
+            "Setting chopper frequency",
+            self.__sync.set_chopper_frequency_hz,
+            self.__requested_chopper_frequency_hz,
+        )
+        if not ok:
+            handle.fail(b"Preinit failed: " + status)
+            self.__preinit_handle = None
+            self.__preinit_setup_pending = False
+            self.__experiment_active = False
             return
 
         ok, status = self.__provider_set(handle, "Turning laser on", self.__sync.set_laser_on, True)
@@ -897,6 +937,50 @@ class LaserSyncSubsystem(ExperimentClient):
 
         handle.ret(OP_OK + b": " + status)
 
+    def __execute_interlock_close(self):
+        try:
+            ok, status = self.__sync.set_target_phase(self.__preinit_phase)
+            if ok:
+                self.__interlock_closed = True
+                self.__logger.log(
+                    "Acquisition interlock closed the sample.",
+                    level="WARNING",
+                    l_type="CTRL",
+                    subsystem="Laser Sync Controller",
+                    event="acquisition_interlock_close",
+                )
+            else:
+                self.__logger.log(
+                    f"Acquisition interlock could not close the sample: {status}",
+                    level="ERROR",
+                    l_type="CTRL",
+                    subsystem="Laser Sync Controller",
+                )
+        finally:
+            self.__interlock_close_pending = False
+
+    def __execute_interlock_reopen(self):
+        try:
+            ok, status = self.__sync.set_target_phase(self.__target_phase)
+            if ok:
+                self.__interlock_closed = False
+                self.__logger.log(
+                    "Acquisition interlock reopened the sample after target motion resumed.",
+                    level="INFO",
+                    l_type="CTRL",
+                    subsystem="Laser Sync Controller",
+                    event="acquisition_interlock_reopen",
+                )
+            else:
+                self.__logger.log(
+                    f"Acquisition interlock could not reopen the sample: {status}",
+                    level="ERROR",
+                    l_type="CTRL",
+                    subsystem="Laser Sync Controller",
+                )
+        finally:
+            self.__interlock_reopen_pending = False
+
     def __phase_at(self, phase: float) -> bool:
         return abs(self.__sync.get_current_phase() - phase) <= self.PHASE_EPSILON
 
@@ -947,7 +1031,13 @@ class LaserSyncSubsystem(ExperimentClient):
 
             if self.__status_publisher is not None and (time.monotonic() - last_status_publish) > 0.1:
                 last_status_publish = time.monotonic()
+                self.__update_acquisition_interlock()
                 self.__status_publisher.value = self.__get_status().encode()
+                if self.__timing_status_publisher is not None:
+                    self.__timing_status_publisher.value = self.__get_timing_status(
+                        sampled_at_unix_ns=time.time_ns(),
+                        sampled_at_monotonic_ns=time.monotonic_ns(),
+                    ).encode()
                 self.__update_status_items()
 
     def __get_status(self) -> LaserSyncStatus:
@@ -958,10 +1048,78 @@ class LaserSyncSubsystem(ExperimentClient):
             chopper_starting_up=self.__sync.get_chopper_starting_up(),
             current_phase=self.__sync.get_current_phase(),
             target_phase=self.__sync.get_target_phase(),
+            preinit_phase=self.__preinit_phase,
+            configured_target_phase=self.__target_phase,
+            chopper_frequency_hz=self.__sync.get_chopper_frequency_hz(),
         )
+
+    def __get_timing_status(
+        self,
+        *,
+        sampled_at_unix_ns: int | None = None,
+        sampled_at_monotonic_ns: int | None = None,
+    ) -> LaserTimingState:
+        return LaserTimingState(
+            laser_on=self.__sync.get_laser_on(),
+            laser_warming_up=self.__sync.get_laser_warming_up(),
+            chopper_on=self.__sync.get_chopper_on(),
+            chopper_starting_up=self.__sync.get_chopper_starting_up(),
+            current_phase=self.__sync.get_current_phase(),
+            preinit_phase=self.__preinit_phase,
+            configured_target_phase=self.__target_phase,
+            chopper_frequency_hz=self.__sync.get_chopper_frequency_hz(),
+            sampled_at_unix_ns=sampled_at_unix_ns,
+            sampled_at_monotonic_ns=sampled_at_monotonic_ns,
+        )
+
+    def __on_acquisition_health(self, payload: bytes) -> None:
+        try:
+            health = AcquisitionHealth.decode(payload)
+        except ValueError:
+            return
+        self.__acquisition_health = health
+        self.__acquisition_health_received_at = time.monotonic()
+
+    def __on_target_status(self, payload) -> None:
+        try:
+            value = payload[0] if isinstance(payload, (tuple, list)) else payload
+            self.__target_status = pickle.loads(bytes(value))
+        except (IndexError, TypeError, ValueError, pickle.PickleError):
+            self.__target_status = None
+
+    def __target_motion_is_running(self) -> bool:
+        return bool(getattr(self.__target_status, "is_running", False))
+
+    def __update_acquisition_interlock(self) -> None:
+        if not self.__experiment_active or self.__stop_handle is not None:
+            return
+        health = self.__acquisition_health
+        stale = (
+            self.__acquisition_health_received_at > 0
+            and time.monotonic() - self.__acquisition_health_received_at > 1.0
+        )
+        if stale or (health is not None and health.pulse_loss):
+            if not self.__interlock_closed and not self.__interlock_close_pending:
+                self.__interlock_close_pending = True
+                self.__enqueue_setter_job("interlock_close")
+            return
+        if (
+            health is not None
+            and health.recovery_ready
+            and health.resume_authorized
+            and self.__interlock_closed
+            and self.__target_motion_is_running()
+            and not self.__interlock_reopen_pending
+        ):
+            self.__interlock_reopen_pending = True
+            self.__enqueue_setter_job("interlock_reopen")
 
     def _on_preinit(self, handle):
         self.__experiment_active = True
+        self.__acquisition_health_received_at = time.monotonic()
+        self.__interlock_closed = False
+        self.__interlock_close_pending = False
+        self.__interlock_reopen_pending = False
         self.__preinit_handle = handle
         self.__preinit_setup_pending = True
         self.__enqueue_setter_job("exp_preinit")
@@ -1007,15 +1165,25 @@ class LaserSyncSubsystem(ExperimentClient):
         return True, b": stop accepted, disabling laser/chopper."
 
     def _on_continue_state(self):
+        if self.__experiment_active and self.__acquisition_health_received_at and time.monotonic() - self.__acquisition_health_received_at > 1.0:
+            return False, b"Acquisition health is stale."
         if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
             return True, self.EXP_IN_PROGRESS
 
         return False, b"Laser/chopper are not active."
 
     def _can_preinit(self, settings, state):
+        frequency = settings.get_chopper_frequency_hz()
+        try:
+            frequency = float(frequency)
+        except (TypeError, ValueError):
+            return False, b"Exposure requires a configured chopper frequency."
+        if not frequency > 0:
+            return False, b"Exposure chopper frequency must be positive."
         if self.__test_active or self.__test_in_progress() or self.__exposure_control_in_progress():
             return False, b"Laser test control is active."
 
+        self.__requested_chopper_frequency_hz = frequency
         return super()._can_preinit(settings, state)
 
     def __test_in_progress(self) -> bool:
@@ -1271,6 +1439,22 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__status_publisher = handle.get_kv_property(b"status", False, True, True)
         self.__status_publisher.set_type(types.ByteTypeSpecifier())
         self.__status_publisher.value = self.__get_status().encode()
+        self.__timing_status_publisher = handle.get_kv_property(b"timing_status", False, True, True)
+        self.__timing_status_publisher.set_type(types.ByteTypeSpecifier())
+        self.__timing_status_publisher.value = self.__get_timing_status(
+            sampled_at_unix_ns=time.time_ns(),
+            sampled_at_monotonic_ns=time.monotonic_ns(),
+        ).encode()
+        acquisition_health_kv = handle.add_remote_kv(
+            uuids.UUID_EUV_ACQUISITION_CONTROLLER,
+            dds_subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"acquisition_health", True, True, False),
+        )
+        acquisition_health_kv.on_new_data_received(self.__on_acquisition_health)
+        target_status_kv = handle.add_remote_kv(
+            uuids.UUID_TARGET_CONTROLLER,
+            dds_subsystem.KVDescriptor(types.VectorTypeSpecifier(types.ByteTypeSpecifier(), 2), b"status", True, True, False),
+        )
+        target_status_kv.on_new_data_received(self.__on_target_status)
 
         preinit_phase_kv = handle.add_kv_handler(b"preinit_phase")
         preinit_phase_kv.set_type(types.FloatTypeSpecifier())

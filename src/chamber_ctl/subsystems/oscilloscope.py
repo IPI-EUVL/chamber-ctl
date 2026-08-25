@@ -4,7 +4,10 @@ import random
 import time, struct, os, signal, re, sys, threading
 import traceback
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import date
+from typing import Any, Callable, Iterable
 
 try:
     from pyvisa import ResourceManager, errors as visa_errors
@@ -29,13 +32,55 @@ from ipi_ecs.logging.client import LogClient
 
 import ipi_ecs.core.tcp as tcp
 import ipi_ecs.dds.client as client
+import ipi_ecs.dds.subsystem as dds_subsystem
 from ipi_ecs.dds.subsystem import StatusItem
 import ipi_ecs.dds.types as types
 import ipi_ecs.subsystems.experiment_client as exp_client
-from ipi_ecs.subsystems.experiment_controller import ExperimentReader, RunRecord, RunState
+from ipi_ecs.subsystems.experiment_controller import ExperimentController, ExperimentReader, RunRecord, RunState
 
 import chamber_ctl.subsystems.uuids as uuids
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
+from chamber_ctl.subsystems.laser import LaserSyncStatus
+
+
+class ParallelCalc:
+    """Reusable bounded worker pool for independent calculation or I/O tasks."""
+
+    def __init__(self, max_workers: int = 24, *, thread_name_prefix: str = "parallel-calc"):
+        if not 1 <= max_workers <= 20:
+            raise ValueError("Parallel calculator workers must be between 1 and 20.")
+        if not thread_name_prefix:
+            raise ValueError("Parallel calculator thread name prefix cannot be empty.")
+        self.max_workers = max_workers
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
+        self._lifecycle_lock = threading.Lock()
+        self._closed = False
+
+    def submit(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Parallel calculator is closed.")
+            return self._executor.submit(operation, *args, **kwargs)
+
+    def map(self, operation: Callable[..., Any], *iterables: Iterable[Any]) -> Iterable[Any]:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Parallel calculator is closed.")
+            return self._executor.map(operation, *iterables)
+
+    def close(self, *, wait: bool = True) -> None:
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._executor.shutdown(wait=wait)
+
+    def __enter__(self) -> "ParallelCalc":
+        return self
+
+    def __exit__(self, _exception_type, _exception, _traceback) -> None:
+        self.close()
+
 
 class OscilloscopeStream:
     def start(self):
@@ -49,6 +94,9 @@ class OscilloscopeStream:
     
     def is_capturing(self):
         return False
+
+    def is_idle(self):
+        return not self.is_capturing()
     
     def get_state(self):
         return "STOPPED"
@@ -100,6 +148,7 @@ class ScopeReader(OscilloscopeStream):
         self.__read_queue = queue.Queue(maxsize=1) # signal from capture to read thread
 
         self.__is_capturing = False
+        self.__is_processing = False
         self.__state = "IDLE"
         self.__last_capturing = 0
 
@@ -119,7 +168,7 @@ class ScopeReader(OscilloscopeStream):
     def set_active(self, active):
         self.__do_capture = active
 
-        if self.is_capturing and not active:
+        if self.is_capturing() and not active:
             self.scope.write(":STOP")
 
     def capture_once(self):
@@ -420,6 +469,7 @@ class ScopeReader(OscilloscopeStream):
 
         self.__state = "PROC"
         self.__is_capturing = False
+        self.__is_processing = True
         # Freeze a consistent snapshot is already ensured (we're stopped)
         self.scope.write(":WAVeform:SEQuence 0,1")         # or 0,<next_start> in your loop
         self.scope.write(":WAVeform:SOURce C1")
@@ -441,9 +491,11 @@ class ScopeReader(OscilloscopeStream):
             t, V, meta, timestamps = self.decode_sequence_waveforms(desc, data, 10)
             if t is None:
                 print("Failed to decode waveform data, skipping this capture.")
+                self.__is_processing = False
                 continue
             
             if len(V) == 0:
+                self.__is_processing = False
                 continue
 
             #print(f"Got {len(V)} frames, {len(V[0])} pts/frame. First timestamp: {timestamps[0]} ns. Meta: {meta}")
@@ -464,6 +516,7 @@ class ScopeReader(OscilloscopeStream):
 
             self.__out_queue.put((start, end, data, indexes, uid))
             self.__state = "IDLE"
+            self.__is_processing = False
 
     def __read_thread(self, stop_flag: StopFlag):
         while stop_flag.run():
@@ -495,6 +548,9 @@ class ScopeReader(OscilloscopeStream):
     
     def is_capturing(self):
         return self.__is_capturing
+
+    def is_idle(self):
+        return not self.__is_capturing and not self.__is_processing
     
     def get_state(self):
         return self.__state
@@ -647,14 +703,14 @@ def calculate_dose_of_experiment(e_uuid: uuid.UUID, d_reader: "DataReader"):
         indexes = snap_array["indexes"]
 
         try:
-            total, duration = calculate_dose_raw(start, end, data, indexes)
+            analysis = analyze_snapshot_from_metadata(start, end, data, indexes, meta)
 
         except Exception as e:
             print(f"Error calculating dose for segment {uid}: {e}. Skipping.")
             continue
 
-        running_total += total
-        running_time += duration
+        running_total += analysis.total_dose_mj_cm2
+        running_time += analysis.runtime_contribution_seconds
 
     return running_total, running_time
 
@@ -686,13 +742,14 @@ def calculate_doses_of_segments(e_uuid: uuid.UUID, d_reader: "DataReader"):
         indexes = snap_array["indexes"]
 
         try:
-            total, duration = calculate_dose_raw(start, end, data, indexes)
+            analysis = analyze_snapshot_from_metadata(start, end, data, indexes, meta)
         except Exception as e:
             print(f"Error calculating dose for segment {uid}: {e}. Skipping.")
             continue
 
-        doses = np.append(doses, total)
-        times = np.append(times, duration)
+        doses = np.append(doses, analysis.total_dose_mj_cm2)
+        times = np.append(times, analysis.runtime_contribution_seconds
+        )
 
     return doses, times
 
@@ -734,106 +791,154 @@ def calculate_peak_voltages_of_experiment(e_uuid: uuid.UUID, d_reader: "DataRead
 
     return volts, times
 
-def calculate_dose_raw(start, end, data, indexes):
-    __REP_RATE_HZ = 100
+@dataclass(frozen=True)
+class SnapshotAnalysis:
+    average_pulse_dose_mj_cm2: float
+    pulse_times_seconds: np.ndarray
+    pulse_indexes: np.ndarray
+    pulse_doses_mj_cm2: np.ndarray
+    pulse_peaks_volts: np.ndarray
+    pulse_span_seconds: float
+    wall_duration_seconds: float
+    is_step_exposure: bool
+    inferred_step_exposure: bool
+    effective_duration_seconds: float
+    runtime_contribution_seconds: float
+    total_dose_mj_cm2: float
+    delivered_dose_rate_mj_cm2_s: float
 
-    total, cont, realtime = calculate_avg_pulsedose(data, indexes)
 
-    if cont:
-        #print(f"Continuous dose calculation: {total} mJ/cm2 over {(end - start) / 1e9} seconds")
-        total *= ((end - start) / 1e9) * __REP_RATE_HZ
-        return total, ((end - start) / 1e9)
-    else:
-        #print(f"Non-continuous dose calculation: {total} mJ/cm2 average per pulse, not scaled by time. Realtime: {realtime} seconds")
-        total *= realtime * __REP_RATE_HZ
-        return total, realtime
-    
-def calculate_peak_volts(data, indexes):
+_EXPOSURE_START_UNSPECIFIED = object()
+
+
+def analyze_snapshot(start, end, data, indexes, is_step_exposure: bool | None = None, *, exposure_start_ns=_EXPOSURE_START_UNSPECIFIED) -> SnapshotAnalysis:
+    off_num = 25
+    resistor_ohms = 50.0
+    responsivity_a_per_w = 0.14
+    area_cm2 = 5 / 100.0
+    rep_rate_hz = 100.0
+
+    waveform = np.asarray(data, dtype=float)
+    pulse_indexes = np.asarray(indexes)
+    if waveform.ndim != 2 or waveform.shape[1] < 2:
+        raise ValueError("Snapshot data must contain time and voltage columns.")
+    if pulse_indexes.ndim != 2 or pulse_indexes.shape[1] < 2:
+        raise ValueError("Snapshot indexes must contain sample index and pulse time columns.")
+    if not np.isfinite(waveform[:, :2]).all():
+        raise ValueError("Snapshot data contains non-finite values.")
+
+    try:
+        sample_index_values = np.asarray(pulse_indexes[:, 0], dtype=float)
+        pulse_times = np.asarray(pulse_indexes[:, 1], dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Snapshot indexes must be numeric.") from exc
+    if not np.isfinite(sample_index_values).all() or not np.isfinite(pulse_times).all():
+        raise ValueError("Snapshot indexes contain non-finite values.")
+    if not np.equal(sample_index_values, np.floor(sample_index_values)).all():
+        raise ValueError("Snapshot sample indexes must be integers.")
+    sample_indexes = sample_index_values.astype(int)
+    if np.any(sample_indexes < 0) or np.any(sample_indexes >= len(waveform)):
+        raise ValueError("Snapshot sample indexes are outside the waveform.")
+    if len(sample_indexes) > 1 and (np.any(np.diff(sample_indexes) <= 0) or np.any(np.diff(pulse_times) < 0)):
+        raise ValueError("Snapshot indexes must be strictly increasing with non-decreasing pulse times.")
+    if is_step_exposure is not None and not isinstance(is_step_exposure, bool):
+        raise ValueError("Snapshot is_step_exposure must be boolean when provided.")
+
+    try:
+        start_ns = float(start)
+        end_ns = float(end)
+        wall_duration = (end_ns - start_ns) / 1e9
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Snapshot start and end timestamps must be numeric nanoseconds.") from exc
+    if not math.isfinite(wall_duration) or wall_duration < 0:
+        raise ValueError("Snapshot end timestamp must not precede its start timestamp.")
+
+    pulse_doses = []
     pulse_peaks = []
+    for position, sample_index in enumerate(sample_indexes):
+        stop = sample_indexes[position + 1] if position + 1 < len(sample_indexes) else len(waveform)
+        pulse = waveform[sample_index:stop, :2]
+        baseline = float(np.average(pulse[:min(off_num, len(pulse)), 1]))
+        corrected_volts = pulse[:, 1] - baseline
+        auc_webers = float(np.trapezoid(corrected_volts, pulse[:, 0]))
+        dose = ((auc_webers / resistor_ohms) / responsivity_a_per_w) * 1000.0 / area_cm2
+        pulse_doses.append(dose)
+        pulse_peaks.append(float(np.max(pulse[:, 1])))
 
-    indexes = np.array(indexes)
-    data = np.array(data)
+    pulse_dose_array = np.asarray(pulse_doses, dtype=float)
+    pulse_peak_array = np.asarray(pulse_peaks, dtype=float)
+    average_pulse_dose = float(np.average(pulse_dose_array)) if len(pulse_dose_array) else 0.0
+    pulse_span = float(pulse_times[-1] - pulse_times[0]) if len(pulse_times) > 1 else 0.0
+    inferred_step = len(pulse_dose_array) < 2 or float(np.average(pulse_dose_array[-50:])) < 0.1 * average_pulse_dose
+    step_exposure = inferred_step if is_step_exposure is None else is_step_exposure
+    effective_duration = pulse_span if step_exposure else wall_duration
+    total_dose = average_pulse_dose * effective_duration * rep_rate_hz
+    uncorrected_dose = average_pulse_dose * pulse_span * rep_rate_hz
+    delivered_rate = uncorrected_dose / pulse_span if pulse_span > 0 else 0.0
 
-    if len(indexes) < 2:
+    runtime_contribution = effective_duration
+    if exposure_start_ns is None:
+        runtime_contribution = 0.0
+    elif exposure_start_ns is not _EXPOSURE_START_UNSPECIFIED:
+        try:
+            exposure_start = float(exposure_start_ns)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Snapshot exposure start timestamp must be numeric when provided.") from exc
+        if not math.isfinite(exposure_start):
+            raise ValueError("Snapshot exposure start timestamp must be finite when provided.")
+        runtime_contribution = max(0.0, end_ns - max(start_ns, exposure_start)) / 1e9
+
+    return SnapshotAnalysis(
+        average_pulse_dose_mj_cm2=average_pulse_dose,
+        pulse_times_seconds=pulse_times.copy(),
+        pulse_indexes=sample_indexes.copy(),
+        pulse_doses_mj_cm2=pulse_dose_array,
+        pulse_peaks_volts=pulse_peak_array,
+        pulse_span_seconds=pulse_span,
+        wall_duration_seconds=wall_duration,
+        is_step_exposure=step_exposure,
+        inferred_step_exposure=inferred_step,
+        effective_duration_seconds=effective_duration,
+        runtime_contribution_seconds=runtime_contribution,
+        total_dose_mj_cm2=total_dose,
+        delivered_dose_rate_mj_cm2_s=delivered_rate,
+    )
+
+
+def analyze_snapshot_from_metadata(start, end, data, indexes, metadata) -> SnapshotAnalysis:
+    if not isinstance(metadata, dict):
+        raise ValueError("Snapshot metadata must be an object.")
+
+    exposure_start_ns = metadata.get("exposure_start_ns", _EXPOSURE_START_UNSPECIFIED)
+    return analyze_snapshot(
+        start,
+        end,
+        data,
+        indexes,
+        is_step_exposure=metadata.get("is_step_exposure"),
+        exposure_start_ns=exposure_start_ns,
+    )
+
+
+def calculate_dose_raw(start, end, data, indexes):
+    analysis = analyze_snapshot(start, end, data, indexes)
+    return analysis.total_dose_mj_cm2, analysis.effective_duration_seconds
+
+
+def calculate_peak_volts(data, indexes):
+    analysis = analyze_snapshot(0, 0, data, indexes)
+    if len(analysis.pulse_indexes) < 2:
         return 0.0, False, 0.0
-    
-    pulse_size = int(indexes[1, 0] - indexes[0, 0])
-
-    for index, begin_time in indexes:
-        index = int(index)
-        pulse = data[index:index+pulse_size, :]
-        pulse_peaks.append((begin_time, np.max(pulse[:, 1])))
-
-    pulse_peaks = np.array(pulse_peaks)
-    
-    return pulse_peaks
+    return np.column_stack((analysis.pulse_times_seconds, analysis.pulse_peaks_volts))
 
 
 def calculate_avg_pulsedose(data, indexes):
-    __OFF_NUM = 25
-    __SAMPLE_dT = 10 / 1e9
-    __RESISTOR_OHMS = 50.0
-    __RESP_A_PER_W = 0.14
-    __AREA_CM2 = (5) / 100.0
-    __REP_RATE_HZ = 100
-
-    pulse_doses = []
-    pulse_webers = []
-
-    indexes = np.array(indexes)
-    data = np.array(data)
-
-    if len(indexes) < 2:
-        return 0.0, False, 0.0
-    
-    pulse_size = int(indexes[1, 0] - indexes[0, 0])
-
-    #start_first_pulse = indexes[0, 1]
-
-    #print(f"Segment {s_uuid} starts at {start_first_pulse} s after epoch, capture started at {start / 1e9} s after epoch")
-    #print(f"Time between capture start and first pulse: {(start_first_pulse - (start / 1e9))} seconds")
-
-    #if start_first_pulse - (start / 1e9) > 1.0:
-    #    print(f"Laser was off for {(start_first_pulse - start) / 1e9} seconds before first pulse. Ignoring this segment for dose calculation.")
-    #    return 0.0, 0.0
-
-    
-    # print(f"Calculated pulse size: {pulse_size} pts")
-
-    for index, begin_time in indexes:
-        index = int(index)
-        pulse = data[index:index+pulse_size, :]
-        off_avg = np.average(pulse[:__OFF_NUM, 1])
-        pulse -= off_avg
-        pulsetime = pulse[-1, 0] - pulse[0, 0]
-        auc_webers = np.trapezoid(pulse[:, 1], pulse[:, 0])
-        # print(f"nWeber: {auc_webers * 1e9}") 
-        Q_coulombs = auc_webers / __RESISTOR_OHMS
-        E_joules = Q_coulombs / __RESP_A_PER_W
-        E_mJ = E_joules * 1000.0
-        dose_per_pulse_mJ_cm2 = E_mJ / __AREA_CM2
-        #print(f"uJ/cm2: {dose_per_pulse_mJ_cm2 * 1e3}")
-        pulse_doses.append((begin_time, dose_per_pulse_mJ_cm2))
-        pulse_webers.append((begin_time, auc_webers))
-
-        #if dose_per_pulse_mJ_cm2 < -1e-5:
-        #    print("NEGATIVE DOSE: ", dose_per_pulse_mJ_cm2)
-
-    pulse_doses = np.array(pulse_doses)
-    pulse_webers = np.array(pulse_webers)
-    total = np.average(pulse_doses[:, 1])
-    last_50 = np.average(pulse_doses[-50:, 1])
-
-    #print(f"Average dose per pulse: {total} mJ/cm2")
-    #print(f"Last 50 pulses average dose: {last_50} mJ/cm2")
-    #print(pulse_doses[:, 1])
-
-
-    if last_50 < 0.1 * total:
-        #print("WARNING: Average dose in last 50 pulses is very low, using non continuous calculation.")
-        return total, False, pulse_doses[-1, 0] - pulse_doses[0, 0]
-    
-    return total, True, pulse_doses[-1, 0] - pulse_doses[0, 0]
+    analysis = analyze_snapshot(0, 0, data, indexes)
+    return (
+        analysis.average_pulse_dose_mj_cm2,
+        not analysis.is_step_exposure,
+        analysis.pulse_span_seconds,
+    )
 
 def calculate_dose_of_segment(e_uuid: uuid.UUID, s_uuid: uuid.UUID, d_reader: "DataReader"):
     __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
@@ -849,26 +954,89 @@ def calculate_dose_of_segment(e_uuid: uuid.UUID, s_uuid: uuid.UUID, d_reader: "D
     data = snap_array["data"]
     indexes = snap_array["indexes"]
 
-    total, duration = calculate_dose_raw(start, end, data, indexes)
-    return total, duration
+    analysis = analyze_snapshot_from_metadata(start, end, data, indexes, meta)
+    return analysis.total_dose_mj_cm2, analysis.runtime_contribution_seconds
     
 
 class DummyOscilloscope(OscilloscopeStream):
+    PHASE_EPSILON = 1e-2
+    STATUS_MAX_AGE_SECONDS = 0.5
+
     def __init__(self):
         self.__is_capturing = False
+        self.__is_processing = False
         self.__state = "IDLE"
         self.__last_capturing = 0
+        self.last_start_cmd = time.time_ns()
 
         self.__out_queue = queue.Queue() # for processed data
 
         self.__do_capture = False
         self.__do_capture_once = False
 
+        self.__dds_client = None
+        self.__dummy_scope = None
+        self.__laser_status_kv = None
+        self.__laser_status_lock = threading.Lock()
+        self.__laser_status = None
+        self.__laser_status_received_at = 0.0
+
         self.__daemon = Daemon()
         self.__daemon.add(self.__proc_thread)
 
     def start(self):
+        self.__dds_client = client.DDSClient(uuid.uuid4())
+        self.__dds_client.when_ready().then(self.__on_dds_ready)
         self.__daemon.start()
+
+    def __on_dds_ready(self):
+        if self.__dummy_scope is not None:
+            return
+
+        self.__dummy_scope = self.__dds_client.register_subsystem(
+            "DummyScope",
+            uuid.uuid4(),
+            temporary=True,
+        )
+        self.__laser_status_kv = self.__dummy_scope.add_remote_kv(
+            uuids.UUID_LASER_CONTROLLER,
+            dds_subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"status", True, True, False),
+        )
+        self.__laser_status_kv.on_new_data_received(self.__on_laser_status)
+
+    def __on_laser_status(self, payload: bytes):
+        try:
+            status = LaserSyncStatus.decode(payload)
+        except Exception:
+            return
+
+        with self.__laser_status_lock:
+            self.__laser_status = status
+            self.__laser_status_received_at = time.monotonic()
+
+    def __is_transmitting(self) -> bool:
+        with self.__laser_status_lock:
+            status = self.__laser_status
+            received_at = self.__laser_status_received_at
+
+        if status is None or (time.monotonic() - received_at) > self.STATUS_MAX_AGE_SECONDS:
+            return False
+
+        try:
+            preinit_phase = float(status.preinit_phase)
+            open_phase = float(status.configured_target_phase)
+            current_phase = float(status.current_phase)
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+        return (
+            status.laser_on
+            and status.chopper_on
+            and not status.laser_warming_up
+            and not status.chopper_starting_up
+            and abs(open_phase - preinit_phase) > self.PHASE_EPSILON
+            and abs(current_phase - open_phase) <= self.PHASE_EPSILON
+        )
 
     def set_active(self, active):
         print(f"Setting dummy oscilloscope active: {active}")
@@ -894,8 +1062,11 @@ class DummyOscilloscope(OscilloscopeStream):
         rand_off_v = random.uniform(-0.1, 0.1)
 
         t_square += rand_off_t
-        V = ((signal.square(t_square, 0.1) + 1.0) / 2.0) * 0.4
-        V += rand_off_v
+        if self.__is_transmitting():
+            V = ((signal.square(t_square, 0.1) + 1.0) / 2.0) * 0.4
+            V += rand_off_v
+        else:
+            V = np.full_like(t, rand_off_v)
 
         return t, V, timestamp
     
@@ -905,6 +1076,7 @@ class DummyOscilloscope(OscilloscopeStream):
             time.sleep(0.01)
 
             t, V, timestamp = self.dummy_wf()
+            self.__last_capturing = time.time()
             ts.append(t)
             Vs.append(V)
             timestamps.append(timestamp)
@@ -914,7 +1086,7 @@ class DummyOscilloscope(OscilloscopeStream):
 
     def __proc_thread(self, stop_flag: StopFlag):
         while stop_flag.run():
-            if not self.__do_capture or self.__do_capture_once:
+            if not self.__do_capture and not self.__do_capture_once:
                 time.sleep(0.1)
                 continue
 
@@ -924,9 +1096,10 @@ class DummyOscilloscope(OscilloscopeStream):
             self.last_start_cmd = time.time_ns()
 
             self.__is_capturing = True
+            self.__is_processing = True
             self.__state = "CAPTURING"
             #print("Dummy oscilloscope capturing...")
-            t, V, meta, timestamps, uid = self.dummy_wfs(100)
+            t, V, meta, timestamps, uid = self.dummy_wfs(250)
             #print("Dummy oscilloscope finished capturing.")
 
             self.__is_capturing = False
@@ -946,15 +1119,22 @@ class DummyOscilloscope(OscilloscopeStream):
 
             #print("Dummy oscilloscope generated new data, writing...")
             self.__out_queue.put((start, time.time_ns(), data, indexes, uid))
+            self.__is_processing = False
        
     def close(self):
         self.__daemon.stop()
+        if self.__dds_client is not None:
+            self.__dds_client.close()
+            self.__dds_client = None
 
     def ok(self):
         return self.__daemon.is_ok()
     
     def is_capturing(self):
         return self.__is_capturing
+
+    def is_idle(self):
+        return not self.__is_capturing and not self.__is_processing
     
     def get_state(self):
         return self.__state
@@ -978,6 +1158,8 @@ class ScopeWriter:
         self.__s_uuid = None
 
         self.__write_queue = queue.Queue()
+        self.__write_condition = threading.Condition()
+        self.__pending_writes = 0
 
         self.__daemon = Daemon()
         self.__daemon.add(self.__writer_thread)
@@ -992,8 +1174,13 @@ class ScopeWriter:
                     self.__do_get_record()
 
                 if not self.__write_queue.empty():
-                    start, end, data, indexes, uid = self.__write_queue.get()
-                    self.__write_wf(start, end, data, indexes, uid)
+                    start, end, data, indexes, uid, is_step_exposure, exposure_start_ns = self.__write_queue.get()
+                    try:
+                        self.__write_wf(start, end, data, indexes, uid, is_step_exposure, exposure_start_ns)
+                    finally:
+                        with self.__write_condition:
+                            self.__pending_writes -= 1
+                            self.__write_condition.notify_all()
             except Exception as e:
                 print(f"Error in ScopeWriter thread: {e}")
                 self.__logger.log(f"Error in ScopeWriter thread: {e}", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
@@ -1011,15 +1198,33 @@ class ScopeWriter:
         except ValueError:
             self.__record = None
 
-    def write_wf(self, start, end, data: np.ndarray, indexes, uid):
+    def write_wf(self, start, end, data: np.ndarray, indexes, uid, is_step_exposure=False, exposure_start_ns=None):
         if self.__record is None:
             print("No record available for writing, skipping...")
             return False
         
-        self.__write_queue.put((start, end, data, indexes, uid))
+        with self.__write_condition:
+            self.__pending_writes += 1
+        try:
+            self.__write_queue.put((start, end, data, indexes, uid, is_step_exposure, exposure_start_ns))
+        except Exception:
+            with self.__write_condition:
+                self.__pending_writes -= 1
+                self.__write_condition.notify_all()
+            raise
+        return True
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self.__write_condition:
+            while self.__pending_writes:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.__write_condition.wait(remaining)
         return True
     
-    def __write_wf(self, start, end, data: np.ndarray, indexes, uid):
+    def __write_wf(self, start, end, data: np.ndarray, indexes, uid, is_step_exposure=False, exposure_start_ns=None):
         if self.__record is None:
             return
         
@@ -1033,6 +1238,8 @@ class ScopeWriter:
             "end": end,
             "num_points": len(data),
             "num_frames": len(indexes),
+            "is_step_exposure": is_step_exposure,
+            "exposure_start_ns": exposure_start_ns,
         }
         json.dump(meta, file_meta)
         file_meta.close()
@@ -1044,6 +1251,9 @@ class DataReader:
     def __init__(self, path):
         self.path = path
         self.__exp_reader = ExperimentReader(path, "exposure")
+
+    def close(self):
+        self.__exp_reader.close()
 
     def get_snapshots(self, e_uuid):
         record = self.__exp_reader.get_run(e_uuid)
@@ -1097,8 +1307,8 @@ class DataReader:
         return None
 
 class OscilloscopeSubsystem(exp_client.ExperimentClient):
-    __STEP_DOSE_TGT = 1.0 # mJ/cm2, start stepping once dose is within this range of target
     def __init__(self, scope: OscilloscopeStream):
+        self.STEP_DOSE_TGT = 1.0 # mJ/cm2, start stepping once dose is within this range of target
         self.__out_queue = queue.Queue()
 
         self.osc = scope
@@ -1122,6 +1332,9 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__status_item_cache = dict()
 
         self.__exp_id = None
+        self.__run_state_lock = threading.Lock()
+        self.__exposure_start_ns = None
+        self.__exposure_state_kv = None
 
         self.__preinit_handle = None
         self.__start_handle = None
@@ -1133,6 +1346,7 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__data_reader = None
 
         self.__dose_queue = queue.Queue()
+        self.__finalizing_exp_id = None
 
         self.__last_laser_on = False
         self.__last_laser_off_time = 0
@@ -1181,6 +1395,24 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
             return
         
         self.__logger.log(msg, level=level, l_type="SW", subsystem="Oscilloscope", **data)
+
+    def __on_exposure_state(self, payload: bytes):
+        try:
+            phase_payload, state_payload = segment_bytes.decode(payload)
+            phase = int.from_bytes(phase_payload, byteorder="big")
+            if phase != ExperimentController.RUN_STATE_RUNNING or not state_payload:
+                return
+            state = RunState.decode(state_payload.decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return
+
+        with self.__run_state_lock:
+            if self.__exp_id == state.get_uuid() and self.__exposure_start_ns is None:
+                self.__exposure_start_ns = time.time_ns()
+
+    def __get_exposure_start_ns(self):
+        with self.__run_state_lock:
+            return self.__exposure_start_ns
 
     def __is_laser_on(self):
         if self.osc.is_capturing() and (time.time() - self.osc.get_last_start_cmd_time()) > 0.25:
@@ -1241,11 +1473,11 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
             time.sleep(0.1)
             #print("Checking if step exposure should be triggered...")
             #print(f"Current dose: {self.__current_dose} mJ/cm2, target dose: {self.__target_dose} mJ/cm2, do run: {self.__do_run}")
-            if self.__do_run and self.__target_dose is not None and self.__current_dose >= (self.__target_dose - self.__STEP_DOSE_TGT) and self.__current_dose < self.__target_dose:
+            if self.__do_run and self.__target_dose is not None and self.__current_dose >= (self.__target_dose - self.STEP_DOSE_TGT) and self.__current_dose < self.__target_dose:
                 self.__doing_step_exposure = True
                 try:
                     #print(f"Current dose {self.__current_dose} mJ/cm2 is within {self.__STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...")
-                    self.__logger.log(f"Current dose {self.__current_dose} mJ/cm2 is within {self.__STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...", level="INFO", l_type="EXP", subsystem="Oscilloscope")
+                    self.__logger.log(f"Current dose {self.__current_dose} mJ/cm2 is within {self.STEP_DOSE_TGT} mJ/cm2 of target dose {self.__target_dose} mJ/cm2, starting to do step exposures...", level="INFO", l_type="EXP", subsystem="Oscilloscope", action="BEGIN_STEP_EXPOSURE", exp_id=str(self.__exp_id), current_dose=self.__current_dose, target_dose=self.__target_dose)
                     self.osc.set_active(False)
 
                     time.sleep(0.1)
@@ -1253,14 +1485,23 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                         time.sleep(0.1)
                     
                     time.sleep(0.1)
-                    payload = struct.pack('d', float(2.0))
+                    payload = struct.pack('d', float(0.5))
                     self.__timed_exposure_handle = self.__do_timed_exposure_event.call(payload, [uuids.UUID_LASER_CONTROLLER])
                     self.__did_read = False
                     self.osc.capture_once()
                     time.sleep(0.1)
 
-                    while self.__timed_exposure_handle.is_in_progress():
+                    start_t = time.monotonic()
+
+                    while self.__timed_exposure_handle.is_in_progress() and (time.monotonic() - start_t) < 10.0:
                         time.sleep(0.1)
+
+                    if self.__timed_exposure_handle.is_in_progress():
+                        print("Timed exposure did not complete within 10 seconds, something may have gone wrong.")
+                        self.__logger.log("Timed exposure did not complete within 10 seconds, something may have gone wrong.", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
+                        self.__timed_exposure_handle.abort()
+                        self.__timed_exposure_handle = None
+                        continue
 
                     start_t = time.monotonic()
                     while not self.__did_read and (time.monotonic() - start_t) < 10.0:
@@ -1308,6 +1549,8 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                 self.__did_read = True
                 #print("New oscilloscope data available, writing...")
                 start, end, data, indexes, uid = self.__osc_queue.get()
+                is_step_exposure = self.__doing_step_exposure
+                exposure_start_ns = self.__get_exposure_start_ns()
 
                 if start < self.__last_laser_off_time <= end:
                     print(f"[OscilloscopeSubsystem] Skipped snapshot {uid}: laser off during segment ({start}..{end}, off at {self.__last_laser_off_time}).")
@@ -1321,7 +1564,15 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                 
                 for i in range(5):
                     try:
-                        ok = self.__writer.write_wf(start, end, data, indexes, uid)
+                        ok = self.__writer.write_wf(
+                            start,
+                            end,
+                            data,
+                            indexes,
+                            uid,
+                            is_step_exposure=is_step_exposure,
+                            exposure_start_ns=exposure_start_ns,
+                        )
                         if ok:
                             break
                         print(f"Failed to write waveform data for snapshot {uid}, attempt {i+1}. Retrying...")
@@ -1331,27 +1582,39 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
                         self.__logger.log(f"Error writing waveform data for snapshot {uid}, attempt {i+1}: {e}", level="ERROR", l_type="EXP", subsystem="Oscilloscope")
                         time.sleep(0.5)
 
-                pdose, pduration = calculate_dose_raw(start, end, data, indexes)
-                self.__current_dose += pdose
-                self.__current_time += pduration
+                analysis = analyze_snapshot(
+                    start,
+                    end,
+                    data,
+                    indexes,
+                    is_step_exposure=is_step_exposure,
+                    exposure_start_ns=exposure_start_ns,
+                )
+                with self.__run_state_lock:
+                    self.__current_dose += analysis.total_dose_mj_cm2
+                    self.__current_time += analysis.runtime_contribution_seconds
+                    current_dose = self.__current_dose
+                    current_time = self.__current_time
+                    target_dose = self.__target_dose
+                    target_time = self.__target_time
 
-                self.__dose_publisher.value = self.__current_dose
-                self.__time_publisher.value = self.__current_time
+                self.__dose_publisher.value = current_dose
+                self.__time_publisher.value = current_time
 
 
 
                 self.__logger.log(f"Saved snapshot {uid}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
-                self.__logger.log(f"Current dose: {self.__current_dose} mJ/cm2, time: {self.__current_time}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
+                self.__logger.log(f"Current dose: {current_dose} mJ/cm2, time: {current_time}", level="DEBUG", l_type="EXP", subsystem="Oscilloscope")
                 
-                if self.__do_run and self.__target_dose is not None and self.__current_dose >= self.__target_dose:
-                    print(f"Target dose of {self.__target_dose} mJ/cm2 reached, stopping exposure.")
-                    self.__logger.log(f"Target dose of {self.__target_dose} mJ/cm2 reached, stopping exposure.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
-                    self.__stop_experiment_event_sender.call((f"Target dose of {self.__target_dose} mJ/cm2 reached").encode("utf-8"), [])
+                if self.__do_run and target_dose is not None and current_dose >= target_dose:
+                    print(f"Target dose of {target_dose} mJ/cm2 reached, stopping exposure.")
+                    self.__logger.log(f"Target dose of {target_dose} mJ/cm2 reached, stopping exposure.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
+                    self.__stop_experiment_event_sender.call((f"Target dose of {target_dose} mJ/cm2 reached").encode("utf-8"), [])
 
-                if self.__do_run and self.__target_time is not None and self.__current_time >= self.__target_time:
-                    print(f"Target time of {self.__target_time} s reached, stopping exposure.")
-                    self.__logger.log(f"Target time of {self.__target_time} s reached, stopping exposure.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
-                    self.__stop_experiment_event_sender.call((f"Target time of {self.__target_time} s reached").encode("utf-8"), [])
+                if self.__do_run and target_time is not None and current_time >= target_time:
+                    print(f"Target time of {target_time} s reached, stopping exposure.")
+                    self.__logger.log(f"Target time of {target_time} s reached, stopping exposure.", level="INFO", l_type="EXP", subsystem="Oscilloscope")
+                    self.__stop_experiment_event_sender.call((f"Target time of {target_time} s reached").encode("utf-8"), [])
 
                 if not ok:
                     print("Failed to write oscilloscope data")
@@ -1362,9 +1625,22 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
                     self.__on_new_segment_publisher.value = segment_bytes.encode([self.__exp_id.bytes, uid.bytes])
 
-            if not self.__dose_queue.empty() and not self.osc.is_capturing():
-                time.sleep(0.5) # wait a moment to ensure all data is written and available for reading
+            if self.__finalizing_exp_id is not None and self.osc.is_idle() and self.__osc_queue.empty():
+                if not self.__writer.flush():
+                    self.__log("Timed out waiting for queued waveform writes before final dose calculation.", level="ERROR")
+                    continue
+
+                exp = self.__finalizing_exp_id
+                self.__finalizing_exp_id = None
+                self.__writer.set_exp_id(None)
+                with self.__run_state_lock:
+                    if self.__exp_id == exp:
+                        self.__exp_id = None
+                self.__dose_queue.put(exp)
+
+            if not self.__dose_queue.empty():
                 exp = self.__dose_queue.get()
+                rec = None
                 for _ in range(5): # retry a few times to get the experiment record, in case it's not immediately available
                     try:
                         rec = self.__exp_reader.get_run(exp)
@@ -1401,6 +1677,12 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__dose_publisher.set_type(types.FloatTypeSpecifier())
         self.__time_publisher.set_type(types.FloatTypeSpecifier())
 
+        self.__exposure_state_kv = sh.add_remote_kv(
+            uuids.UUID_EXPOSURE_CONTROLLER,
+            dds_subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"experiment_state", True, True, False),
+        )
+        self.__exposure_state_kv.on_new_data_received(self.__on_exposure_state)
+
         self.__stop_experiment_event_sender = sh.add_event_provider(f"stop_exposure".encode("utf-8"))
         self.__do_timed_exposure_event = sh.add_event_provider(b"laser_do_timed_exposure")
 
@@ -1408,27 +1690,39 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
 
     def _can_start(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
         print("Started exposure with UUID: ", state.get_uuid())
-        self.__exp_id = state.get_uuid()
-        self.__current_dose = 0.0
-        self.__current_time = 0.0
 
         if state.get_settings().get_attr("target_dose") > 0.1:
-            self.__target_dose = state.get_settings().get_attr("target_dose")
-            print(f"Target dose for this exposure: {self.__target_dose} mJ/cm2")
+            target_dose = state.get_settings().get_attr("target_dose")
+            print(f"Target dose for this exposure: {target_dose} mJ/cm2")
         else:
-            self.__target_dose = None
+            target_dose = None
 
         if state.get_settings().get_attr("target_time") > 0.1:
-            self.__target_time = state.get_settings().get_attr("target_time")
-            print(f"Target time for this exposure: {self.__target_time} s")
+            target_time = state.get_settings().get_attr("target_time")
+            print(f"Target time for this exposure: {target_time} s")
         else:
-            self.__target_time = None
+            target_time = None
 
-        if self.__target_dose is not None and self.__target_time is not None:
+        if target_dose is not None and target_time is not None:
             self.__logger.log("Warning: both target dose and target time are set. Refusing to start exposure.", level="WARNING", l_type="EXP", subsystem="Oscilloscope")
             return False, b"Cannot set both target dose and target time. Please set only one of them."
-        
-        self.__writer.set_exp_id(self.__exp_id)
+
+        is_new_run = False
+        with self.__run_state_lock:
+            if self.__exp_id == state.get_uuid():
+                if target_dose is not None and self.__current_dose >= target_dose:
+                    return False, b"Measured dose reached the target before the exposure phase opened."
+            else:
+                is_new_run = True
+                self.__exp_id = state.get_uuid()
+                self.__current_dose = 0.0
+                self.__current_time = 0.0
+                self.__target_dose = target_dose
+                self.__target_time = target_time
+                self.__exposure_start_ns = None
+
+        if is_new_run:
+            self.__writer.set_exp_id(self.__exp_id)
 
         return super()._can_start(settings, state)
     
@@ -1436,9 +1730,6 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
         self.__preinit_handle = handle
         self.__last_laser_on = False
         self.__last_laser_off_time = 0
-
-        self.__current_dose = 0.0
-        self.__current_time = 0.0
 
         self.osc.set_active(True)
 
@@ -1465,9 +1756,8 @@ class OscilloscopeSubsystem(exp_client.ExperimentClient):
     
     def __stop_exp(self):
         self.osc.set_active(False)
-        self.__dose_queue.put(self.__exp_id)
-
-        self.__exp_id = None
+        with self.__run_state_lock:
+            self.__finalizing_exp_id = self.__exp_id
     
     def _on_continue_state(self):
         if self.__exp_id is not None:
@@ -1488,6 +1778,7 @@ def main(stop_event):
     osc = ScopeReader("TCPIP0::10.11.13.220::5025::SOCKET")
     #osc = DummyOscilloscope()
     subsystem = OscilloscopeSubsystem(osc)
+    #subsystem.STEP_DOSE_TGT = -1.0 # sim laser does not support this
     print("Oscilloscope subsystem initializing...")
     #proc = RealtimeDoseCalc(osc)
 

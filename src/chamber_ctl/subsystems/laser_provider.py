@@ -39,6 +39,14 @@ class LaserSyncProvider(abc.ABC):
         pass
 
     @abc.abstractmethod
+    def set_chopper_frequency_hz(self, frequency_hz: float) -> tuple[bool, str]:
+        pass
+
+    @abc.abstractmethod
+    def get_chopper_frequency_hz(self) -> float | None:
+        pass
+
+    @abc.abstractmethod
     def set_laser_on(self, on: bool) -> tuple[bool, str]:
         pass
 
