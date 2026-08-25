@@ -21,6 +21,8 @@ from chamber_ctl import ECS_IP, ECS_PORT
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.interfaces.scope_interface import PhosphorScopeTk
 from chamber_ctl.subsystems.oscilloscope import calculate_dose_of_experiment, DataReader, calculate_dose_of_segment
+from chamber_ctl.data.dose_analysis import load_hdf5_snapshot_pulses
+from ipi_ecs.subsystems.experiment_controller import ExperimentReader
 
 class ScopeClient:
     __PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
@@ -68,7 +70,7 @@ class ScopeClient:
             print(f"Failed: {reason}")
             self.__run = False
 
-        handle.get_subsystem(uuids.UUID_OSCILLOSCOPE_CONTROLLER).then(lambda subsystem: subsystem.get_kv(b"new_segment").then(self.__on_got_kv).catch(fail)).catch(fail)
+        handle.get_subsystem(uuids.UUID_EUV_ACQUISITION_CONTROLLER).then(lambda subsystem: subsystem.get_kv(b"new_segment").then(self.__on_got_kv).catch(fail)).catch(fail)
 
         #pylint: disable=pointless-string-statement
 
@@ -83,6 +85,7 @@ class ScopeClient:
     
     def __calc_thread(self, stop_flag: daemon.StopFlag):
         self.__d_reader = DataReader(self.__PATH)
+        self.__hdf5_reader = ExperimentReader(self.__PATH, "exposure")
         total_dose = 0
         total_time = 0
         last_experiment = None
@@ -122,18 +125,18 @@ class ScopeClient:
         self.__run = False
 
     def __update_phosphor(self, exp, s_uuid, phosphor):
-        snap, meta = self.__d_reader.get_snapshot(exp, s_uuid)
+        try:
+            record = self.__hdf5_reader.get_run(exp)
+            pulses = load_hdf5_snapshot_pulses(record.get_record(), s_uuid)
+        except Exception:
+            snap, _meta = self.__d_reader.get_snapshot(exp, s_uuid)
+            data_f = np.load(snap)
+            indexes = data_f["indexes"]
+            data = data_f["data"]
+            pulse_size = int(indexes[1, 0] - indexes[0, 0])
+            pulses = np.reshape(data, (-1, pulse_size, 2))
 
-        data_f = np.load(snap)
-
-        indexes = data_f["indexes"]
-        data = data_f["data"]
-
-        pulse_size = int(indexes[1, 0] - indexes[0, 0])
-        pulses = np.reshape(data, (-1, pulse_size, 2))
-
-        last_time = indexes[0, 1]
-        for n, pulse in enumerate(pulses):
+        for pulse in pulses:
             #cur_time = indexes[n, 1]
             #time.sleep(max(0, cur_time - last_time) * 0.95) # sleep a bit less than the actual time to account for processing time, otherwise we might fall behind over time
             #last_time = cur_time

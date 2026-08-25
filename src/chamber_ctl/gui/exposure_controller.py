@@ -1,4 +1,5 @@
 import os
+import json
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
@@ -14,11 +15,13 @@ from ipi_ecs.gui.experiment_controller_gui import ExperimentInterface, Experimen
 from ipi_ecs.cli.captive_cli import wait_for
 
 from chamber_ctl import ECS_IP, ECS_PORT
+from chamber_ctl.data.calibration import CalibrationRepository
 from chamber_ctl.gui.sample_motion_gui import draw_sample_stage, build_sample_data, RING_RADII
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 from chamber_ctl.subsystems.laser import LaserSyncStatus
 from chamber_ctl.subsystems.settings_presets import SettingsPresets
+from euv_acquisition.health import AcquisitionHealth
 import chamber_ctl.subsystems.sample_motion as stage_client
 
 
@@ -36,8 +39,9 @@ class ExposureControllerGUI():
         self.__sample_type_options = []
         self.__operator_options = []
         
-        db_path = os.path.join(os.environ["EUVL_PATH"], "datasets")
-        self.__presets = SettingsPresets(db_path)
+        self.__data_path = os.path.join(os.environ["EUVL_PATH"], "datasets")
+        self.__presets = SettingsPresets(self.__data_path)
+        self.__calibration_options = {}
 
         self.__reload_presets()
 
@@ -55,15 +59,19 @@ class ExposureControllerGUI():
         self.__zr_filter_combo = None
         self.__sample_combo = None
         self.__sample_type_combo = None
+        self.__calibration_combo = None
         self.__base_pressure_input = None
         self.__operating_pressure_input = None
         self.__flowrate_input = None
+        self.__chopper_frequency_input = None
         self.__settings_frame = None
         self.__time_radio = None
         self.__dose_radio = None
         self.__refresh_button = None
         self.__apply_button = None
         self.__settings_locked = False
+        self.__settings_lock_reason = ""
+        self.__automation_lock_text = tk.StringVar(value="Settings are editable.")
 
         c_uuid = uuid.uuid4()
         s_uuid = uuid.uuid4()
@@ -82,11 +90,18 @@ class ExposureControllerGUI():
 
         self.__dose_kv = None
         self.__time_kv = None
+        self.__acquisition_status_kv = None
+        self.__acquisition_health_kv = None
+        self.__resume_acquisition_interlock_event = None
+        self.__recover_orphaned_capture_event = None
+        self.__acquisition_control_handle = None
+        self.__acquisition_control_name = None
         self.__laser_status_kv = None
         self.__target_status_kv = None
 
         self.__status_dose_value = None
         self.__status_time_value = None
+        self.__status_acquisition_value = None
         self.__status_laser_value = None
         self.__status_chopper_value = None
         self.__status_target_value = None
@@ -129,6 +144,15 @@ class ExposureControllerGUI():
             self.__zr_filter_options = self.__presets.read_zr_filters()
             self.__sample_type_options = self.__presets.read_sample_types()
             self.__operator_options = self.__presets.read_operators()
+            repository = CalibrationRepository(self.__data_path)
+            try:
+                profiles = repository.list_latest()
+            finally:
+                repository.close()
+            self.__calibration_options = {
+                f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
+                for profile in profiles
+            }
         except Exception as e:
             messagebox.showerror("Exposure Controller", f"Failed to load settings presets:\n{e}")
 
@@ -150,6 +174,9 @@ class ExposureControllerGUI():
         # Update sample type dropdown
         if self.__sample_type_combo is not None:
             self.__sample_type_combo.config(values=self.__sample_type_options)
+
+        if self.__calibration_combo is not None:
+            self.__calibration_combo.config(values=tuple(self.__calibration_options))
 
     def __update_target_unit_label(self, *args):
         """Update the unit label based on target type selection."""
@@ -177,14 +204,25 @@ class ExposureControllerGUI():
         self.__queue_start_event = handle.add_event_provider(b"queue_start_exposure")
 
         self.__dose_kv = handle.add_remote_kv(
-            uuids.UUID_OSCILLOSCOPE_CONTROLLER,
+            uuids.UUID_EUV_ACQUISITION_CONTROLLER,
             subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"cur_dose", True, True, False)
         )
 
         self.__time_kv = handle.add_remote_kv(
-            uuids.UUID_OSCILLOSCOPE_CONTROLLER,
+            uuids.UUID_EUV_ACQUISITION_CONTROLLER,
             subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"cur_time", True, True, False)
         )
+
+        self.__acquisition_status_kv = handle.add_remote_kv(
+            uuids.UUID_EUV_ACQUISITION_CONTROLLER,
+            subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"acquisition_status", True, True, False),
+        )
+        self.__acquisition_health_kv = handle.add_remote_kv(
+            uuids.UUID_EUV_ACQUISITION_CONTROLLER,
+            subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"acquisition_health", True, True, False),
+        )
+        self.__resume_acquisition_interlock_event = handle.add_event_provider(b"resume_acquisition_interlock")
+        self.__recover_orphaned_capture_event = handle.add_event_provider(b"recover_orphaned_capture_session")
 
         self.__laser_status_kv = handle.add_remote_kv(
             uuids.UUID_LASER_CONTROLLER,
@@ -223,6 +261,7 @@ class ExposureControllerGUI():
 
     def __update_live_status(self):
         laser_status = None
+        self.__update_acquisition_control_result()
         if self.__status_dose_value is not None:
             dose_value = self.__dose_kv.value if self.__dose_kv is not None else None
             self.__status_dose_value.config(text="N/A" if dose_value is None else f"{float(dose_value):.2f} mJ/cm²")
@@ -230,6 +269,9 @@ class ExposureControllerGUI():
         if self.__status_time_value is not None:
             time_value = self.__time_kv.value if self.__time_kv is not None else None
             self.__status_time_value.config(text="N/A" if time_value is None else f"{float(time_value):.2f} s")
+
+        if self.__status_acquisition_value is not None:
+            self.__status_acquisition_value.config(text=self.__format_acquisition_status())
 
         if self.__status_laser_value is not None:
             laser_text = "Unknown"
@@ -306,6 +348,106 @@ class ExposureControllerGUI():
         if self.__root is not None:
             self.__root.after(250, self.__update_live_status)
 
+    def __format_acquisition_status(self) -> str:
+        status_value = self.__acquisition_status_kv.value if self.__acquisition_status_kv is not None else None
+        health_value = self.__acquisition_health_kv.value if self.__acquisition_health_kv is not None else None
+        try:
+            status_payload = bytes(status_value) if isinstance(status_value, list) else status_value
+            status = json.loads(bytes(status_payload).decode("utf-8")) if status_payload is not None else {}
+            health_payload = bytes(health_value) if isinstance(health_value, list) else health_value
+            health = AcquisitionHealth.decode(health_payload) if health_payload is not None else None
+        except Exception:
+            return "Unavailable"
+        state = str(status.get("state", "unknown"))
+        if health is None:
+            return state
+        if state == "recovery_required":
+            detail = status.get("finalization_detail") or "Digitizer artifact recovery is required."
+            return f"Recovery required: {detail}"
+        details = []
+        source_kind = status.get("source_kind")
+        source_id = status.get("source_id")
+        if source_kind:
+            details.append(str(source_kind) if not source_id else f"{source_kind}:{source_id}")
+        if health.last_sequence is not None:
+            details.append(f"seq {health.last_sequence}")
+        clipped_count = status.get("clipped_pulse_count", 0)
+        if clipped_count:
+            details.append(f"clipped {clipped_count}")
+        if state == "finalizing" and status.get("finalization_phase"):
+            details.append(str(status["finalization_phase"]))
+        prefix = f"{state}, " + ", ".join(details) if details else state
+        if health.pulse_loss:
+            return f"{prefix}: pulse loss"
+        if health.recovery_ready and not health.resume_authorized:
+            return f"{prefix}: recovery ready"
+        if health.resume_authorized:
+            return f"{prefix}: recovery authorized"
+        if health.last_pulse_age_seconds is None:
+            return prefix
+        detail = status.get("finalization_detail")
+        suffix = f", {detail}" if state == "finalizing" and detail else ""
+        return f"{prefix}, pulse {health.last_pulse_age_seconds:.2f}s ago{suffix}"
+
+    def __call_acquisition_control(self, event, payload: bytes, requested_text: str) -> None:
+        if self.__acquisition_control_handle is not None and self.__acquisition_control_handle.is_in_progress():
+            messagebox.showinfo("EUV Acquisition", f"{self.__acquisition_control_name} is already in progress.")
+            return
+        if event is None:
+            messagebox.showerror("EUV Acquisition", "Acquisition controls are not connected.")
+            return
+        handle = event.call(payload, [uuids.UUID_EUV_ACQUISITION_CONTROLLER])
+        if handle is None:
+            messagebox.showerror("EUV Acquisition", "Failed to send the acquisition control request.")
+            return
+        self.__acquisition_control_handle = handle
+        self.__acquisition_control_name = requested_text
+        if self.__status_acquisition_value is not None:
+            self.__status_acquisition_value.config(text=requested_text)
+
+    def __update_acquisition_control_result(self) -> None:
+        handle = self.__acquisition_control_handle
+        if handle is None or handle.is_in_progress():
+            return
+        control_name = self.__acquisition_control_name or "Acquisition control request"
+        self.__acquisition_control_handle = None
+        self.__acquisition_control_name = None
+        state = handle.get_state(uuids.UUID_EUV_ACQUISITION_CONTROLLER)
+        result = handle.get_result(uuids.UUID_EUV_ACQUISITION_CONTROLLER)
+        if isinstance(result, bytes):
+            message = result.decode("utf-8", errors="replace")
+        else:
+            message = "" if result is None else str(result)
+        if state == client.EVENT_OK:
+            completion = message or f"{control_name} completed."
+            if self.__status_acquisition_value is not None:
+                self.__status_acquisition_value.config(text=completion)
+            return
+        failure = message or f"{control_name} failed."
+        if self.__status_acquisition_value is not None:
+            self.__status_acquisition_value.config(text=failure)
+        messagebox.showerror("EUV Acquisition", failure, parent=self.__root)
+
+    def __on_resume_acquisition_interlock(self) -> None:
+        self.__call_acquisition_control(
+            self.__resume_acquisition_interlock_event,
+            bytes(),
+            "Recovery authorization requested",
+        )
+
+    def __on_recover_orphaned_capture(self) -> None:
+        if not messagebox.askyesno(
+            "Recover Orphaned Capture",
+            "Import all unacknowledged artifacts, reconcile the matching exposure, and release the digitizer spool?",
+            parent=self.__root,
+        ):
+            return
+        self.__call_acquisition_control(
+            self.__recover_orphaned_capture_event,
+            b"confirm",
+            "Orphan recovery requested",
+        )
+
     def __update_laser_canvas(self, laser_status):
         if self.__laser_status_canvas is None:
             return
@@ -371,11 +513,25 @@ class ExposureControllerGUI():
 
         # Flowrate
         settings["flow_sccm"] = self.__flowrate_input.get()
+        settings["chopper_frequency_hz"] = self.__chopper_frequency_input.get()
+
+        calibration = self.__calibration_options.get(self.__calibration_combo.get())
+        if calibration is None:
+            settings["calibration_profile_id"] = ""
+            settings["calibration_revision"] = "0"
+        else:
+            profile_id, revision = calibration
+            settings["calibration_profile_id"] = str(profile_id)
+            settings["calibration_revision"] = str(revision)
 
         return settings
 
     def __on_apply_settings(self):
         """Apply current settings to the experiment controller."""
+        self.__sync_settings_from_run_state()
+        if self.__settings_locked:
+            self.__automation_lock_text.set(self.__settings_lock_reason)
+            return
         settings = self.__get_current_settings()
         self.__exp_ctl.do_update_settings(settings)
 
@@ -404,6 +560,26 @@ class ExposureControllerGUI():
             values.append(value)
             combobox.config(values=values)
         combobox.set(value)
+
+    def __set_calibration_selection(self, profile_id, revision) -> None:
+        if self.__calibration_combo is None:
+            return
+        profile_id = "" if profile_id is None else str(profile_id)
+        try:
+            revision = int(revision)
+        except (TypeError, ValueError):
+            revision = 0
+        if not profile_id or revision < 1:
+            self.__calibration_combo.set("")
+            return
+        for label, value in self.__calibration_options.items():
+            if value == (profile_id, revision):
+                self.__calibration_combo.set(label)
+                return
+        label = f"Unavailable calibration r{revision} | {profile_id}"
+        self.__calibration_options[label] = (profile_id, revision)
+        self.__calibration_combo.config(values=tuple(self.__calibration_options))
+        self.__calibration_combo.set(label)
 
     def __sync_settings_from_experiment(self):
         exp = self.__exp_itf.get_experiment()
@@ -453,6 +629,8 @@ class ExposureControllerGUI():
         self.__set_entry_text(self.__base_pressure_input, settings.get("base_pressure", ""))
         self.__set_entry_text(self.__operating_pressure_input, settings.get("operating_pressure", ""))
         self.__set_entry_text(self.__flowrate_input, settings.get("flow_sccm", ""))
+        self.__set_entry_text(self.__chopper_frequency_input, settings.get("chopper_frequency_hz", ""))
+        self.__set_calibration_selection(settings.get("calibration_profile_id"), settings.get("calibration_revision"))
 
     @staticmethod
     def __summarize_queue_item(index: int, b_item: bytes) -> str:
@@ -668,6 +846,7 @@ class ExposureControllerGUI():
             self.__base_pressure_input,
             self.__operating_pressure_input,
             self.__flowrate_input,
+            self.__chopper_frequency_input,
         ]:
             if widget is not None:
                 widget.config(state=entry_state)
@@ -680,6 +859,7 @@ class ExposureControllerGUI():
             self.__zr_filter_combo,
             self.__sample_combo,
             self.__sample_type_combo,
+            self.__calibration_combo,
         ]:
             if widget is not None:
                 widget.config(state=combo_state)
@@ -693,9 +873,18 @@ class ExposureControllerGUI():
         if has_experiment:
             self.__sync_settings_from_experiment()
 
-        should_lock = has_experiment
-        if should_lock != self.__settings_locked:
+        automation_owner = self.__exp_itf.get_automation_owner()
+        should_lock = has_experiment or automation_owner is not None
+        if has_experiment:
+            reason = "Settings locked while an exposure is active."
+        elif automation_owner is not None:
+            reason = f"Settings locked: automation held by {automation_owner}."
+        else:
+            reason = "Settings are editable."
+        if should_lock != self.__settings_locked or reason != self.__settings_lock_reason:
             self.__settings_locked = should_lock
+            self.__settings_lock_reason = reason
+            self.__automation_lock_text.set(reason)
             self.__set_settings_controls_enabled(not should_lock)
 
     def initialize_component(self):
@@ -787,6 +976,23 @@ class ExposureControllerGUI():
         self.__status_target_time_value = ttk.Label(status_grid, text="Time: t=N/A seg=N/A")
         self.__status_target_time_value.grid(row=6, column=1, sticky=tk.W, pady=2)
 
+        ttk.Label(status_grid, text="Acquisition:").grid(row=7, column=0, sticky=tk.NW, padx=(0, 8), pady=2)
+        self.__status_acquisition_value = ttk.Label(status_grid, text="Unavailable", wraplength=180)
+        self.__status_acquisition_value.grid(row=7, column=1, sticky=tk.W, pady=2)
+
+        acquisition_controls = ttk.Frame(status_grid)
+        acquisition_controls.grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
+        ttk.Button(
+            acquisition_controls,
+            text="Authorize Recovery",
+            command=self.__on_resume_acquisition_interlock,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(
+            acquisition_controls,
+            text="Recover Orphan",
+            command=self.__on_recover_orphaned_capture,
+        ).pack(side=tk.LEFT)
+
         self.__laser_status_canvas = tk.Canvas(status_container, width=240, height=42, bg="black", highlightthickness=0)
         self.__laser_status_canvas.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
 
@@ -871,6 +1077,16 @@ class ExposureControllerGUI():
         self.__zr_filter_combo.grid(row=row, column=1, sticky=tk.EW, pady=2)
         row += 1
 
+        ttk.Label(settings_frame, text="Calibration:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        self.__calibration_combo = ttk.Combobox(
+            settings_frame,
+            values=tuple(self.__calibration_options),
+            state="readonly",
+            width=20,
+        )
+        self.__calibration_combo.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 1
+
         row += 1  # Spacing
 
         # --- Pressure/Flow Settings ---
@@ -911,6 +1127,15 @@ class ExposureControllerGUI():
         ttk.Label(flowrate_frame, text="SCCM").pack(side=tk.LEFT)
         row += 1
 
+        ttk.Label(settings_frame, text="Chopper Frequency:").grid(row=row, column=0, sticky=tk.W, pady=2)
+        frequency_frame = ttk.Frame(settings_frame)
+        frequency_frame.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        self.__chopper_frequency_input = ttk.Entry(frequency_frame, width=10)
+        self.__chopper_frequency_input.insert(0, "192")
+        self.__chopper_frequency_input.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(frequency_frame, text="Hz").pack(side=tk.LEFT)
+        row += 1
+
         row += 1  # Spacing
 
         # --- Control Buttons ---
@@ -922,6 +1147,14 @@ class ExposureControllerGUI():
 
         self.__apply_button = ttk.Button(button_frame, text="Apply Settings", command=self.__on_apply_settings)
         self.__apply_button.pack(side=tk.LEFT)
+
+        ttk.Label(settings_frame, textvariable=self.__automation_lock_text, foreground="#9a4d35", wraplength=320).grid(
+            row=row + 1,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(6, 0),
+        )
 
         # Configure grid weights for proper expansion
         settings_frame.columnconfigure(1, weight=1)

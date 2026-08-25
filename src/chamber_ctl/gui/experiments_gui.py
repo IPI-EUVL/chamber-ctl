@@ -9,13 +9,14 @@ import plotly.graph_objects as go
 
 from ipi_ecs.core import daemon
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader, RunRecord
-from chamber_ctl.subsystems.oscilloscope import (
-    DataReader,
-    calculate_dose_of_experiment,
-    calculate_doses_of_segments,
-    calculate_peak_voltages_of_experiment,
-)
 from chamber_ctl.subsystems.development_metrics import DevelopmentMetrics
+from chamber_ctl.data.dose_analysis import (
+    DoseAnalysisRevision,
+    analyze_experiment_entry,
+    load_experiment_dose_series,
+    load_experiment_peak_voltage_series,
+    write_analysis_revision,
+)
 from ipi_ecs.util.export_experiment import export_experiment_data
 
 
@@ -1414,58 +1415,48 @@ class ExperimentsGUI:
         self.__volts_plot_worker.start()
 
     def __plot_selected_thread(self, run_ids: list):
-        data_reader = DataReader(self.__data_path)
         exp_reader = ExperimentReader(self.__data_path, self.__exp_name)
         traces = []
         errors = []
         total = len(run_ids)
 
-        for idx, run_uuid in enumerate(run_ids, start=1):
-            try:
-                run = exp_reader.locate_run_by_uuid(run_uuid)
-                name = f"{run.get_name()}:{run.get_description()}"
+        try:
+            for idx, run_uuid in enumerate(run_ids, start=1):
+                try:
+                    run = exp_reader.locate_run_by_uuid(run_uuid)
+                    name = f"{run.get_name()}:{run.get_description()}"
+                    series = load_experiment_dose_series(run_uuid, run.get_record())
 
-                doses, times = calculate_doses_of_segments(run_uuid, data_reader)
-                abs_doses = []
-                abs_times = []
-                running_total = 0.0
-                running_time = 0.0
-
-                for dose, run_time in zip(doses, times):
-                    running_total += float(dose)
-                    running_time += float(run_time)
-                    abs_doses.append(running_total)
-                    abs_times.append(running_time)
-
-                traces.append((name, abs_times, abs_doses))
-                self.__plot_queue.put(("progress", idx, total, run_uuid))
-            except Exception as e:
-                errors.append((run_uuid, str(e)))
-                self.__plot_queue.put(("error", idx, total, run_uuid, str(e)))
+                    traces.append((name, series.cumulative_runtime_seconds, series.cumulative_dose_mj_cm2))
+                    self.__plot_queue.put(("progress", idx, total, run_uuid))
+                except Exception as e:
+                    errors.append((run_uuid, str(e)))
+                    self.__plot_queue.put(("error", idx, total, run_uuid, str(e)))
+        finally:
+            exp_reader.close()
 
         self.__plot_queue.put(("done", traces, errors, total))
 
     def __plot_volts_selected_thread(self, run_ids: list):
-        data_reader = DataReader(self.__data_path)
         exp_reader = ExperimentReader(self.__data_path, self.__exp_name)
         traces = []
         errors = []
         total = len(run_ids)
 
-        for idx, run_uuid in enumerate(run_ids, start=1):
-            try:
-                run = exp_reader.locate_run_by_uuid(run_uuid)
-                name = f"{run.get_name()}:{run.get_description()}"
+        try:
+            for idx, run_uuid in enumerate(run_ids, start=1):
+                try:
+                    run = exp_reader.locate_run_by_uuid(run_uuid)
+                    name = f"{run.get_name()}:{run.get_description()}"
+                    series = load_experiment_peak_voltage_series(run.get_record())
 
-                volts, times = calculate_peak_voltages_of_experiment(run_uuid, data_reader)
-                if len(times) > 0:
-                    times = times - times[0]
-
-                traces.append((name, times, volts))
-                self.__volts_plot_queue.put(("progress", idx, total, run_uuid))
-            except Exception as e:
-                errors.append((run_uuid, str(e)))
-                self.__volts_plot_queue.put(("error", idx, total, run_uuid, str(e)))
+                    traces.append((name, series.time_seconds, series.peak_volts))
+                    self.__volts_plot_queue.put(("progress", idx, total, run_uuid))
+                except Exception as e:
+                    errors.append((run_uuid, str(e)))
+                    self.__volts_plot_queue.put(("error", idx, total, run_uuid, str(e)))
+        finally:
+            exp_reader.close()
 
         self.__volts_plot_queue.put(("done", traces, errors, total))
 
@@ -1516,7 +1507,7 @@ class ExperimentsGUI:
         errors = 0
 
         # Keep database access thread-affine: instantiate readers in this worker thread.
-        data_reader = DataReader(self.__data_path)
+        experiment_reader = ExperimentReader(self.__data_path, self.__exp_name)
 
         for i, record in enumerate(records, start=1):
             if self.__dose_recalc_cancel.is_set():
@@ -1524,9 +1515,15 @@ class ExperimentsGUI:
 
             run_uuid = _record_run_uuid(record)
             try:
-                dose, runtime = calculate_dose_of_experiment(run_uuid, data_reader)
-                self.__reader.add_tag(record, "dose", float(dose))
-                self.__reader.add_tag(record, "runtime", float(runtime))
+                worker_record = experiment_reader.get_run(run_uuid)
+                result = analyze_experiment_entry(run_uuid, worker_record.get_record())
+                write_analysis_revision(
+                    worker_record.get_record(),
+                    DoseAnalysisRevision(uuid.uuid4(), time.time(), result),
+                    promote=True,
+                )
+                dose = result.total_dose_mj_cm2
+                runtime = result.runtime_seconds
                 processed += 1
                 self.__dose_recalc_queue.put(("progress", i, total, record, run_uuid, float(dose), float(runtime)))
             except Exception as e:
@@ -1534,6 +1531,7 @@ class ExperimentsGUI:
                 self.__dose_recalc_queue.put(("error", i, total, record, run_uuid, str(e)))
 
         canceled = self.__dose_recalc_cancel.is_set()
+        experiment_reader.close()
         self.__dose_recalc_queue.put(("done", processed, total, errors, canceled))
 
     def __updater(self):
