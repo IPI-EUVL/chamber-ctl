@@ -42,13 +42,17 @@ class ExposureQueueSubsystem:
 
 		self.__settings_kv = None
 		self.__prepare_event = None
+		self.__acquire_automation_event = None
+		self.__release_automation_event = None
 		self.__run_finalized_kv = None
+		self.__lease_owned = False
 
 		self.__save_path = os.path.join(os.environ["EUVL_PATH"], "datasets")
 		self.__config_save_queue = queue.Queue()
 		self.__config_save_in_progress = False
 
 		self.__pending_queue_advance = False
+		self.__pending_lease_release = False
 		self.__queue_worker_lock = threading.Lock()
 		self.__last_seen_finalized_payload = None
 
@@ -115,6 +119,7 @@ class ExposureQueueSubsystem:
 			if code == "STOPPED":
 				self.__pending_queue_advance = True
 			else:
+				self.__pending_lease_release = True
 				self.__log(
 					f"Skipping queue advance for non-stopped finalization code: {code}",
 					level="INFO",
@@ -155,6 +160,8 @@ class ExposureQueueSubsystem:
 		with self.__queue_lock:
 			self.__queue = b_queue
 			q_len = len(self.__queue)
+			if q_len == 0:
+				self.__pending_lease_release = True
 
 		self.__request_queue_save()
 		self.__log(f"Queue replaced with {q_len} item(s).", level="INFO", event="queue_replace")
@@ -185,6 +192,8 @@ class ExposureQueueSubsystem:
 		self.__run_finalized_kv.on_new_data_received(self.__on_run_finalized_update)
 
 		self.__prepare_event = handle.add_event_provider(b"prepare_exposure")
+		self.__acquire_automation_event = handle.add_event_provider(b"acquire_exposure_automation")
+		self.__release_automation_event = handle.add_event_provider(b"release_exposure_automation")
 
 	@staticmethod
 	def __normalize_item(value) -> bytes:
@@ -384,33 +393,76 @@ class ExposureQueueSubsystem:
 
 		return True, magics.OP_OK
 
+	def __ensure_automation_lease(self):
+		if self.__lease_owned:
+			return True, magics.OP_OK
+		if self.__acquire_automation_event is None:
+			return False, b"Exposure automation lease provider is unavailable."
+		event_handle = self.__acquire_automation_event.call(
+			b"Exposure Queue Controller",
+			[uuids.UUID_EXPOSURE_CONTROLLER],
+		)
+		if event_handle is None:
+			return False, b"Failed to send exposure automation lease request."
+		ok, reason = self.__wait_event_completion(event_handle, uuids.UUID_EXPOSURE_CONTROLLER, timeout=10.0)
+		if ok:
+			self.__lease_owned = True
+		return ok, reason
+
+	def __release_automation_lease(self):
+		if not self.__lease_owned:
+			return True, magics.OP_OK
+		if self.__release_automation_event is None:
+			return False, b"Exposure automation release provider is unavailable."
+		event_handle = self.__release_automation_event.call(bytes(), [uuids.UUID_EXPOSURE_CONTROLLER])
+		if event_handle is None:
+			return False, b"Failed to send exposure automation release request."
+		ok, reason = self.__wait_event_completion(event_handle, uuids.UUID_EXPOSURE_CONTROLLER, timeout=10.0)
+		if ok:
+			self.__lease_owned = False
+		return ok, reason
+
 	def __start_next_if_available(self):
 		with self.__queue_worker_lock:
 			with self.__queue_lock:
 				if len(self.__queue) == 0:
 					self.__last_error = b""
+					ok, reason = self.__release_automation_lease()
+					if not ok:
+						self.__last_error = reason
+						self.__log(f"Failed to release queue automation lease: {reason}", level="ERROR", event="queue_lease")
 					return
 				b_item = self.__queue[0]
 
+			ok, reason = self.__ensure_automation_lease()
+			if not ok:
+				self.__last_error = reason
+				self.__log(f"Failed to acquire queue automation lease: {reason}", level="ERROR", event="queue_lease")
+				return
+
 			ok, reason = self.__set_settings_on_controller(b_item)
 			if not ok:
+				self.__release_automation_lease()
 				self.__last_error = reason
 				self.__log(f"Failed to apply queued settings: {reason}", level="ERROR", event="queue_apply")
 				return
 
 			if self.__prepare_event is None:
+				self.__release_automation_lease()
 				self.__last_error = b"prepare_exposure provider is unavailable."
 				self.__log("prepare_exposure provider is unavailable.", level="ERROR", event="queue_start")
 				return
 
 			event_handle = self.__prepare_event.call(bytes(), [uuids.UUID_EXPOSURE_CONTROLLER])
 			if event_handle is None:
+				self.__release_automation_lease()
 				self.__last_error = b"Failed to send prepare_exposure event."
 				self.__log("Failed to send prepare_exposure event.", level="ERROR", event="queue_start")
 				return
 
 			ok, reason = self.__wait_event_completion(event_handle, uuids.UUID_EXPOSURE_CONTROLLER)
 			if not ok:
+				self.__release_automation_lease()
 				self.__last_error = reason
 				self.__log(f"Queued run did not start: {reason}", level="ERROR", event="queue_start")
 				return
@@ -425,6 +477,12 @@ class ExposureQueueSubsystem:
 
 	def __worker_thread(self, stop_flag: daemon.StopFlag):
 		while stop_flag.run() and self.__run:
+			if self.__pending_lease_release:
+				self.__pending_lease_release = False
+				ok, reason = self.__release_automation_lease()
+				if not ok:
+					self.__last_error = reason
+					self.__log(f"Failed to release queue automation lease: {reason}", level="ERROR", event="queue_lease")
 			if self.__pending_queue_advance:
 				self.__pending_queue_advance = False
 				self.__start_next_if_available()
@@ -436,6 +494,10 @@ class ExposureQueueSubsystem:
 
 	def close(self):
 		self.__run = False
+		try:
+			self.__release_automation_lease()
+		except Exception:
+			pass
 
 		begin = time.monotonic()
 		while (not self.__config_save_queue.empty() or self.__config_save_in_progress) and (time.monotonic() - begin) < 2.0:
