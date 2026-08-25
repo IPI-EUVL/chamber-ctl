@@ -3,7 +3,8 @@ import uuid
 import argparse
 import numpy as np
 
-from chamber_ctl.subsystems.oscilloscope import  calculate_dose_of_segment, DataReader
+from ipi_ecs.subsystems.experiment_controller import ExperimentReader
+from chamber_ctl.data.dose_analysis import load_experiment_dose_series
 
 def main():
     parser = argparse.ArgumentParser(description="Calculate dose of an experiment.")
@@ -11,27 +12,18 @@ def main():
     parser.add_argument("filename", type=str, help="Name of the output file")
     args = parser.parse_args()
 
-    d_reader = DataReader(os.path.join(os.environ["EUVL_PATH"], "datasets"))
+    data_path = os.path.join(os.environ["EUVL_PATH"], "datasets")
     e_uuid = uuid.UUID(args.experiment_uuid)
 
-    segments = d_reader.get_snapshots(e_uuid)
+    exp_reader = ExperimentReader(data_path, "exposure")
+    try:
+        record = exp_reader.locate_run_by_uuid(e_uuid)
+        series = load_experiment_dose_series(e_uuid, record.get_record())
+    finally:
+        exp_reader.close()
 
-    running_total = 0
-    running_time = 0
-
-    doses = []
-    times = []
-
-    for uid, (snapshot_file, snapshot_meta) in segments.items():
-
-        dose, time = calculate_dose_of_segment(e_uuid, uid, d_reader)
-        running_total += dose
-        running_time += time
-        doses.append(running_total)
-        times.append(running_time)
-
-    doses = np.array(doses)
-    times = np.array(times)
+    doses = series.cumulative_dose_mj_cm2
+    times = series.cumulative_runtime_seconds
 
     stack = np.column_stack((times, doses))
 
@@ -46,7 +38,9 @@ def main():
 
     print(doses, times, stack)
 
-    print(f"Total dose: {running_total} mJ/cm^2 over {running_time} seconds")
+    total_dose = float(doses[-1]) if len(doses) else 0.0
+    total_time = float(times[-1]) if len(times) else 0.0
+    print(f"Total dose: {total_dose} mJ/cm^2 over {total_time} seconds")
     print(f"Dose and time data saved to {filename} in numpy .npz format")
 
 if __name__ == "__main__":

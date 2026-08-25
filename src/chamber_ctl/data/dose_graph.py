@@ -6,32 +6,18 @@ import plotly.graph_objects as go
 
 
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader
-from chamber_ctl.subsystems.oscilloscope import  calculate_doses_of_segments, DataReader
+from chamber_ctl.data.dose_analysis import load_experiment_dose_series
 
-def load_expr(e_uuid: uuid.UUID, d_reader: DataReader, exp_reader:ExperimentReader):
-    name = f"{exp_reader.locate_run_by_uuid(e_uuid).get_name()}:{exp_reader.locate_run_by_uuid(e_uuid).get_description()}"
+def load_expr(e_uuid: uuid.UUID, exp_reader: ExperimentReader):
+    record = exp_reader.locate_run_by_uuid(e_uuid)
+    name = f"{record.get_name()}:{record.get_description()}"
+    series = load_experiment_dose_series(e_uuid, record.get_record())
 
-    abs_doses = []
-    abs_times = []
+    return name, series.cumulative_runtime_seconds, series.cumulative_dose_mj_cm2
 
-    running_total = 0
-    running_time = 0
 
-    doses, times = calculate_doses_of_segments(e_uuid, d_reader)
-
-    print(doses, times)
-
-    for dose, time in zip(doses, times):
-        running_total += dose
-        running_time += time
-        abs_doses.append(running_total)
-        abs_times.append(running_time)
-    
-
-    return name, abs_times, abs_doses
-
-def plot_expr(e_uuid: uuid.UUID, d_reader: DataReader, exp_reader:ExperimentReader, fig: go.Figure):
-    name, times, doses = load_expr(e_uuid, d_reader, exp_reader)
+def plot_expr(e_uuid: uuid.UUID, exp_reader: ExperimentReader, fig: go.Figure):
+    name, times, doses = load_expr(e_uuid, exp_reader)
 
     fig.add_trace(go.Scatter(x=times, y=doses, mode='lines', name=name))
 
@@ -41,14 +27,16 @@ def main():
     parser.add_argument("experiment_uuids", type=str, help="UUIDs of the experiment to calculate dose for.")
     args = parser.parse_args()
 
-    d_reader = DataReader(__PATH)
     exp_reader = ExperimentReader(__PATH, "exposure")
 
     fig = go.Figure()
 
-    for e_uuid_str in args.experiment_uuids.split(","):
-        e_uuid = uuid.UUID(e_uuid_str)
-        plot_expr(e_uuid, d_reader, exp_reader, fig)
+    try:
+        for e_uuid_str in args.experiment_uuids.split(","):
+            e_uuid = uuid.UUID(e_uuid_str)
+            plot_expr(e_uuid, exp_reader, fig)
+    finally:
+        exp_reader.close()
 
     fig.show()
 
