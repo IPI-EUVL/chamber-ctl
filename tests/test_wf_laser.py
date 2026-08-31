@@ -14,8 +14,16 @@ class _Clock:
 
 
 class _FakeSerial:
-    def __init__(self, frequency_hz: float = 0.0) -> None:
+    def __init__(
+        self,
+        frequency_hz: float | str = 0.0,
+        *,
+        query_prefix_lines: tuple[bytes, ...] = (),
+        echo_prefix: str = "",
+    ) -> None:
         self.frequency_hz = frequency_hz
+        self.query_prefix_lines = query_prefix_lines
+        self.echo_prefix = echo_prefix
         self.is_open = True
         self.writes: list[str] = []
         self._responses: deque[bytes] = deque()
@@ -23,7 +31,9 @@ class _FakeSerial:
     def write(self, payload: bytes) -> int:
         command = payload.decode("utf-8").strip()
         self.writes.append(command)
-        self._responses.append(f"{command}\r".encode("utf-8"))
+        if command == "refoutfreq?":
+            self._responses.extend(line + b"\r" for line in self.query_prefix_lines)
+        self._responses.append(f"{self.echo_prefix}{command}\r".encode("utf-8"))
         if command == "refoutfreq?":
             self._responses.append(f"{self.frequency_hz}\r".encode("utf-8"))
         return len(payload)
@@ -104,6 +114,33 @@ def test_chopper_ready_means_measured_frequency_is_within_target_tolerance() -> 
 
     assert status.chopper_spinning is True
     assert status.chopper_on is False
+
+
+def test_chopper_frequency_query_skips_blank_frame_and_prefixed_command_echo() -> None:
+    clock = _Clock()
+    serial_device = _FakeSerial(
+        192.0,
+        query_prefix_lines=(b"",),
+        echo_prefix="> ",
+    )
+    provider = _provider(clock, serial_device, _FakeWaveform())
+
+    status = provider.refresh_hardware_status()
+
+    assert status.chopper_connected is True
+    assert status.measured_chopper_frequency_hz == 192.0
+    assert status.chopper_error is None
+
+
+def test_chopper_frequency_query_rejects_non_numeric_payload() -> None:
+    clock = _Clock()
+    serial_device = _FakeSerial("not-a-frequency", echo_prefix="> ")
+    provider = _provider(clock, serial_device, _FakeWaveform())
+
+    status = provider.refresh_hardware_status()
+
+    assert status.chopper_connected is False
+    assert "Invalid chopper frequency response" in status.chopper_error
 
 
 def test_laser_requires_chopper_at_target_and_shuts_down_when_it_faults() -> None:

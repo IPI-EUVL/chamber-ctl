@@ -19,6 +19,7 @@ LOGGER = logging.getLogger(__name__)
 
 CHOPPER_PORT = "COM4"
 WAVEFORM_RESOURCE = "USB0::0x0957::0x1507::MY48009073::INSTR"
+CHOPPER_RESPONSE_LINE_LIMIT = 8
 
 
 class WFLaserSyncProvider(LaserSyncProvider):
@@ -403,10 +404,10 @@ class WFLaserSyncProvider(LaserSyncProvider):
 
     def __poll_chopper_frequency_locked(self, now: float) -> None:
         self.__last_chopper_poll = now
-        if not self.__send_chopper_command_locked("refoutfreq?"):
+        response = self.__query_chopper_command_locked("refoutfreq?")
+        if response is None:
             return
         try:
-            response = self.__read_chopper_line_locked()
             frequency_hz = float(response)
         except Exception as exc:
             self.__mark_chopper_disconnected_locked(f"Invalid chopper frequency response: {exc}")
@@ -463,21 +464,57 @@ class WFLaserSyncProvider(LaserSyncProvider):
         if not self.__ensure_chopper_connection_locked(now):
             return False
         try:
-            self.__port.write(f"{command}\r".encode("utf-8"))
-            flush = getattr(self.__port, "flush", None)
-            if callable(flush):
-                flush()
-            self.__read_chopper_line_locked()
+            self.__write_chopper_command_locked(command)
+            self.__read_chopper_response_locked(command, expect_value=False)
             return True
         except Exception as exc:
             self.__mark_chopper_disconnected_locked(f"Chopper command {command!r} failed: {exc}")
             return False
+
+    def __query_chopper_command_locked(self, command: str) -> str | None:
+        now = self.__monotonic()
+        if not self.__ensure_chopper_connection_locked(now):
+            return None
+        try:
+            self.__write_chopper_command_locked(command)
+            return self.__read_chopper_response_locked(command, expect_value=True)
+        except Exception as exc:
+            self.__mark_chopper_disconnected_locked(f"Chopper command {command!r} failed: {exc}")
+            return None
+
+    def __write_chopper_command_locked(self, command: str) -> None:
+        reset_input_buffer = getattr(self.__port, "reset_input_buffer", None)
+        if callable(reset_input_buffer):
+            reset_input_buffer()
+        self.__port.write(f"{command}\r".encode("utf-8"))
+        flush = getattr(self.__port, "flush", None)
+        if callable(flush):
+            flush()
+
+    def __read_chopper_response_locked(self, command: str, *, expect_value: bool) -> str:
+        for _ in range(CHOPPER_RESPONSE_LINE_LIMIT):
+            response = self.__normalize_chopper_response(self.__read_chopper_line_locked())
+            if not response:
+                continue
+            if response.casefold() == command.casefold():
+                if expect_value:
+                    continue
+                return response
+            return response
+        raise TimeoutError("controller response contained no value")
 
     def __read_chopper_line_locked(self) -> str:
         response = self.__port.read_until(b"\r")
         if not response:
             raise TimeoutError("controller did not respond")
         return response.decode("utf-8").strip()
+
+    @staticmethod
+    def __normalize_chopper_response(response: str) -> str:
+        normalized = response.strip()
+        while normalized.startswith(">"):
+            normalized = normalized[1:].lstrip()
+        return normalized
 
     def __set_waveform_phase_locked(self, phase: float) -> bool:
         if self.__waveform is None:
