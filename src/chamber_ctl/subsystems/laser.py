@@ -22,10 +22,10 @@ from ipi_ecs.subsystems.experiment_client import ExperimentClient
 
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
-from chamber_ctl.subsystems.laser_provider import LaserSyncProvider
+from chamber_ctl.subsystems.laser_provider import LaserSyncProvider, LaserSyncProviderStatus
+from chamber_ctl.subsystems.wf_laser import WFLaserSyncProvider
 from euv_acquisition.health import AcquisitionHealth
 from euv_acquisition.timing import LaserTimingState
-#from chamber_ctl.subsystems.wf_laser import WFLaserSyncProvider
 
 class DummyLaserSyncProvider:
     def __init__(self, laser_warmup_time=5, chopper_startup_time=5):
@@ -50,6 +50,24 @@ class DummyLaserSyncProvider:
     def set_target_phase(self, phase):
         self.__target_phase = phase
         return True, f"Target phase set to {phase:.3f}."
+
+    def refresh_hardware_status(self) -> LaserSyncProviderStatus:
+        return self.get_hardware_status()
+
+    def get_hardware_status(self) -> LaserSyncProviderStatus:
+        chopper_on = self.get_chopper_on()
+        return LaserSyncProviderStatus(
+            desired_laser_on=self.__laser_on,
+            laser_on=self.__laser_on,
+            desired_chopper_on=self.__chopper_on,
+            chopper_on=chopper_on,
+            chopper_starting_up=self.get_chopper_starting_up(),
+            chopper_spinning=chopper_on,
+            target_chopper_frequency_hz=int(self.__chopper_frequency_hz),
+            measured_chopper_frequency_hz=self.__chopper_frequency_hz if chopper_on else 0.0,
+            chopper_connected=True,
+            waveform_connected=True,
+        )
 
     def set_skew_rate(self, skew_rate: float):
         if skew_rate < 0:
@@ -190,7 +208,7 @@ class DummyLaserSyncProvider:
 
 
 class LaserSyncStatus:
-    def __init__(self, laser_on: bool, laser_warming_up: bool, chopper_on: bool, chopper_starting_up: bool, current_phase: float, target_phase: float, preinit_phase=None, configured_target_phase=None, chopper_frequency_hz=None):
+    def __init__(self, laser_on: bool, laser_warming_up: bool, chopper_on: bool, chopper_starting_up: bool, current_phase: float, target_phase: float, preinit_phase=None, configured_target_phase=None, chopper_frequency_hz=None, desired_laser_on=None, desired_chopper_on=None, chopper_spinning=None, target_chopper_frequency_hz=None, chopper_connected=None, waveform_connected=None, chopper_recovery_exhausted=False, chopper_error=None, waveform_error=None):
         self.laser_on = laser_on
         self.laser_warming_up = laser_warming_up
         self.chopper_on = chopper_on
@@ -200,13 +218,36 @@ class LaserSyncStatus:
         self.preinit_phase = preinit_phase
         self.configured_target_phase = configured_target_phase
         self.chopper_frequency_hz = chopper_frequency_hz
+        self.desired_laser_on = desired_laser_on
+        self.desired_chopper_on = desired_chopper_on
+        self.chopper_spinning = chopper_spinning
+        self.target_chopper_frequency_hz = target_chopper_frequency_hz
+        self.chopper_connected = chopper_connected
+        self.waveform_connected = waveform_connected
+        self.chopper_recovery_exhausted = chopper_recovery_exhausted
+        self.chopper_error = chopper_error
+        self.waveform_error = waveform_error
 
     def encode(self) -> bytes:
         return pickle.dumps(self)
 
     @staticmethod
     def decode(data: bytes) -> "LaserSyncStatus":
-        return pickle.loads(data)
+        status = pickle.loads(data)
+        for name, default in (
+            ("desired_laser_on", None),
+            ("desired_chopper_on", None),
+            ("chopper_spinning", None),
+            ("target_chopper_frequency_hz", None),
+            ("chopper_connected", None),
+            ("waveform_connected", None),
+            ("chopper_recovery_exhausted", False),
+            ("chopper_error", None),
+            ("waveform_error", None),
+        ):
+            if not hasattr(status, name):
+                setattr(status, name, default)
+        return status
 
 
 class LaserSyncSubsystem(ExperimentClient):
@@ -484,11 +525,28 @@ class LaserSyncSubsystem(ExperimentClient):
         if handle is not None:
             handle.feedback(magics.OP_IN_PROGRESS + f": {step_label}...".encode("utf-8"))
 
-        ok, status = setter(*args)
+        try:
+            ok, status = setter(*args)
+        except Exception as exc:
+            self.__log(
+                f"Provider operation {step_label} raised an exception: {exc}",
+                level="ERROR",
+                event="laser_provider_operation",
+                step=step_label,
+            )
+            return False, self.__to_bytes(f"{step_label} failed: {exc}")
         b_status = self.__to_bytes(status)
 
         if handle is not None and b_status:
             handle.feedback(magics.OP_IN_PROGRESS + b": " + b_status)
+
+        if not ok:
+            self.__log(
+                f"Provider operation {step_label} failed: {b_status.decode('utf-8', errors='replace')}",
+                level="ERROR",
+                event="laser_provider_operation",
+                step=step_label,
+            )
 
         return bool(ok), b_status
 
@@ -502,6 +560,10 @@ class LaserSyncSubsystem(ExperimentClient):
 
         self.__subsystem.put_status_item(StatusItem(severity, code, message))
         self.__status_item_cache[code] = status
+        if severity == StatusItem.STATE_ALARM:
+            self.__log(message, level="ERROR", event="laser_status_alarm", status_code=code)
+        elif severity == StatusItem.STATE_WARN:
+            self.__log(message, level="WARNING", event="laser_status_warning", status_code=code)
 
     def __clear_status_item_if_exists(self, code: int):
         if self.__subsystem is None:
@@ -520,11 +582,26 @@ class LaserSyncSubsystem(ExperimentClient):
         msg = self.__to_bytes(status).decode("utf-8", errors="replace")
         self.__put_status_item_if_changed(200, StatusItem.STATE_ALARM, f"Chopper failed to turn on: {msg}")
 
+    def __get_provider_status(self) -> LaserSyncProviderStatus | None:
+        refresh = getattr(self.__sync, "refresh_hardware_status", None)
+        if not callable(refresh):
+            return None
+        try:
+            return refresh()
+        except Exception as exc:
+            self.__log(
+                f"Unable to refresh physical laser status: {exc}",
+                level="ERROR",
+                event="laser_provider_status",
+            )
+            return None
+
     def __update_status_items(self):
-        laser_on = self.__sync.get_laser_on()
-        chopper_on = self.__sync.get_chopper_on()
+        provider_status = self.__get_provider_status()
+        laser_on = provider_status.laser_on if provider_status is not None else self.__sync.get_laser_on()
+        chopper_on = provider_status.chopper_on if provider_status is not None else self.__sync.get_chopper_on()
         laser_warming = self.__sync.get_laser_warming_up()
-        chopper_starting = self.__sync.get_chopper_starting_up()
+        chopper_starting = provider_status.chopper_starting_up if provider_status is not None else self.__sync.get_chopper_starting_up()
 
         if laser_warming:
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Warming up")
@@ -534,6 +611,10 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Moving phase")
         elif laser_on and chopper_on:
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Ready")
+        elif provider_status is not None and provider_status.desired_chopper_on and provider_status.chopper_spinning:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Chopper outside target tolerance")
+        elif provider_status is not None and provider_status.desired_chopper_on:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Chopper recovering")
         elif laser_on:
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Laser on")
         elif chopper_on:
@@ -542,11 +623,29 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Idle")
 
         if laser_on and not chopper_on:
-            self.__put_status_item_if_changed(100, StatusItem.STATE_WARN, "Laser on, but chopper off!")
-            self.__put_status_item_if_changed(101, StatusItem.STATE_WARN, "Laser has no sync source!")
+            self.__put_status_item_if_changed(100, StatusItem.STATE_ALARM, "Laser enabled while chopper is not at target frequency.")
+            self.__put_status_item_if_changed(101, StatusItem.STATE_ALARM, "Laser has no valid chopper sync source.")
         else:
             self.__clear_status_item_if_exists(100)
             self.__clear_status_item_if_exists(101)
+
+        if provider_status is not None and not provider_status.chopper_connected:
+            detail = provider_status.chopper_error or "No connection to chopper controller."
+            self.__put_status_item_if_changed(102, StatusItem.STATE_ALARM, f"Chopper controller disconnected: {detail}")
+        else:
+            self.__clear_status_item_if_exists(102)
+
+        if provider_status is not None and not provider_status.waveform_connected:
+            detail = provider_status.waveform_error or "No connection to waveform generator."
+            self.__put_status_item_if_changed(103, StatusItem.STATE_ALARM, f"Waveform generator disconnected: {detail}")
+        else:
+            self.__clear_status_item_if_exists(103)
+
+        if provider_status is not None and provider_status.chopper_recovery_exhausted:
+            detail = provider_status.chopper_error or "Automatic recovery limit reached."
+            self.__put_status_item_if_changed(104, StatusItem.STATE_ALARM, f"Chopper recovery exhausted: {detail}")
+        else:
+            self.__clear_status_item_if_exists(104)
 
         if chopper_on:
             self.__put_status_item_if_changed(1, StatusItem.STATE_INFO, "Chopper on")
@@ -591,12 +690,16 @@ class LaserSyncSubsystem(ExperimentClient):
             try:
                 if job_name == "exp_preinit":
                     self.__execute_exp_preinit_setters()
+                elif job_name == "exp_preinit_laser":
+                    self.__execute_exp_preinit_laser_setters()
                 elif job_name == "exp_start":
                     self.__execute_exp_start_setters()
                 elif job_name == "exp_stop":
                     self.__execute_exp_stop_setters()
                 elif job_name == "test_preinit":
                     self.__execute_test_preinit_setters()
+                elif job_name == "test_preinit_laser":
+                    self.__execute_test_preinit_laser_setters()
                 elif job_name == "test_init":
                     self.__execute_test_init_setters()
                 elif job_name == "test_stop":
@@ -649,7 +752,8 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__experiment_active = False
             return
 
-        ok, status = self.__provider_set(handle, "Turning laser on", self.__sync.set_laser_on, True)
+        ok, status = self.__provider_set(handle, "Turning chopper on", self.__sync.set_chopper_on, True)
+        self.__record_chopper_on_result(ok, status)
         if not ok:
             handle.fail(b"Preinit failed: " + status)
             self.__preinit_handle = None
@@ -657,10 +761,18 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__experiment_active = False
             return
 
-        ok, status = self.__provider_set(handle, "Turning chopper on", self.__sync.set_chopper_on, True)
-        self.__record_chopper_on_result(ok, status)
+        self.__preinit_setup_pending = False
+        handle.feedback(b"Chopper enable requested, waiting for target frequency before enabling laser.")
+
+    def __execute_exp_preinit_laser_setters(self):
+        handle = self.__preinit_handle
+        if handle is None:
+            self.__preinit_setup_pending = False
+            return
+
+        ok, status = self.__provider_set(handle, "Turning laser on", self.__sync.set_laser_on, True)
         if not ok:
-            handle.fail(b"Preinit failed: " + status)
+            handle.fail(b"Preinit failed while enabling laser: " + status)
             self.__preinit_handle = None
             self.__preinit_setup_pending = False
             self.__experiment_active = False
@@ -675,7 +787,7 @@ class LaserSyncSubsystem(ExperimentClient):
             return
 
         self.__preinit_setup_pending = False
-        handle.feedback(b"Preinit setup complete, waiting for laser to warm up and chopper to start")
+        handle.feedback(b"Laser enabled, waiting for warmup and preinit phase.")
 
     def __execute_exp_start_setters(self):
         handle = self.__start_handle
@@ -706,13 +818,6 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__stop_setup_pending = False
             return
 
-        #ok, status = self.__provider_set(handle, "Turning chopper off", self.__sync.set_chopper_on, False)
-        #if not ok:
-        #    handle.fail(b"Stop failed: " + status)
-        #    self.__stop_handle = None
-        #    self.__stop_setup_pending = False
-        #    return
-
         ok, status = self.__reset_to_initial_phase(handle)
         if not ok:
             handle.fail(b"Stop failed: " + status)
@@ -721,7 +826,7 @@ class LaserSyncSubsystem(ExperimentClient):
             return
 
         self.__stop_setup_pending = False
-        handle.feedback(b"Stop complete, waiting for laser/chopper to disable.")
+        handle.feedback(b"Stop complete, waiting for laser to disable.")
 
     def __execute_test_preinit_setters(self):
         handle = self.__test_preinit_handle
@@ -729,7 +834,8 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__test_preinit_setup_pending = False
             return
 
-        ok, status = self.__provider_set(handle, "Turning laser on", self.__sync.set_laser_on, True)
+        ok, status = self.__provider_set(handle, "Turning chopper on", self.__sync.set_chopper_on, True)
+        self.__record_chopper_on_result(ok, status)
         if not ok:
             self.__test_active = False
             handle.fail(status)
@@ -737,8 +843,16 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__test_preinit_setup_pending = False
             return
 
-        ok, status = self.__provider_set(handle, "Turning chopper on", self.__sync.set_chopper_on, True)
-        self.__record_chopper_on_result(ok, status)
+        self.__test_preinit_setup_pending = False
+        handle.feedback(magics.OP_IN_PROGRESS + b": chopper enable requested; waiting for target frequency.")
+
+    def __execute_test_preinit_laser_setters(self):
+        handle = self.__test_preinit_handle
+        if handle is None:
+            self.__test_preinit_setup_pending = False
+            return
+
+        ok, status = self.__provider_set(handle, "Turning laser on", self.__sync.set_laser_on, True)
         if not ok:
             self.__test_active = False
             handle.fail(status)
@@ -755,7 +869,7 @@ class LaserSyncSubsystem(ExperimentClient):
             return
 
         self.__test_preinit_setup_pending = False
-        handle.feedback(magics.OP_IN_PROGRESS + b": test preinit setup complete.")
+        handle.feedback(magics.OP_IN_PROGRESS + b": laser enabled; waiting for warmup and preinit phase.")
 
     def __execute_test_init_setters(self):
         handle = self.__test_init_handle
@@ -786,13 +900,6 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__test_stop_handle = None
             self.__test_stop_setup_pending = False
             return
-
-        #ok, status = self.__provider_set(handle, "Turning chopper off", self.__sync.set_chopper_on, False)
-        #if not ok:
-        #    handle.fail(status)
-        #    self.__test_stop_handle = None
-        #    self.__test_stop_setup_pending = False
-        #    return
 
         ok, status = self.__reset_to_initial_phase(handle)
         if not ok:
@@ -1001,9 +1108,13 @@ class LaserSyncSubsystem(ExperimentClient):
         while stop_flag.run() and self.__run:
             time.sleep(0.01)
 
-            if self.__preinit_handle is not None and not self.__preinit_setup_pending and self.__preinit_ready():
-                self._on_did_preinit(b"Preinit complete.")
-                self.__preinit_handle = None
+            if self.__preinit_handle is not None and not self.__preinit_setup_pending:
+                if not self.__sync.get_laser_on() and self.__sync.get_chopper_on():
+                    self.__preinit_setup_pending = True
+                    self.__enqueue_setter_job("exp_preinit_laser")
+                elif self.__preinit_ready():
+                    self._on_did_preinit(b"Preinit complete.")
+                    self.__preinit_handle = None
 
             if self.__start_handle is not None and not self.__start_setup_pending and self.__init_ready():
                 self._on_did_start(b"Target phase reached.")
@@ -1015,9 +1126,13 @@ class LaserSyncSubsystem(ExperimentClient):
                     self.__stop_handle = None
                     self.__experiment_active = False
 
-            if self.__test_preinit_handle is not None and not self.__test_preinit_setup_pending and self.__preinit_ready():
-                self.__test_preinit_handle.ret(OP_OK + b": test preinit complete.")
-                self.__test_preinit_handle = None
+            if self.__test_preinit_handle is not None and not self.__test_preinit_setup_pending:
+                if not self.__sync.get_laser_on() and self.__sync.get_chopper_on():
+                    self.__test_preinit_setup_pending = True
+                    self.__enqueue_setter_job("test_preinit_laser")
+                elif self.__preinit_ready():
+                    self.__test_preinit_handle.ret(OP_OK + b": test preinit complete.")
+                    self.__test_preinit_handle = None
 
             if self.__test_init_handle is not None and not self.__test_init_setup_pending and self.__init_ready():
                 self.__test_init_handle.ret(OP_OK + b": test init complete.")
@@ -1041,16 +1156,26 @@ class LaserSyncSubsystem(ExperimentClient):
                 self.__update_status_items()
 
     def __get_status(self) -> LaserSyncStatus:
+        provider_status = self.__get_provider_status()
         return LaserSyncStatus(
-            laser_on=self.__sync.get_laser_on(),
+            laser_on=provider_status.laser_on if provider_status is not None else self.__sync.get_laser_on(),
             laser_warming_up=self.__sync.get_laser_warming_up(),
-            chopper_on=self.__sync.get_chopper_on(),
-            chopper_starting_up=self.__sync.get_chopper_starting_up(),
+            chopper_on=provider_status.chopper_on if provider_status is not None else self.__sync.get_chopper_on(),
+            chopper_starting_up=provider_status.chopper_starting_up if provider_status is not None else self.__sync.get_chopper_starting_up(),
             current_phase=self.__sync.get_current_phase(),
             target_phase=self.__sync.get_target_phase(),
             preinit_phase=self.__preinit_phase,
             configured_target_phase=self.__target_phase,
-            chopper_frequency_hz=self.__sync.get_chopper_frequency_hz(),
+            chopper_frequency_hz=provider_status.measured_chopper_frequency_hz if provider_status is not None else self.__sync.get_chopper_frequency_hz(),
+            desired_laser_on=provider_status.desired_laser_on if provider_status is not None else None,
+            desired_chopper_on=provider_status.desired_chopper_on if provider_status is not None else None,
+            chopper_spinning=provider_status.chopper_spinning if provider_status is not None else None,
+            target_chopper_frequency_hz=provider_status.target_chopper_frequency_hz if provider_status is not None else None,
+            chopper_connected=provider_status.chopper_connected if provider_status is not None else None,
+            waveform_connected=provider_status.waveform_connected if provider_status is not None else None,
+            chopper_recovery_exhausted=provider_status.chopper_recovery_exhausted if provider_status is not None else False,
+            chopper_error=provider_status.chopper_error if provider_status is not None else None,
+            waveform_error=provider_status.waveform_error if provider_status is not None else None,
         )
 
     def __get_timing_status(
@@ -1059,15 +1184,16 @@ class LaserSyncSubsystem(ExperimentClient):
         sampled_at_unix_ns: int | None = None,
         sampled_at_monotonic_ns: int | None = None,
     ) -> LaserTimingState:
+        provider_status = self.__get_provider_status()
         return LaserTimingState(
-            laser_on=self.__sync.get_laser_on(),
+            laser_on=provider_status.laser_on if provider_status is not None else self.__sync.get_laser_on(),
             laser_warming_up=self.__sync.get_laser_warming_up(),
-            chopper_on=self.__sync.get_chopper_on(),
-            chopper_starting_up=self.__sync.get_chopper_starting_up(),
+            chopper_on=provider_status.chopper_on if provider_status is not None else self.__sync.get_chopper_on(),
+            chopper_starting_up=provider_status.chopper_starting_up if provider_status is not None else self.__sync.get_chopper_starting_up(),
             current_phase=self.__sync.get_current_phase(),
             preinit_phase=self.__preinit_phase,
             configured_target_phase=self.__target_phase,
-            chopper_frequency_hz=self.__sync.get_chopper_frequency_hz(),
+            chopper_frequency_hz=provider_status.measured_chopper_frequency_hz if provider_status is not None else self.__sync.get_chopper_frequency_hz(),
             sampled_at_unix_ns=sampled_at_unix_ns,
             sampled_at_monotonic_ns=sampled_at_monotonic_ns,
         )

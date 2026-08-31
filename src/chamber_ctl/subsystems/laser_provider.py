@@ -1,7 +1,33 @@
 import abc
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class LaserSyncProviderStatus:
+    desired_laser_on: bool
+    laser_on: bool
+    desired_chopper_on: bool
+    chopper_on: bool
+    chopper_starting_up: bool
+    chopper_spinning: bool
+    target_chopper_frequency_hz: int | None
+    measured_chopper_frequency_hz: float | None
+    chopper_connected: bool
+    waveform_connected: bool
+    chopper_recovery_exhausted: bool = False
+    chopper_error: str | None = None
+    waveform_error: str | None = None
 
 
 class LaserSyncProvider(abc.ABC):
+    @abc.abstractmethod
+    def refresh_hardware_status(self) -> LaserSyncProviderStatus:
+        pass
+
+    @abc.abstractmethod
+    def get_hardware_status(self) -> LaserSyncProviderStatus:
+        pass
+
     @abc.abstractmethod
     def set_target_phase(self, phase: float) -> tuple[bool, str]:
         pass

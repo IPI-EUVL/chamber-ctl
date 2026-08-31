@@ -575,14 +575,29 @@ class LaserSyncTestGUI:
         laser_text = "ON" if status.laser_on else "OFF"
         if status.laser_warming_up:
             laser_text += " (warming up)"
+        if status.desired_laser_on is not None and status.desired_laser_on != status.laser_on:
+            laser_text += " (requested ON)" if status.desired_laser_on else " (shutdown requested)"
+        if status.waveform_connected is False:
+            laser_text += " (generator disconnected)"
 
         chopper_text = "ON" if status.chopper_on else "OFF"
         if status.chopper_starting_up:
             chopper_text += " (starting up)"
+        if status.chopper_spinning is True and not status.chopper_on:
+            chopper_text += " (outside target tolerance)"
+        if status.desired_chopper_on is not None and status.desired_chopper_on != status.chopper_on:
+            chopper_text += " (requested ON)" if status.desired_chopper_on else " (shutdown requested)"
+        if status.target_chopper_frequency_hz is not None:
+            measured = "N/A" if status.chopper_frequency_hz is None else f"{float(status.chopper_frequency_hz):.2f} Hz"
+            chopper_text += f" [measured {measured}, target {status.target_chopper_frequency_hz} Hz]"
+        if status.chopper_connected is False:
+            chopper_text += " (controller disconnected)"
 
         self.__laser_label.config(text=f"Laser: {laser_text}")
         self.__chopper_label.config(text=f"Chopper: {chopper_text}")
         self.__phase_label.config(text=f"Phase: current={status.current_phase:.3f} target={status.target_phase:.3f}")
+        if status.chopper_error or status.waveform_error:
+            self.__result_label.config(text=f"Hardware fault: {status.chopper_error or status.waveform_error}")
 
     def __periodic_refresh(self):
         if self.__run and self.__connected:
