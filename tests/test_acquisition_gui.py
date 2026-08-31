@@ -5,6 +5,7 @@ from chamber_ctl.data.acquisition_preview import AcquisitionPreview
 from chamber_ctl.gui.acquisition import (
     AcquisitionPreviewHistory,
     acquisition_control_state,
+    acquisition_pipeline_status,
     acquisition_status_detail,
     acquisition_status_metrics,
     decode_acquisition_status,
@@ -72,6 +73,48 @@ def test_acquisition_status_formats_live_metrics_and_transferred_snapshots() -> 
     assert acquisition_status_detail(status) == (
         "one-shot; 1 pulse report(s); 1 snapshot(s) transferred; 0 pending"
     )
+
+
+def test_pipeline_status_formats_mode_rate_queues_timings_and_fault() -> None:
+    status = {
+        "pipeline_metrics": {
+            "capture_mode": {
+                "requested": "auto",
+                "effective": "single-shot",
+                "fallback_reason": "AXI unavailable",
+            },
+            "counters": {"accepted": 192},
+            "elapsed_seconds": 2.0,
+            "queues": {
+                "capture": {"depth": 2, "capacity": 64, "high_water": 5},
+                "persistence": {"depth": 0, "capacity": 8, "high_water": 1},
+                "control": {"depth": 3, "capacity": 256, "high_water": 7},
+            },
+            "stages": {
+                "hardware_read": {"p95_ms": 0.25},
+                "analysis": {"p95_ms": 1.5},
+                "trigger_to_report": {"p95_ms": 2.75},
+            },
+            "terminal_error": "control queue overflow",
+        }
+    }
+
+    pipeline = acquisition_pipeline_status(status)
+
+    assert pipeline.mode == "single-shot (requested auto)"
+    assert pipeline.fallback == "AXI unavailable"
+    assert pipeline.accepted_rate == "96.0 Hz (192 total)"
+    assert pipeline.queues == (
+        "capture 2/64 (high 5) | persistence 0/8 (high 1) | control 3/256 (high 7)"
+    )
+    assert pipeline.timings == "read 0.25 ms | analysis 1.50 ms | trigger-report 2.75 ms"
+    assert pipeline.fault == "control queue overflow"
+
+
+def test_pipeline_status_is_backward_compatible_when_metrics_are_missing() -> None:
+    pipeline = acquisition_pipeline_status({"state": "idle"})
+
+    assert set(vars(pipeline).values()) == {"N/A"}
 
 
 def test_idle_status_keeps_the_last_diagnostic_transfer_summary_visible() -> None:

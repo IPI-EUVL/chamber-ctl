@@ -88,7 +88,13 @@ def test_acquisition_status_publishes_live_dose_and_zero_runtime() -> None:
     subsystem._timing_status = None
     subsystem._run = run
     subsystem._diagnostic = None
-    subsystem._board_status = {}
+    subsystem._board_status = {
+        "pipeline_metrics": {
+            "schema_version": 1,
+            "state": "active",
+            "counters": {"accepted": 12},
+        }
+    }
     subsystem._capture_client = object()
     subsystem._deferred_finalization_detail = None
     subsystem._diagnostic_error = None
@@ -105,6 +111,7 @@ def test_acquisition_status_publishes_live_dose_and_zero_runtime() -> None:
     cadence = decode_live_cadence(subsystem._cadence_publisher.value)
     assert status["accumulated_dose_mj_cm2"] == 2.5
     assert status["transmitting_runtime_seconds"] == 0.0
+    assert status["pipeline_metrics"]["counters"]["accepted"] == 12
     assert cadence.context == "exposure"
     assert cadence.run_id == run.run_id
 
@@ -715,6 +722,39 @@ def test_connection_loss_marks_a_running_diagnostic_failed() -> None:
     assert subsystem._capture_client is None
     assert len(failures) == 1
     assert "ConnectionError: link down" in failures[0]
+
+
+def test_capture_connection_polls_board_status_on_the_existing_client() -> None:
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem
+
+    class _Client:
+        def __init__(self) -> None:
+            self.commands = []
+
+        def heartbeat_if_due(self):
+            return False
+
+        def command(self, command):
+            self.commands.append(command)
+            return {
+                "source_kind": "red_pitaya",
+                "capabilities": {"pipeline_metrics": True},
+                "pipeline_metrics": {"schema_version": 1, "state": "active"},
+            }
+
+    capture_client = _Client()
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._capture_client = capture_client
+    subsystem._next_board_status_monotonic = 0.0
+    subsystem._board_status = {}
+    subsystem._run = None
+    subsystem._diagnostic = None
+
+    subsystem._maintain_capture_connection()
+
+    assert capture_client.commands == ["status"]
+    assert subsystem._board_status["pipeline_metrics"]["state"] == "active"
+    assert subsystem._next_board_status_monotonic > 0.0
 
 
 def test_errored_diagnostic_does_not_retry_queued_imports() -> None:

@@ -47,6 +47,16 @@ class AcquisitionControlState:
     recover_orphan_enabled: bool
 
 
+@dataclass(frozen=True)
+class AcquisitionPipelineStatus:
+    mode: str
+    fallback: str
+    accepted_rate: str
+    queues: str
+    timings: str
+    fault: str
+
+
 def decode_acquisition_status(payload) -> dict:
     raw = bytes(payload) if isinstance(payload, list) else payload
     if not isinstance(raw, bytes):
@@ -106,6 +116,95 @@ def acquisition_status_metrics(status: dict | None) -> tuple[str, str]:
     return (
         format_value("accumulated_dose_mj_cm2", "mJ/cm2"),
         format_value("transmitting_runtime_seconds", "s"),
+    )
+
+
+def acquisition_pipeline_status(status: dict | None) -> AcquisitionPipelineStatus:
+    unavailable = AcquisitionPipelineStatus("N/A", "N/A", "N/A", "N/A", "N/A", "N/A")
+    if not isinstance(status, dict):
+        return unavailable
+    metrics = status.get("pipeline_metrics")
+    if not isinstance(metrics, dict):
+        return unavailable
+
+    capture_mode = metrics.get("capture_mode")
+    if isinstance(capture_mode, dict):
+        requested = capture_mode.get("requested")
+        effective = capture_mode.get("effective")
+        fallback_reason = capture_mode.get("fallback_reason")
+    else:
+        requested = effective = fallback_reason = None
+    requested = requested.strip() if isinstance(requested, str) and requested.strip() else None
+    effective = effective.strip() if isinstance(effective, str) and effective.strip() else None
+    fallback_reason = (
+        fallback_reason.strip()
+        if isinstance(fallback_reason, str) and fallback_reason.strip()
+        else None
+    )
+    mode = effective or requested or "N/A"
+    if requested is not None and effective is not None and requested != effective:
+        mode = f"{effective} (requested {requested})"
+
+    counters = metrics.get("counters")
+    accepted = counters.get("accepted") if isinstance(counters, dict) else None
+    elapsed_seconds = metrics.get("elapsed_seconds")
+    accepted_rate = "N/A"
+    if (
+        isinstance(accepted, int)
+        and not isinstance(accepted, bool)
+        and accepted >= 0
+        and isinstance(elapsed_seconds, (int, float))
+        and not isinstance(elapsed_seconds, bool)
+        and math.isfinite(elapsed_seconds)
+        and elapsed_seconds > 0
+    ):
+        accepted_rate = f"{accepted / elapsed_seconds:.1f} Hz ({accepted} total)"
+
+    queues = metrics.get("queues")
+    queue_values = []
+    if isinstance(queues, dict):
+        ordered_names = [name for name in ("capture", "persistence", "control") if name in queues]
+        ordered_names.extend(sorted(set(queues) - set(ordered_names)))
+        for name in ordered_names:
+            value = queues.get(name)
+            if not isinstance(value, dict):
+                continue
+            depth = value.get("depth")
+            capacity = value.get("capacity")
+            high_water = value.get("high_water")
+            if all(isinstance(item, int) and not isinstance(item, bool) for item in (depth, capacity, high_water)):
+                queue_values.append(f"{name} {depth}/{capacity} (high {high_water})")
+
+    stages = metrics.get("stages")
+    timing_values = []
+    timing_names = (
+        ("hardware_read", "read"),
+        ("capture_queue_wait", "capture wait"),
+        ("analysis", "analysis"),
+        ("snapshot_write", "write"),
+        ("trigger_to_report", "trigger-report"),
+    )
+    if isinstance(stages, dict):
+        for stage_name, label in timing_names:
+            stage = stages.get(stage_name)
+            p95_ms = stage.get("p95_ms") if isinstance(stage, dict) else None
+            if (
+                isinstance(p95_ms, (int, float))
+                and not isinstance(p95_ms, bool)
+                and math.isfinite(p95_ms)
+                and p95_ms >= 0
+            ):
+                timing_values.append(f"{label} {p95_ms:.2f} ms")
+
+    terminal_error = metrics.get("terminal_error")
+    fault = terminal_error.strip() if isinstance(terminal_error, str) and terminal_error.strip() else "none"
+    return AcquisitionPipelineStatus(
+        mode=mode,
+        fallback=fallback_reason or "none",
+        accepted_rate=accepted_rate,
+        queues=" | ".join(queue_values) or "N/A",
+        timings=" | ".join(timing_values) or "N/A",
+        fault=fault,
     )
 
 
@@ -211,6 +310,12 @@ class AcquisitionGUI:
         self.__detail_text = tk.StringVar(value="Waiting for acquisition status.")
         self.__dose_text = tk.StringVar(value="Dose: N/A")
         self.__runtime_text = tk.StringVar(value="Transmitting time: N/A")
+        self.__pipeline_mode_text = tk.StringVar(value="Mode: N/A")
+        self.__pipeline_rate_text = tk.StringVar(value="Accepted: N/A")
+        self.__pipeline_queues_text = tk.StringVar(value="Queues: N/A")
+        self.__pipeline_timings_text = tk.StringVar(value="p95: N/A")
+        self.__pipeline_fallback_text = tk.StringVar(value="Fallback: N/A")
+        self.__pipeline_fault_text = tk.StringVar(value="Fault: N/A")
         self.__cadence_rate_text = tk.StringVar(value="Capture rate: N/A")
         self.__cadence_loss_text = tk.StringVar(value="Estimated lost: N/A")
         self.__cadence_total_text = tk.StringVar(value="Estimated missing: 0")
@@ -256,6 +361,16 @@ class AcquisitionGUI:
         metrics.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(3, 0))
         ttk.Label(metrics, textvariable=self.__dose_text).pack(side=tk.LEFT, padx=(0, 18))
         ttk.Label(metrics, textvariable=self.__runtime_text).pack(side=tk.LEFT)
+
+        pipeline = ttk.LabelFrame(status, text="Pipeline", padding=(6, 3))
+        pipeline.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(4, 0))
+        pipeline.columnconfigure(2, weight=1)
+        ttk.Label(pipeline, textvariable=self.__pipeline_mode_text).grid(row=0, column=0, sticky="w", padx=(0, 16))
+        ttk.Label(pipeline, textvariable=self.__pipeline_rate_text).grid(row=0, column=1, sticky="w", padx=(0, 16))
+        ttk.Label(pipeline, textvariable=self.__pipeline_queues_text).grid(row=0, column=2, sticky="w")
+        ttk.Label(pipeline, textvariable=self.__pipeline_timings_text).grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Label(pipeline, textvariable=self.__pipeline_fallback_text).grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 16))
+        ttk.Label(pipeline, textvariable=self.__pipeline_fault_text).grid(row=2, column=2, sticky="w")
 
         live_panes = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
         live_panes.grid(row=1, column=0, sticky="nsew")
@@ -710,6 +825,13 @@ class AcquisitionGUI:
         dose, runtime = acquisition_status_metrics(status)
         self.__dose_text.set(f"Dose: {dose}")
         self.__runtime_text.set(f"Transmitting time: {runtime}")
+        pipeline = acquisition_pipeline_status(status)
+        self.__pipeline_mode_text.set(f"Mode: {pipeline.mode}")
+        self.__pipeline_rate_text.set(f"Accepted: {pipeline.accepted_rate}")
+        self.__pipeline_queues_text.set(f"Queues: {pipeline.queues}")
+        self.__pipeline_timings_text.set(f"p95: {pipeline.timings}")
+        self.__pipeline_fallback_text.set(f"Fallback: {pipeline.fallback}")
+        self.__pipeline_fault_text.set(f"Fault: {pipeline.fault}")
 
         simulator = status.get("simulator")
         if isinstance(simulator, dict):

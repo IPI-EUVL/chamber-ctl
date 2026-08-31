@@ -168,6 +168,7 @@ class _DiagnosticCapture:
 
 class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
     STATUS_UPDATE_SECONDS = 0.1
+    BOARD_STATUS_UPDATE_SECONDS = 1.0
     STOP_QUIET_SECONDS = 0.5
     STOP_DRAIN_CAP_SECONDS = 5.0
     STOP_ACK_DELAY_SECONDS = 0.05
@@ -192,6 +193,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._artifact_importer: AcquisitionArtifactImporter | None = None
         self._temporary_directory: Path | None = None
         self._next_capture_connect_monotonic = 0.0
+        self._next_board_status_monotonic = 0.0
         self._board_status: dict = {}
         self._reader: ExperimentReader | None = None
         self._preinit_pending = False
@@ -1673,6 +1675,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             board_status = dict(self._board_status)
             capabilities = board_status.get("capabilities")
             simulator = board_status.get("simulator")
+            pipeline_metrics = board_status.get("pipeline_metrics")
             if run is None and diagnostic is None:
                 dose = 0.0
                 runtime = 0.0
@@ -1685,6 +1688,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     "source_id": board_status.get("source_id"),
                     "capabilities": capabilities,
                     "simulator": simulator,
+                    "pipeline_metrics": pipeline_metrics,
                     "last_sequence": None,
                     "clipped_pulse_count": 0,
                     "last_pulse_clipped": False,
@@ -1727,6 +1731,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     "source_id": run.source_id,
                     "capabilities": capabilities,
                     "simulator": simulator,
+                    "pipeline_metrics": pipeline_metrics,
                     "last_sequence": run.last_sequence,
                     "clipped_pulse_count": run.clipped_pulse_count,
                     "last_pulse_clipped": run.last_pulse_clipped,
@@ -1764,6 +1769,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     "source_id": diagnostic.source_id,
                     "capabilities": capabilities,
                     "simulator": simulator,
+                    "pipeline_metrics": pipeline_metrics,
                     "last_sequence": diagnostic.last_sequence,
                     "clipped_pulse_count": 0,
                     "last_pulse_clipped": False,
@@ -1902,6 +1908,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._artifact_importer = AcquisitionArtifactImporter(capture_client, self._temporary_directory)
         self._cache_board_status(initial_status)
         self._next_capture_connect_monotonic = 0.0
+        self._next_board_status_monotonic = time.monotonic() + self.BOARD_STATUS_UPDATE_SECONDS
         try:
             self._cleanup_stale_diagnostic_after_connect(initial_status)
         except Exception as exc:
@@ -1947,6 +1954,10 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 return
         try:
             capture_client.heartbeat_if_due()
+            now = time.monotonic()
+            if now >= getattr(self, "_next_board_status_monotonic", 0.0):
+                self._cache_board_status(capture_client.command("status"))
+                self._next_board_status_monotonic = now + self.BOARD_STATUS_UPDATE_SECONDS
         except Exception as exc:
             active_run = self._run is not None and not self._run.finalizing
             active_diagnostic = self._diagnostic is not None
@@ -1994,6 +2005,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._artifact_importer = None
         temporary_directory = getattr(self, "_temporary_directory", None)
         self._temporary_directory = None
+        self._next_board_status_monotonic = 0.0
         if temporary_directory is not None:
             shutil.rmtree(temporary_directory, ignore_errors=True)
 
