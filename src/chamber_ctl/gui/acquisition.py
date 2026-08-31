@@ -692,7 +692,12 @@ class AcquisitionGUI:
         self.__cadence_loss_text.set(
             "Estimated lost: N/A" if lost_rate is None else f"Estimated lost: {lost_rate:.2f}/s"
         )
-        self.__cadence_total_text.set(f"Estimated missing: {cadence.inferred_lost_count}")
+        omitted = (
+            ""
+            if cadence.omitted_gap_count == 0
+            else f" ({cadence.omitted_gap_count} live marker(s) omitted)"
+        )
+        self.__cadence_total_text.set(f"Estimated missing: {cadence.inferred_lost_count}{omitted}")
         self.__cadence_quality_text.set(f"Evidence: {cadence.quality.value.replace('_', '-')}")
 
     def __render_status(self, status: dict) -> None:

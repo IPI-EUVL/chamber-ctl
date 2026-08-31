@@ -6,6 +6,7 @@ from chamber_ctl.data.capture_cadence import (
     CadenceQuality,
     CaptureCadenceTracker,
     GapConfidence,
+    MAX_CADENCE_PAYLOAD_BYTES,
     PulseCadenceObservation,
     decode_live_cadence,
     infer_gap,
@@ -149,7 +150,7 @@ def test_live_payload_round_trips_relative_points_and_rejects_unknown_fields() -
     assert decoded.session_id == session_id
     assert decoded.points[-1].relative_seconds == 0.0
     assert decoded.gaps[0].estimated_lost_count == 2
-    invalid = snapshot.encode().replace(b'"schema_version":1', b'"schema_version":2')
+    invalid = snapshot.encode().replace(b'"schema_version":2', b'"schema_version":999')
     with pytest.raises(ValueError, match="Unsupported"):
         decode_live_cadence(invalid)
 
@@ -180,3 +181,25 @@ def test_disabling_inference_retains_expected_rate_and_evidence_quality() -> Non
 
     assert decoded.expected_rate_hz == 96.0
     assert decoded.quality is CadenceQuality.TIMESTAMP_INFERRED
+
+
+def test_dense_live_gaps_are_bounded_for_dds_while_totals_are_preserved() -> None:
+    session_id = uuid.uuid4()
+    tracker = CaptureCadenceTracker()
+    tracker.reset(session_id)
+    tracker.set_expected_rate(96.0)
+    for sequence in range(319):
+        timestamp_ns = sequence * 20_000_000
+        tracker.ingest(
+            _observation(session_id, sequence, timestamp_ns),
+            received_at_monotonic_ns=timestamp_ns,
+        )
+        tracker.snapshot(timestamp_ns)
+
+    payload = tracker.snapshot(6_380_000_000).encode(context="diagnostic")
+    decoded = decode_live_cadence(payload)
+
+    assert len(payload) <= MAX_CADENCE_PAYLOAD_BYTES < 65_536
+    assert decoded.inferred_lost_count == 318
+    assert decoded.omitted_gap_count > 0
+    assert len(decoded.gaps) + decoded.omitted_gap_count == 250

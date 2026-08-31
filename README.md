@@ -46,6 +46,12 @@ segments and are not counted as losses. The data model also accepts future
 trigger ordinals and counter epochs so counter hardware can replace inference
 without changing the surrounding UI contract.
 
+DDS carries only bounded live telemetry, capped at 60 KiB. Dense failure windows
+retain aggregate loss totals but may omit older on-screen gap markers; the GUI
+reports the omission count. Full post-exposure cadence data is transported as
+the HDF5 experiment resource rather than as a DDS blob. Cadence telemetry is
+best effort and a publication failure does not stop an active capture.
+
 Completed native exposures receive a strict `euv_capture_cadence.h5` resource.
 Its interactive Plotly view supports zoom, pan, and the same one-, two-, and
 three-second windows. Open it with **Open Last Exposure** in Capture Diagnostics

@@ -184,6 +184,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._diagnostic_error: str | None = None
         self._last_diagnostic_summary: dict | None = None
         self._last_cadence_payload: bytes | None = None
+        self._last_cadence_publish_error: str | None = None
         self._last_run_id: uuid.UUID | None = None
         self._control_requests: queue.Queue[_AcquisitionControlRequest] = queue.Queue()
         self._recovery_active = False
@@ -409,9 +410,15 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             run = getattr(self, "_run", None)
             diagnostic = getattr(self, "_diagnostic", None)
             if run is not None:
-                run.cadence.set_expected_rate(run.chopper_frequency_hz / 2.0 if status.triggers_enabled else None)
+                run.cadence.set_expected_rate(
+                    run.chopper_frequency_hz / 2.0
+                    if status.triggers_enabled and not run.finalizing and not run.release_pending
+                    else None
+                )
             if diagnostic is not None:
-                diagnostic.cadence.set_expected_rate(status.trigger_rate_hz)
+                diagnostic.cadence.set_expected_rate(
+                    status.trigger_rate_hz if diagnostic.state == "running" else None
+                )
             if run is not None and run.timing_stream is not None and not run.timing_stream_closed:
                 self._record_timing_state(run, status)
 
@@ -1199,6 +1206,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         with self._run_lock:
             diagnostic = self._require_diagnostic()
             snapshot_count = len(diagnostic.processed_snapshot_ids)
+            diagnostic.cadence.set_expected_rate(None)
             self._last_cadence_payload = diagnostic.cadence.snapshot().encode(context="diagnostic")
             self._last_diagnostic_summary = {
                 "mode": diagnostic.mode,
@@ -1237,6 +1245,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 return
             diagnostic.state = "error"
             diagnostic.terminal_error = detail
+            diagnostic.cadence.set_expected_rate(None)
             diagnostic.next_cleanup_attempt_monotonic = 0.0
             handles = tuple(diagnostic.completion_handles)
             diagnostic.completion_handles.clear()
@@ -1798,7 +1807,26 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             self._health_publisher.value = health.encode()
         cadence_publisher = getattr(self, "_cadence_publisher", None)
         if cadence_publisher is not None and cadence_payload is not None:
-            cadence_publisher.value = cadence_payload
+            self._publish_cadence_payload(cadence_payload)
+
+    def _publish_cadence_payload(self, payload: bytes) -> None:
+        cadence_publisher = getattr(self, "_cadence_publisher", None)
+        if cadence_publisher is None:
+            return
+        try:
+            cadence_publisher.value = payload
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            if detail != getattr(self, "_last_cadence_publish_error", None):
+                self._log(
+                    f"Could not publish live capture cadence telemetry: {detail}",
+                    level="ERROR",
+                    event="capture_cadence_publish_failed",
+                    payload_bytes=len(payload),
+                )
+            self._last_cadence_publish_error = detail
+        else:
+            self._last_cadence_publish_error = None
 
     def _refresh_cadence_rate(
         self,
@@ -1818,11 +1846,21 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         if run is not None:
             run.cadence.set_expected_rate(
                 run.chopper_frequency_hz / 2.0
-                if fresh and timing is not None and timing.triggers_enabled
+                if (
+                    fresh
+                    and timing is not None
+                    and timing.triggers_enabled
+                    and not run.finalizing
+                    and not run.release_pending
+                )
                 else None
             )
         if diagnostic is not None:
-            diagnostic.cadence.set_expected_rate(timing.trigger_rate_hz if fresh and timing is not None else None)
+            diagnostic.cadence.set_expected_rate(
+                timing.trigger_rate_hz
+                if fresh and timing is not None and diagnostic.state == "running"
+                else None
+            )
 
     def _request_exposure_stop(self, reason: str) -> None:
         if self._stop_requested or self._stop_exposure_event is None:

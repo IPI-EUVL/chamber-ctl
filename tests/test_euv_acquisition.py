@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from chamber_ctl.data.calibration import CalibrationProfile, CalibrationRepository
-from chamber_ctl.data.capture_cadence import decode_live_cadence
+from chamber_ctl.data.capture_cadence import PulseCadenceObservation, decode_live_cadence
 from chamber_ctl.subsystems.euv_acquisition_controller import (
     CALIBRATION_PROVENANCE_RESOURCE,
     CAPTURE_SESSION_RESOURCE,
@@ -130,6 +130,65 @@ def test_completed_diagnostic_retains_transferred_snapshot_summary() -> None:
         "report_count": 1,
         "snapshot_count": 1,
     }
+
+
+def test_errored_diagnostic_deactivates_provisional_cadence_inference() -> None:
+    import threading
+    import time
+
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem, _DiagnosticCapture
+
+    session_id = uuid.uuid4()
+    diagnostic = _DiagnosticCapture(
+        session_id,
+        "continuous",
+        "simulated",
+        "fixture",
+        0.0,
+        state="error",
+        terminal_error="transport failed",
+    )
+    diagnostic.cadence.set_expected_rate(96.0)
+    diagnostic.cadence.ingest(
+        PulseCadenceObservation(session_id, 0, 1, 1),
+        received_at_monotonic_ns=1,
+    )
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._timing_status_lock = threading.Lock()
+    subsystem._timing_status = LaserTimingState(True, False, True, False, 10.0, 0.0, 10.0, 192.0)
+    subsystem._timing_status_received_at = time.monotonic()
+
+    subsystem._refresh_cadence_rate(diagnostic=diagnostic)
+    snapshot = diagnostic.cadence.snapshot(60_000_000_001)
+
+    assert snapshot.points[-1].provisional_lost_count == 0
+    assert all(window.estimated_lost_per_second is None for window in snapshot.points[-1].windows)
+
+
+def test_cadence_publication_failure_does_not_fail_acquisition() -> None:
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem
+
+    class _FailingPublisher:
+        @property
+        def value(self):
+            return None
+
+        @value.setter
+        def value(self, _payload):
+            raise OverflowError("int too big to convert")
+
+    messages = []
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._cadence_publisher = _FailingPublisher()
+    subsystem._last_cadence_publish_error = None
+    subsystem._log = lambda message, **fields: messages.append((message, fields))
+
+    subsystem._publish_cadence_payload(b"cadence")
+    subsystem._publish_cadence_payload(b"cadence")
+
+    assert len(messages) == 1
+    assert messages[0][1]["event"] == "capture_cadence_publish_failed"
+    assert messages[0][1]["payload_bytes"] == 7
 
 
 def test_acquisition_timing_stream_records_initial_values_transitions_and_closure() -> None:

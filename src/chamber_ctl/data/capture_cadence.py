@@ -10,12 +10,13 @@ from typing import Iterable
 from uuid import UUID
 
 
-CADENCE_SCHEMA_VERSION = 1
+CADENCE_SCHEMA_VERSION = 2
 DEFAULT_DISPLAY_HORIZON_SECONDS = 5.0
 DEFAULT_ROLLING_WINDOW_SECONDS = 2.0
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 0.1
 ROLLING_WINDOW_OPTIONS_SECONDS = (1.0, 2.0, 3.0)
-MAX_CADENCE_PAYLOAD_BYTES = 262_144
+MAX_CADENCE_PAYLOAD_BYTES = 60 * 1024
+MAX_LIVE_CADENCE_GAP_MARKERS = 64
 
 
 class CadenceQuality(str, Enum):
@@ -154,6 +155,41 @@ class LiveCadenceSnapshot:
         if context != "exposure" and run_id is not None:
             raise ValueError("Only exposure cadence may include a run ID.")
         latest_ns = self.points[-1].sampled_at_monotonic_ns if self.points else 0
+        points = [
+            {
+                "relative_seconds": (point.sampled_at_monotonic_ns - latest_ns) / 1e9,
+                "expected_rate_hz": point.expected_rate_hz,
+                "quality": point.quality.value,
+                "provisional_lost_count": point.provisional_lost_count,
+                "windows": [
+                    {
+                        "window_seconds": window.window_seconds,
+                        "capture_rate_hz": window.capture_rate_hz,
+                        "estimated_lost_per_second": window.estimated_lost_per_second,
+                        "captured_count": window.captured_count,
+                        "estimated_lost_count": window.estimated_lost_count,
+                    }
+                    for window in point.windows
+                ],
+            }
+            for point in self.points
+        ]
+        gaps = [
+            {
+                "sequence_before": item.gap.sequence_before,
+                "sequence_after": item.gap.sequence_after,
+                "relative_seconds": (item.projected_monotonic_ns - latest_ns) / 1e9,
+                "interval_seconds": item.gap.interval_seconds,
+                "estimated_lost_count": item.gap.estimated_lost_count,
+                "residual_seconds": item.gap.residual_seconds,
+                "quality": item.gap.quality.value,
+                "confidence": item.gap.confidence.value,
+                "crosses_snapshot_boundary": item.gap.crosses_snapshot_boundary,
+            }
+            for item in self.gaps
+            if item.gap.estimated_lost_count > 0
+        ]
+        displayed_gaps = gaps[-MAX_LIVE_CADENCE_GAP_MARKERS:]
         value = {
             "schema_version": CADENCE_SCHEMA_VERSION,
             "context": context,
@@ -167,45 +203,19 @@ class LiveCadenceSnapshot:
             "captured_count": self.captured_count,
             "inferred_lost_count": self.inferred_lost_count,
             "ambiguous_gap_count": self.ambiguous_gap_count,
-            "points": [
-                {
-                    "relative_seconds": (point.sampled_at_monotonic_ns - latest_ns) / 1e9,
-                    "expected_rate_hz": point.expected_rate_hz,
-                    "quality": point.quality.value,
-                    "provisional_lost_count": point.provisional_lost_count,
-                    "windows": [
-                        {
-                            "window_seconds": window.window_seconds,
-                            "capture_rate_hz": window.capture_rate_hz,
-                            "estimated_lost_per_second": window.estimated_lost_per_second,
-                            "captured_count": window.captured_count,
-                            "estimated_lost_count": window.estimated_lost_count,
-                        }
-                        for window in point.windows
-                    ],
-                }
-                for point in self.points
-            ],
-            "gaps": [
-                {
-                    "sequence_before": item.gap.sequence_before,
-                    "sequence_after": item.gap.sequence_after,
-                    "relative_seconds": (item.projected_monotonic_ns - latest_ns) / 1e9,
-                    "interval_seconds": item.gap.interval_seconds,
-                    "estimated_lost_count": item.gap.estimated_lost_count,
-                    "residual_seconds": item.gap.residual_seconds,
-                    "quality": item.gap.quality.value,
-                    "confidence": item.gap.confidence.value,
-                    "crosses_snapshot_boundary": item.gap.crosses_snapshot_boundary,
-                }
-                for item in self.gaps
-                if item.gap.estimated_lost_count > 0
-            ],
+            "omitted_gap_count": len(gaps) - len(displayed_gaps),
+            "points": points,
+            "gaps": displayed_gaps,
         }
-        payload = json.dumps(value, allow_nan=False, separators=(",", ":")).encode("utf-8")
-        if len(payload) > MAX_CADENCE_PAYLOAD_BYTES:
-            raise ValueError("Live cadence payload exceeds its maximum encoded size.")
-        return payload
+        while True:
+            payload = json.dumps(value, allow_nan=False, separators=(",", ":")).encode("utf-8")
+            if len(payload) <= MAX_CADENCE_PAYLOAD_BYTES:
+                return payload
+            if not displayed_gaps:
+                raise ValueError("Live cadence points exceed the DDS telemetry budget.")
+            displayed_gaps = displayed_gaps[max(1, len(displayed_gaps) // 2):]
+            value["gaps"] = displayed_gaps
+            value["omitted_gap_count"] = len(gaps) - len(displayed_gaps)
 
 @dataclass(frozen=True)
 class DecodedCadencePoint:
@@ -242,6 +252,7 @@ class DecodedLiveCadence:
     captured_count: int
     inferred_lost_count: int
     ambiguous_gap_count: int
+    omitted_gap_count: int
     points: tuple[DecodedCadencePoint, ...]
     gaps: tuple[DecodedCadenceGap, ...]
 
@@ -253,7 +264,7 @@ def decode_live_cadence(payload: bytes) -> DecodedLiveCadence:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Live cadence payload must be UTF-8 JSON.") from exc
-    expected = {
+    base_fields = {
         "schema_version",
         "context",
         "run_id",
@@ -269,7 +280,11 @@ def decode_live_cadence(payload: bytes) -> DecodedLiveCadence:
         "points",
         "gaps",
     }
-    if not isinstance(value, dict) or set(value) != expected or value["schema_version"] != CADENCE_SCHEMA_VERSION:
+    if not isinstance(value, dict):
+        raise ValueError("Unsupported live cadence payload schema.")
+    schema_version = value.get("schema_version")
+    expected = base_fields if schema_version == 1 else base_fields | {"omitted_gap_count"}
+    if schema_version not in {1, CADENCE_SCHEMA_VERSION} or set(value) != expected:
         raise ValueError("Unsupported live cadence payload schema.")
     context = value["context"]
     if context not in {None, "exposure", "diagnostic"}:
@@ -293,7 +308,8 @@ def decode_live_cadence(payload: bytes) -> DecodedLiveCadence:
     gaps_value = value["gaps"]
     if not isinstance(points_value, list) or len(points_value) > 100:
         raise ValueError("Live cadence points must be a bounded list.")
-    if not isinstance(gaps_value, list) or len(gaps_value) > 100:
+    gap_limit = 100 if schema_version == 1 else MAX_LIVE_CADENCE_GAP_MARKERS
+    if not isinstance(gaps_value, list) or len(gaps_value) > gap_limit:
         raise ValueError("Live cadence gaps must be a bounded list.")
 
     points = tuple(_decode_point(item, options) for item in points_value)
@@ -315,6 +331,11 @@ def decode_live_cadence(payload: bytes) -> DecodedLiveCadence:
         captured_count=_non_negative_integer("captured_count", value["captured_count"]),
         inferred_lost_count=_non_negative_integer("inferred_lost_count", value["inferred_lost_count"]),
         ambiguous_gap_count=_non_negative_integer("ambiguous_gap_count", value["ambiguous_gap_count"]),
+        omitted_gap_count=(
+            0
+            if schema_version == 1
+            else _non_negative_integer("omitted_gap_count", value["omitted_gap_count"])
+        ),
         points=points,
         gaps=gaps,
     )
