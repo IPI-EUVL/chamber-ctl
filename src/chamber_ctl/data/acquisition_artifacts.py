@@ -17,7 +17,36 @@ class AcquisitionArtifactImporter:
         self.client = client
         self._temporary_directory = None if temporary_directory is None else Path(temporary_directory)
 
-    def import_snapshot(self, record, manifest, *, before_ack: Callable[[object], None] | None = None) -> Path:
+    def import_snapshot(
+        self,
+        record,
+        manifest,
+        *,
+        before_ack: Callable[[object], None] | None = None,
+        after_persist: Callable[[object, Path], None] | None = None,
+    ) -> Path:
+        local_path = self.fetch_verified_snapshot(manifest)
+
+        entry = record.get_record() if hasattr(record, "get_record") else record
+        try:
+            with entry.resource(manifest.filename, HDF5_SNAPSHOT_RESOURCE_TYPE, "wb") as output:
+                with local_path.open("rb") as source:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+        except Exception as exc:
+            raise ArtifactImportError(f"Failed to write snapshot {manifest.snapshot_id} into the experiment record: {exc}") from exc
+        if before_ack is not None:
+            try:
+                before_ack(entry)
+            except Exception as exc:
+                raise ArtifactImportError(
+                    f"Snapshot {manifest.snapshot_id} was written but its capture timeline could not be persisted: {exc}"
+                ) from exc
+        if after_persist is not None:
+            after_persist(entry, local_path)
+        self.acknowledge_snapshot(manifest)
+        return local_path
+
+    def fetch_verified_snapshot(self, manifest) -> Path:
         from euv_acquisition.snapshot import read_snapshot
 
         destination = self._destination_directory()
@@ -34,26 +63,13 @@ class AcquisitionArtifactImporter:
             raise ArtifactImportError(f"Transferred snapshot {manifest.snapshot_id} failed HDF5 validation: {exc}") from exc
         if contents.snapshot_id != manifest.snapshot_id or contents.session_id != manifest.session_id:
             raise ArtifactImportError(f"Transferred snapshot {manifest.snapshot_id} has mismatched identity.")
+        return local_path
 
-        entry = record.get_record() if hasattr(record, "get_record") else record
-        try:
-            with entry.resource(manifest.filename, HDF5_SNAPSHOT_RESOURCE_TYPE, "wb") as output:
-                with local_path.open("rb") as source:
-                    shutil.copyfileobj(source, output, length=1024 * 1024)
-        except Exception as exc:
-            raise ArtifactImportError(f"Failed to write snapshot {manifest.snapshot_id} into the experiment record: {exc}") from exc
-        if before_ack is not None:
-            try:
-                before_ack(entry)
-            except Exception as exc:
-                raise ArtifactImportError(
-                    f"Snapshot {manifest.snapshot_id} was written but its capture timeline could not be persisted: {exc}"
-                ) from exc
+    def acknowledge_snapshot(self, manifest) -> None:
         try:
             self.client.command("acknowledge_snapshot", {"snapshot_id": str(manifest.snapshot_id)})
         except Exception as exc:
             raise ArtifactImportError(f"Snapshot {manifest.snapshot_id} was written but acknowledgement failed: {exc}") from exc
-        return local_path
 
     def _destination_directory(self) -> Path:
         if self._temporary_directory is None:

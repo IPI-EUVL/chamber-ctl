@@ -9,6 +9,7 @@ import time
 from chamber_ctl import ECS_IP
 from chamber_ctl.gui.experiments_gui import ExperimentsGUI
 from chamber_ctl.gui.exposure_controller import ExposureControllerGUI
+from chamber_ctl.gui.acquisition import AcquisitionGUI
 from chamber_ctl.gui.batch_controller import BatchControllerGUI
 from chamber_ctl.gui.laser_sync import LaserSyncTestGUI
 from chamber_ctl.gui.settings_presets import SettingsPresetsGUI
@@ -298,6 +299,7 @@ class CentralGUI:
 	def __build_tabs(self):
 		self.__build_experiments_tab()
 		self.__build_exposure_tab()
+		self.__build_acquisition_tab()
 		self.__build_batch_tab()
 		self.__build_settings_presets_tab()
 		self.__build_laser_sync_tab()
@@ -668,6 +670,15 @@ class CentralGUI:
 			self.__register_component("Exposure Controller", comp, "close")
 		except Exception as exc:
 			self.__add_error_content(tab, "Exposure Controller", exc)
+
+	def __build_acquisition_tab(self):
+		tab = ttk.Frame(self.__notebook)
+		self.__notebook.add(tab, text="Acquisition")
+		try:
+			comp = AcquisitionGUI(tab, own_window=False)
+			self.__register_component("Acquisition", comp, "close")
+		except Exception as exc:
+			self.__add_error_content(tab, "Acquisition", exc)
 
 	def __build_batch_tab(self):
 		tab = ttk.Frame(self.__notebook)

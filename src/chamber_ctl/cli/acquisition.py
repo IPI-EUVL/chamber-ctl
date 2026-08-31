@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 import time
 import uuid
@@ -23,6 +24,32 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     recover.add_argument("--confirm", action="store_true", help="Required acknowledgement before artifacts can be imported and released.")
     recover.add_argument("--timeout-seconds", type=float, default=120.0)
     recover.set_defaults(func=main)
+
+    test_start = commands.add_parser("test-start", help="Start continuous diagnostic acquisition.")
+    test_start.add_argument("--timeout-seconds", type=float, default=15.0)
+    test_start.set_defaults(func=main)
+
+    one_shot = commands.add_parser("test-one-shot", help="Capture and publish one diagnostic pulse window.")
+    one_shot.add_argument("--timeout-seconds", type=float, default=30.0)
+    one_shot.set_defaults(func=main)
+
+    test_flush = commands.add_parser("test-flush", help="Publish the current continuous diagnostic window.")
+    test_flush.add_argument("--timeout-seconds", type=float, default=15.0)
+    test_flush.set_defaults(func=main)
+
+    test_stop = commands.add_parser("test-stop", help="Stop continuous diagnostic acquisition and clean its artifacts.")
+    test_stop.add_argument("--timeout-seconds", type=float, default=30.0)
+    test_stop.set_defaults(func=main)
+
+    simulator_set = commands.add_parser("simulator-set", help="Set a remote acquisition simulator input.")
+    simulator_set.add_argument("name", choices=("laser_enabled", "chopper_enabled", "pll_locked"))
+    simulator_set.add_argument("state", choices=("on", "off"))
+    simulator_set.add_argument("--timeout-seconds", type=float, default=15.0)
+    simulator_set.set_defaults(func=main)
+
+    simulator_restore = commands.add_parser("simulator-restore", help="Restore all remote acquisition simulator inputs.")
+    simulator_restore.add_argument("--timeout-seconds", type=float, default=15.0)
+    simulator_restore.set_defaults(func=main)
 
 
 def _call_acquisition_event(event_name: bytes, payload: bytes, timeout_seconds: float) -> str:
@@ -67,5 +94,24 @@ def main(args: argparse.Namespace) -> int:
         if not args.confirm:
             raise ValueError("recover-orphan requires --confirm.")
         print(_call_acquisition_event(b"recover_orphaned_capture_session", b"confirm", args.timeout_seconds))
+        return 0
+    diagnostic_events = {
+        "test-start": b"acquisition_test_start",
+        "test-one-shot": b"acquisition_test_one_shot",
+        "test-flush": b"acquisition_test_flush",
+        "test-stop": b"acquisition_test_stop",
+    }
+    if args.acquisition_command in diagnostic_events:
+        print(_call_acquisition_event(diagnostic_events[args.acquisition_command], bytes(), args.timeout_seconds))
+        return 0
+    if args.acquisition_command == "simulator-set":
+        payload = json.dumps(
+            {"name": args.name, "enabled": args.state == "on"},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        print(_call_acquisition_event(b"set_acquisition_simulator_control", payload, args.timeout_seconds))
+        return 0
+    if args.acquisition_command == "simulator-restore":
+        print(_call_acquisition_event(b"restore_acquisition_simulator_controls", bytes(), args.timeout_seconds))
         return 0
     raise ValueError(f"Unknown acquisition command {args.acquisition_command!r}.")

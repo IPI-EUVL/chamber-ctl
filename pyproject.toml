@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ipi-chamber-ctl"
-version = "0.1.1"
+version = "0.1.2"
 description = "IPI EUVL chamber control system"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ dependencies = [
   "prompt_toolkit>=3.0",
   "numpy>=2.4.0",
   "h5py>=3.11",
-  "ipi-euv-acquisition>=0.1.2",
+  "ipi-euv-acquisition>=0.1.4",
   "portalocker>=4.1,<5",
   "pyvisa>=1.16.0",
   "scipy>=1.17.0"

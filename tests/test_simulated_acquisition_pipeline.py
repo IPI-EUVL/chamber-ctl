@@ -5,6 +5,7 @@ from collections import deque
 import numpy as np
 
 from chamber_ctl.data.acquisition_artifacts import AcquisitionArtifactImporter
+from chamber_ctl.data.acquisition_preview import AcquisitionPreview
 from chamber_ctl.data.acquisition_runtime import LiveDoseAccumulator
 from chamber_ctl.data.calibration import CalibrationProfile
 from chamber_ctl.data.dose_analysis import DoseAnalysisResult, DoseAnalysisRevision, analyze_hdf5_snapshot, write_analysis_revision
@@ -170,3 +171,89 @@ def test_orphaned_session_recovery_imports_reconciles_and_releases_spool(tmp_pat
         reader.close()
         server.close()
         library.close()
+
+
+def test_one_shot_diagnostic_publishes_preview_and_cleans_both_hosts(tmp_path, monkeypatch) -> None:
+    from chamber_ctl.subsystems.euv_acquisition_controller import _DiagnosticCapture
+
+    class _Publisher:
+        def __init__(self) -> None:
+            self.values = []
+
+        @property
+        def value(self):
+            return self.values[-1] if self.values else None
+
+        @value.setter
+        def value(self, payload):
+            self.values.append(payload)
+
+    class _Handle:
+        def __init__(self) -> None:
+            self.returned = []
+            self.failed = []
+
+        def feedback(self, _value) -> None:
+            pass
+
+        def ret(self, value) -> None:
+            self.returned.append(value)
+
+        def fail(self, value) -> None:
+            self.failed.append(value)
+
+    spool_path = tmp_path / "diagnostic-spool"
+    source = _QueuePulseSource()
+    source._timestamps = deque((1,))
+    store = SnapshotStore(spool_path)
+    spool = SpoolRepository(spool_path)
+    engine = CaptureEngine(
+        source,
+        store,
+        spool,
+        source_kind="simulated",
+        source_id="diagnostic-pipeline",
+        rotation=RotationConfig(pulse_limit=10, trigger_idle_seconds=100.0),
+    )
+    server = AcquisitionServer(engine, ServiceConfig(control_port=0, artifact_port=0, capture_poll_seconds=0.001))
+    server.start()
+    publisher = _Publisher()
+    handle = _Handle()
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._run_lock = __import__("threading").RLock()
+    subsystem._run = None
+    subsystem._diagnostic = None
+    subsystem._diagnostic_start_pending = True
+    subsystem._diagnostic_error = None
+    subsystem._capture_client = None
+    subsystem._artifact_importer = None
+    subsystem._temporary_directory = None
+    subsystem._next_capture_connect_monotonic = 0.0
+    subsystem._board_status = {}
+    subsystem._preview_publisher = publisher
+    subsystem._log = lambda *_args, **_kwargs: None
+    try:
+        monkeypatch.setenv("EUV_ACQUISITION_HOST", server.control_address[0])
+        monkeypatch.setenv("EUV_ACQUISITION_CONTROL_PORT", str(server.control_address[1]))
+        monkeypatch.setenv("EUV_ACQUISITION_ARTIFACT_PORT", str(server.artifact_address[1]))
+
+        assert subsystem._start_diagnostic("one_shot", handle) is None
+        assert isinstance(subsystem._diagnostic, _DiagnosticCapture)
+        deadline = time.monotonic() + 2.0
+        while subsystem._diagnostic is not None and time.monotonic() < deadline:
+            subsystem._consume_capture_events()
+            subsystem._advance_diagnostic()
+            time.sleep(0.01)
+
+        assert subsystem._diagnostic is None
+        assert handle.failed == []
+        assert handle.returned
+        assert spool.load() is None
+        assert len(publisher.values) == 1
+        preview = AcquisitionPreview.decode(publisher.values[0])
+        assert preview.context == "diagnostic"
+        assert preview.source_id == "diagnostic-pipeline"
+        assert not list(subsystem._temporary_directory.glob("*.h5"))
+    finally:
+        subsystem._close_capture_client()
+        server.close()

@@ -1,13 +1,6 @@
-import random
-import time, struct, os, signal, re, sys, threading, numpy as np
-import uuid
-from datetime import date
-from pyvisa import ResourceManager, errors as visa_errors
-import socket
-import csv
-import queue
-import math
+import time
 import tkinter as tk
+
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
@@ -17,12 +10,9 @@ from matplotlib import colors as mpl_colors
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.ticker import FuncFormatter
 
-from datetime import datetime
-
 from ipi_ecs.core.daemon import StopFlag, Daemon
-from ipi_ecs.core.tcp import TCPClientSocket
 
-from chamber_ctl.subsystems.oscilloscope import OscilloscopeStream, DummyOscilloscope, ScopeReader
+from chamber_ctl.subsystems.oscilloscope import OscilloscopeStream, ScopeReader
 
 class PhosphorScopeTk:
     def __init__(
@@ -45,6 +35,8 @@ class PhosphorScopeTk:
 
         self.buf = np.zeros((self.h, self.w), dtype=np.float32)
         self.paused = False
+        self._closed = False
+        self._after_job = None
 
         self.fig = Figure(figsize=(9, 4.5), dpi=100)
         self.fig.patch.set_facecolor("black")
@@ -98,6 +90,17 @@ class PhosphorScopeTk:
         self.im.set_data(self.buf)
         self.canvas.draw_idle()
 
+    def set_time_limits(self, tlim):
+        tmin, tmax = (float(value) for value in tlim)
+        if not np.isfinite([tmin, tmax]).all() or tmin >= tmax:
+            raise ValueError("Time limits must be finite and increasing.")
+        if (tmin, tmax) == (self.tmin, self.tmax):
+            return
+        self.tmin, self.tmax = tmin, tmax
+        self.im.set_extent([self.tmin, self.tmax, self.vmin, self.vmax])
+        self.ax.set_xlim(self.tmin, self.tmax)
+        self.clear()
+
     @staticmethod
     def _normalize_pulses(arr: np.ndarray) -> np.ndarray:
         """
@@ -124,6 +127,8 @@ class PhosphorScopeTk:
         Add pulse batch into phosphor buffer.
         pulses shape: (P,N,2) preferred.
         """
+        if self._closed:
+            return
         p = self._normalize_pulses(pulses)
         t = p[:, :, 0]
         v = p[:, :, 1]
@@ -157,8 +162,23 @@ class PhosphorScopeTk:
             self.canvas.draw_idle()
 
     def _schedule(self):
+        if self._closed:
+            return
         self._tick_render()
-        self.master.after(self.update_ms, self._schedule)
+        if not self._closed:
+            self._after_job = self.master.after(self.update_ms, self._schedule)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        after_job = self._after_job
+        self._after_job = None
+        if after_job is not None:
+            try:
+                self.master.after_cancel(after_job)
+            except tk.TclError:
+                pass
 
     def _make_demo_batch(self, num_pulses=8, num_points=800):
         """

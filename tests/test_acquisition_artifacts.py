@@ -95,3 +95,27 @@ def test_importer_persists_timeline_before_acknowledging_source(tmp_path) -> Non
         assert client.acknowledged == [str(manifest.snapshot_id)]
     finally:
         library.close()
+
+
+def test_importer_exposes_verified_persisted_file_before_acknowledgement(tmp_path) -> None:
+    store, manifest = _manifest(tmp_path)
+    records_path = tmp_path / "records"
+    records_path.mkdir()
+    library = Library(records_path)
+    entry = library.create_entry("Exposure", "Fixture")
+    client = _Client(store, manifest)
+    observed = []
+    importer = AcquisitionArtifactImporter(client, tmp_path / "received")
+    try:
+        importer.import_snapshot(
+            entry,
+            manifest,
+            after_persist=lambda persisted, path: observed.append(
+                (path.is_file(), manifest.filename in dict(persisted.list_resources()), list(client.acknowledged))
+            ),
+        )
+
+        assert observed == [(True, True, [])]
+        assert client.acknowledged == [str(manifest.snapshot_id)]
+    finally:
+        library.close()
