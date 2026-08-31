@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from chamber_ctl.data.calibration import CalibrationProfile, CalibrationRepository
+from chamber_ctl.data.capture_cadence import decode_live_cadence
 from chamber_ctl.subsystems.euv_acquisition_controller import (
     CALIBRATION_PROVENANCE_RESOURCE,
     CAPTURE_SESSION_RESOURCE,
@@ -96,12 +97,16 @@ def test_acquisition_status_publishes_live_dose_and_zero_runtime() -> None:
     subsystem._time_publisher = _Publisher()
     subsystem._status_publisher = _Publisher()
     subsystem._health_publisher = _Publisher()
+    subsystem._cadence_publisher = _Publisher()
 
     subsystem._publish_values()
 
     status = json.loads(subsystem._status_publisher.value)
+    cadence = decode_live_cadence(subsystem._cadence_publisher.value)
     assert status["accumulated_dose_mj_cm2"] == 2.5
     assert status["transmitting_runtime_seconds"] == 0.0
+    assert cadence.context == "exposure"
+    assert cadence.run_id == run.run_id
 
 
 def test_completed_diagnostic_retains_transferred_snapshot_summary() -> None:

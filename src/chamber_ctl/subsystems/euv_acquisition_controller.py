@@ -32,6 +32,8 @@ import segment_bytes
 from chamber_ctl.data.acquisition_artifacts import AcquisitionArtifactImporter
 from chamber_ctl.data.acquisition_preview import build_acquisition_preview
 from chamber_ctl.data.acquisition_runtime import LiveDoseAccumulator, PulseSequenceGap
+from chamber_ctl.data.capture_cadence import CaptureCadenceTracker, observation_from_report
+from chamber_ctl.data.capture_cadence_graph import ensure_capture_cadence_graph
 from chamber_ctl.data.calibration import CalibrationProfile, CalibrationRepository
 from chamber_ctl.data.dose_analysis import (
     CaptureTimelinePoint,
@@ -107,6 +109,7 @@ class _AcquisitionRun:
     target_time: float | None
     chopper_frequency_hz: float
     accumulator: LiveDoseAccumulator
+    cadence: CaptureCadenceTracker = field(default_factory=CaptureCadenceTracker)
     session_id: uuid.UUID | None = None
     imported_snapshot_ids: set[uuid.UUID] = field(default_factory=set)
     finalizing: bool = False
@@ -150,6 +153,7 @@ class _DiagnosticCapture:
     source_kind: str
     source_id: str
     started_monotonic: float
+    cadence: CaptureCadenceTracker = field(default_factory=CaptureCadenceTracker)
     state: str = "running"
     report_count: int = 0
     last_sequence: int | None = None
@@ -179,6 +183,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._diagnostic_start_pending = False
         self._diagnostic_error: str | None = None
         self._last_diagnostic_summary: dict | None = None
+        self._last_cadence_payload: bytes | None = None
+        self._last_run_id: uuid.UUID | None = None
         self._control_requests: queue.Queue[_AcquisitionControlRequest] = queue.Queue()
         self._recovery_active = False
         self._capture_client: AcquisitionClient | None = None
@@ -202,6 +208,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._time_publisher = None
         self._segment_publisher = None
         self._preview_publisher = None
+        self._cadence_publisher = None
         self._status_publisher = None
         self._health_publisher = None
         self._timing_status_kv = None
@@ -249,11 +256,13 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._time_publisher = handle.get_kv_property(b"cur_time", False, True, True)
         self._segment_publisher = handle.get_kv_property(b"new_segment", False, True, True)
         self._preview_publisher = handle.get_kv_property(b"acquisition_preview", False, True, True)
+        self._cadence_publisher = handle.get_kv_property(b"acquisition_cadence", False, True, True)
         self._status_publisher = handle.get_kv_property(b"acquisition_status", False, True, True)
         self._health_publisher = handle.get_kv_property(b"acquisition_health", False, True, True)
         self._dose_publisher.set_type(types.FloatTypeSpecifier())
         self._time_publisher.set_type(types.FloatTypeSpecifier())
         self._preview_publisher.set_type(types.ByteTypeSpecifier())
+        self._cadence_publisher.set_type(types.ByteTypeSpecifier())
         self._status_publisher.set_type(types.ByteTypeSpecifier())
         self._health_publisher.set_type(types.ByteTypeSpecifier())
         self._timing_status_kv = handle.add_remote_kv(
@@ -397,7 +406,12 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         if run_lock is None:
             return
         with run_lock:
-            run = self._run
+            run = getattr(self, "_run", None)
+            diagnostic = getattr(self, "_diagnostic", None)
+            if run is not None:
+                run.cadence.set_expected_rate(run.chopper_frequency_hz / 2.0 if status.triggers_enabled else None)
+            if diagnostic is not None:
+                diagnostic.cadence.set_expected_rate(status.trigger_rate_hz)
             if run is not None and run.timing_stream is not None and not run.timing_stream_closed:
                 self._record_timing_state(run, status)
 
@@ -525,13 +539,34 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 event="exposure_graph_generation_failed",
                 run_id=str(run_id),
             )
-            return
-        self._log(
-            f"Persisted exposure graph {result.status} after {context}.",
-            event="exposure_graph_generation_completed",
-            run_id=str(run_id),
-            status=result.status,
-        )
+        else:
+            self._log(
+                f"Persisted exposure graph {result.status} after {context}.",
+                event="exposure_graph_generation_completed",
+                run_id=str(run_id),
+                status=result.status,
+            )
+        try:
+            cadence_result = ensure_capture_cadence_graph(
+                run_id,
+                entry,
+                self._data_path,
+                allow_incomplete=True,
+            )
+        except Exception as exc:
+            self._log(
+                f"Could not generate persisted capture cadence after {context}: {type(exc).__name__}: {exc}",
+                level="ERROR",
+                event="capture_cadence_generation_failed",
+                run_id=str(run_id),
+            )
+        else:
+            self._log(
+                f"Persisted capture cadence {cadence_result.status} after {context}.",
+                event="capture_cadence_generation_completed",
+                run_id=str(run_id),
+                status=cadence_result.status,
+            )
 
     def _can_start(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
         self._log("Checking whether EUV acquisition can start.", level="DEBUG", event="acquisition_start_check", run_id=str(state.get_uuid()))
@@ -621,6 +656,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                         self._log(f"Best-effort digitizer cleanup after preinit failure also failed: {type(stop_exc).__name__}: {stop_exc}", level="ERROR", event="capture_preinit_cleanup_failed", run_id=str(run.run_id))
                 return False, f"Unable to start digitizer capture: {exc}".encode("utf-8")
             run.session_id = session_id
+            run.cadence.reset(session_id)
+            self._refresh_cadence_rate(run=run)
             self._open_timing_event_stream(run)
             self._log("Digitizer capture preinitialization completed.", event="capture_preinit_completed", run_id=str(run.run_id), session_id=str(session_id), source_kind=run.source_kind, source_id=run.source_id)
             self._preinit_pending = True
@@ -829,6 +866,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             source_id=session.source_id,
             started_monotonic=started_monotonic,
         )
+        diagnostic.cadence.reset(session_id)
+        self._refresh_cadence_rate(diagnostic=diagnostic)
         if mode == "one_shot":
             diagnostic.completion_handles.append(handle)
         with self._run_lock:
@@ -864,6 +903,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             state="error",
             terminal_error=detail,
         )
+        diagnostic.cadence.reset(session_id)
+        self._refresh_cadence_rate(diagnostic=diagnostic)
         with self._run_lock:
             self._diagnostic = diagnostic
             self._diagnostic_start_pending = False
@@ -1060,6 +1101,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 diagnostic.pending_snapshots.pop(manifest.snapshot_id, None)
             elif manifest.snapshot_id not in diagnostic.processed_snapshot_ids:
                 diagnostic.pending_snapshots[manifest.snapshot_id] = manifest
+                diagnostic.cadence.mark_snapshot_boundary(manifest.final_sequence)
 
     def _import_pending_diagnostic_snapshots(self) -> None:
         with self._run_lock:
@@ -1157,6 +1199,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         with self._run_lock:
             diagnostic = self._require_diagnostic()
             snapshot_count = len(diagnostic.processed_snapshot_ids)
+            self._last_cadence_payload = diagnostic.cadence.snapshot().encode(context="diagnostic")
             self._last_diagnostic_summary = {
                 "mode": diagnostic.mode,
                 "report_count": diagnostic.report_count,
@@ -1258,6 +1301,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     run = self._require_run()
                     if manifest.snapshot_id not in run.imported_snapshot_ids:
                         run.pending_snapshots[manifest.snapshot_id] = manifest
+                        run.cadence.mark_snapshot_boundary(manifest.final_sequence)
             except Exception as exc:
                 self._request_exposure_stop(str(exc))
         self._import_pending_snapshots()
@@ -1274,6 +1318,10 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     raise RuntimeError("Diagnostic pulse report belongs to another capture session.")
                 if diagnostic.last_sequence is not None and report.sequence <= diagnostic.last_sequence:
                     raise RuntimeError("Diagnostic pulse reports are out of order.")
+                diagnostic.cadence.ingest(
+                    observation_from_report(report),
+                    received_at_monotonic_ns=time.monotonic_ns(),
+                )
                 diagnostic.last_sequence = report.sequence
                 diagnostic.report_count += 1
         while True:
@@ -1287,6 +1335,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     raise RuntimeError("Diagnostic snapshot belongs to another capture session.")
                 if manifest.snapshot_id not in diagnostic.processed_snapshot_ids:
                     diagnostic.pending_snapshots[manifest.snapshot_id] = manifest
+                    diagnostic.cadence.mark_snapshot_boundary(manifest.final_sequence)
         while True:
             try:
                 reason = capture_client.get_stop_reason(timeout=0)
@@ -1319,6 +1368,10 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             update = run.accumulator.ingest(report)
             if not update.accepted:
                 return
+            run.cadence.ingest(
+                observation_from_report(report),
+                received_at_monotonic_ns=time.monotonic_ns(),
+            )
             if run.last_report_monotonic_ns is None or report.captured_at_monotonic_ns - run.last_report_monotonic_ns > 250_000_000:
                 run.consecutive_timed_pulses = 1
             else:
@@ -1462,6 +1515,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 for snapshot in stored:
                     if snapshot.manifest.snapshot_id not in run.imported_snapshot_ids:
                         run.pending_snapshots[snapshot.manifest.snapshot_id] = snapshot.manifest
+                        run.cadence.mark_snapshot_boundary(snapshot.manifest.final_sequence)
                 if run.pending_snapshots:
                     self._set_finalization_status(
                         run,
@@ -1584,6 +1638,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 self._run = None
                 return
             self._log("Released digitizer spool after stopped exposure.", event="capture_release_completed", run_id=str(run.run_id))
+            self._last_cadence_payload = run.cadence.snapshot().encode(context="exposure", run_id=run.run_id)
+            self._last_run_id = run.run_id
             self._run = None
 
     def _promote_final_analysis(self, run: _AcquisitionRun, result: DoseAnalysisResult) -> None:
@@ -1613,6 +1669,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 runtime = 0.0
                 status = {
                     "state": "recovery_required" if self._deferred_finalization_detail is not None else "idle",
+                    "run_id": None,
+                    "last_run_id": None if getattr(self, "_last_run_id", None) is None else str(self._last_run_id),
                     "capture_connected": self._capture_client is not None,
                     "source_kind": board_status.get("source_kind"),
                     "source_id": board_status.get("source_id"),
@@ -1632,6 +1690,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     "last_diagnostic": self._last_diagnostic_summary,
                 }
             elif run is not None:
+                self._refresh_cadence_rate(run=run)
                 dose = run.accumulator.accumulated_dose_mj_cm2
                 runtime = run.accumulator.transmitting_runtime_seconds
                 pulse_age = None if run.last_pulse_monotonic is None else time.monotonic() - run.last_pulse_monotonic
@@ -1651,6 +1710,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     run.resume_authorized = False
                 status = {
                     "state": "finalizing" if run.finalizing or run.release_pending else "running",
+                    "run_id": str(run.run_id),
+                    "last_run_id": None if getattr(self, "_last_run_id", None) is None else str(self._last_run_id),
                     "session_id": str(run.session_id) if run.session_id else None,
                     "capture_connected": self._capture_client is not None,
                     "source_kind": run.source_kind,
@@ -1681,10 +1742,13 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     reason="Pulse reports stopped while laser timing expected triggers." if pulse_loss else None,
                 )
             else:
+                self._refresh_cadence_rate(diagnostic=diagnostic)
                 dose = 0.0
                 runtime = 0.0
                 status = {
                     "state": f"diagnostic_{diagnostic.state}",
+                    "run_id": None,
+                    "last_run_id": None if getattr(self, "_last_run_id", None) is None else str(self._last_run_id),
                     "session_id": str(diagnostic.session_id),
                     "capture_connected": self._capture_client is not None,
                     "source_kind": diagnostic.source_kind,
@@ -1721,11 +1785,44 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 health = AcquisitionHealth(False, None, None, None, False, False, False)
             status["accumulated_dose_mj_cm2"] = dose
             status["transmitting_runtime_seconds"] = runtime
+            if run is not None:
+                cadence_payload = run.cadence.snapshot().encode(context="exposure", run_id=run.run_id)
+            elif diagnostic is not None:
+                cadence_payload = diagnostic.cadence.snapshot().encode(context="diagnostic")
+            else:
+                cadence_payload = getattr(self, "_last_cadence_payload", None)
         if self._dose_publisher is not None:
             self._dose_publisher.value = dose
             self._time_publisher.value = runtime
             self._status_publisher.value = __import__("json").dumps(status, allow_nan=False, separators=(",", ":")).encode("utf-8")
             self._health_publisher.value = health.encode()
+        cadence_publisher = getattr(self, "_cadence_publisher", None)
+        if cadence_publisher is not None and cadence_payload is not None:
+            cadence_publisher.value = cadence_payload
+
+    def _refresh_cadence_rate(
+        self,
+        *,
+        run: _AcquisitionRun | None = None,
+        diagnostic: _DiagnosticCapture | None = None,
+    ) -> None:
+        timing_lock = getattr(self, "_timing_status_lock", None)
+        if timing_lock is None:
+            timing = None
+            received_at = 0.0
+        else:
+            with timing_lock:
+                timing = getattr(self, "_timing_status", None)
+                received_at = getattr(self, "_timing_status_received_at", 0.0)
+        fresh = timing is not None and time.monotonic() - received_at <= 0.5
+        if run is not None:
+            run.cadence.set_expected_rate(
+                run.chopper_frequency_hz / 2.0
+                if fresh and timing is not None and timing.triggers_enabled
+                else None
+            )
+        if diagnostic is not None:
+            diagnostic.cadence.set_expected_rate(timing.trigger_rate_hz if fresh and timing is not None else None)
 
     def _request_exposure_stop(self, reason: str) -> None:
         if self._stop_requested or self._stop_exposure_event is None:

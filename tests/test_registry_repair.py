@@ -8,6 +8,7 @@ import pytest
 
 import chamber_ctl.data.registry_repair as registry_repair
 from chamber_ctl.data.registry_repair import (
+    infer_resource_type,
     log_applied_repair,
     read_registry,
     repair_exposure_registries,
@@ -30,6 +31,11 @@ def _create_run(library: Library, name: str, experiment_type: str = "exposure") 
 
 def _folder(root: Path, entry: Entry) -> Path:
     return root / entry.get_foldername()
+
+
+def test_repair_recognizes_persisted_graph_resource_types() -> None:
+    assert infer_resource_type("euv_exposure_dose_graph.h5") == "euv_exposure_dose_graph"
+    assert infer_resource_type("euv_capture_cadence.h5") == "euv_capture_cadence"
 
 
 def test_repair_dry_run_only_scans_exposure_records(tmp_path: Path) -> None:

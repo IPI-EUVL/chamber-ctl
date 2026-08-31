@@ -17,6 +17,8 @@ from chamber_ctl.data.dose_analysis import (
     load_experiment_peak_voltage_series,
     write_analysis_revision,
 )
+from chamber_ctl.data.capture_cadence_graph import ensure_capture_cadence_graph
+from chamber_ctl.gui.capture_cadence_plot import show_capture_cadence_figure
 from ipi_ecs.util.export_experiment import export_experiment_data
 
 
@@ -1022,6 +1024,9 @@ class ExperimentsGUI:
         self.__volts_plot_queue: Queue = Queue()
         self.__volts_plot_worker = None
 
+        self.__cadence_plot_queue: Queue = Queue()
+        self.__cadence_plot_worker = None
+
         self.__loading_dialog = None
         self.__loading_progressbar = None
         self.__loading_progress_var = tk.DoubleVar(value=0.0)
@@ -1070,6 +1075,11 @@ class ExperimentsGUI:
             self.__actions_frame,
             text="Plot Volts Graph (Selected)",
             command=self.__on_plot_selected_volts_graph,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(
+            self.__actions_frame,
+            text="Capture Integrity (Selected)",
+            command=self.__on_plot_selected_capture_cadence,
         ).pack(side=tk.LEFT, padx=2)
 
         self.__results_frame = ResultsFrame(left, on_selection_changed=self.__on_selection_changed)
@@ -1414,6 +1424,28 @@ class ExperimentsGUI:
         )
         self.__volts_plot_worker.start()
 
+    def __on_plot_selected_capture_cadence(self):
+        records = self.__results_frame.get_selected_records()
+        if len(records) != 1:
+            messagebox.showinfo(
+                "Capture Integrity",
+                "Select exactly one experiment from the list first.",
+            )
+            return
+        if self.__cadence_plot_worker is not None and self.__cadence_plot_worker.is_alive():
+            messagebox.showinfo("Capture Integrity", "A capture integrity graph is already being prepared.")
+            return
+
+        run_id = _record_run_uuid(records[0])
+        self.__show_loading_dialog("Preparing capture integrity graph...", determinate=True, maximum=1)
+        self.__status_var.set(f"Preparing capture integrity graph (...{str(run_id)[-8:]})")
+        self.__cadence_plot_worker = threading.Thread(
+            target=self.__plot_capture_cadence_thread,
+            args=(run_id,),
+            daemon=True,
+        )
+        self.__cadence_plot_worker.start()
+
     def __plot_selected_thread(self, run_ids: list):
         exp_reader = ExperimentReader(self.__data_path, self.__exp_name)
         traces = []
@@ -1459,6 +1491,23 @@ class ExperimentsGUI:
             exp_reader.close()
 
         self.__volts_plot_queue.put(("done", traces, errors, total))
+
+    def __plot_capture_cadence_thread(self, run_id: uuid.UUID):
+        experiment_reader = ExperimentReader(self.__data_path, self.__exp_name)
+        try:
+            run = experiment_reader.locate_run_by_uuid(run_id)
+            if run is None:
+                raise FileNotFoundError(f"Exposure {run_id} was not found.")
+            result = ensure_capture_cadence_graph(run_id, run.get_record(), self.__data_path)
+            if result.graph is None:
+                raise RuntimeError(f"Capture cadence is {result.status.replace('_', ' ')}.")
+            name = f"{run.get_name()}:{run.get_description()}"
+        except Exception as exc:
+            self.__cadence_plot_queue.put(("error", run_id, str(exc)))
+        else:
+            self.__cadence_plot_queue.put(("done", run_id, name, result.graph))
+        finally:
+            experiment_reader.close()
 
     def __open_dose_progress_dialog(self, total_count: int):
         if self.__dose_dialog is not None and self.__dose_dialog.winfo_exists():
@@ -1605,6 +1654,30 @@ class ExperimentsGUI:
                     if self.__dose_cancel_btn is not None and self.__dose_cancel_btn.winfo_exists():
                         self.__dose_cancel_btn.config(text="Close", state=tk.NORMAL)
                         self.__dose_cancel_btn.configure(command=self.__close_dose_dialog)
+        except Empty:
+            pass
+
+        try:
+            while True:
+                msg = self.__cadence_plot_queue.get_nowait()
+                m_type = msg[0]
+                self.__hide_loading_dialog()
+                if m_type == "done":
+                    _t, run_id, name, graph = msg
+                    try:
+                        show_capture_cadence_figure(
+                            graph,
+                            title=f"Capture Integrity - {name}",
+                        )
+                    except Exception as exc:
+                        self.__status_var.set(f"Could not open capture integrity graph: {exc}")
+                        messagebox.showerror("Capture Integrity", str(exc))
+                    else:
+                        self.__status_var.set(f"Capture integrity graph ready (...{str(run_id)[-8:]})")
+                elif m_type == "error":
+                    _t, run_id, error = msg
+                    self.__status_var.set(f"Capture integrity failed (...{str(run_id)[-8:]})")
+                    messagebox.showerror("Capture Integrity", error)
         except Empty:
             pass
 

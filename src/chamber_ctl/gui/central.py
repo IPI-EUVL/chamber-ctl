@@ -679,7 +679,7 @@ class CentralGUI:
 		diagnostics_tab = ttk.Frame(workspace)
 		workspace.add(diagnostics_tab, text=ACQUISITION_WORKSPACE_TABS[1])
 		try:
-			comp = AcquisitionGUI(diagnostics_tab, own_window=False)
+			comp = AcquisitionGUI(diagnostics_tab, own_window=False, data_path=DEFAULT_DATA_PATH)
 			self.__register_component("Acquisition / Capture Diagnostics", comp, "close")
 		except Exception as exc:
 			self.__add_error_content(diagnostics_tab, "Capture Diagnostics", exc)

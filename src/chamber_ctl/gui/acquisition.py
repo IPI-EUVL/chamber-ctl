@@ -12,9 +12,14 @@ from dataclasses import dataclass
 from tkinter import messagebox, ttk
 
 from ipi_ecs.dds import client, magics, subsystem as dds_subsystem, types
+from ipi_ecs.subsystems.experiment_controller import ExperimentReader
 
 from chamber_ctl import ECS_IP
 from chamber_ctl.data.acquisition_preview import AcquisitionPreview
+from chamber_ctl.data.capture_cadence import DecodedLiveCadence, decode_live_cadence
+from chamber_ctl.data.capture_cadence_graph import ensure_capture_cadence_graph
+from chamber_ctl.gui.capture_cadence_plot import show_capture_cadence_figure
+from chamber_ctl.interfaces.capture_cadence_interface import CaptureCadenceChart
 from chamber_ctl.interfaces.scope_interface import PhosphorScopeTk
 from chamber_ctl.subsystems import uuids
 
@@ -171,9 +176,16 @@ class AcquisitionGUI:
     HISTORY_LIMIT = 20
     UI_UPDATE_MS = 100
 
-    def __init__(self, root, own_window: bool = True, dds_ip: str = ECS_IP) -> None:
+    def __init__(
+        self,
+        root,
+        own_window: bool = True,
+        dds_ip: str = ECS_IP,
+        data_path: str | None = None,
+    ) -> None:
         self.__root = root
         self.__own_window = own_window
+        self.__data_path = data_path
         self.__run = True
         self.__dds_connected = False
         self.__status: dict | None = None
@@ -188,7 +200,10 @@ class AcquisitionGUI:
         self.__subsystem = None
         self.__status_kv = None
         self.__preview_kv = None
+        self.__cadence_kv = None
         self.__ui_job = None
+        self.__cadence: DecodedLiveCadence | None = None
+        self.__cadence_plot_pending = False
 
         self.__connection_text = tk.StringVar(value="DDS: connecting")
         self.__state_text = tk.StringVar(value="Acquisition: unavailable")
@@ -196,6 +211,11 @@ class AcquisitionGUI:
         self.__detail_text = tk.StringVar(value="Waiting for acquisition status.")
         self.__dose_text = tk.StringVar(value="Dose: N/A")
         self.__runtime_text = tk.StringVar(value="Transmitting time: N/A")
+        self.__cadence_rate_text = tk.StringVar(value="Capture rate: N/A")
+        self.__cadence_loss_text = tk.StringVar(value="Estimated lost: N/A")
+        self.__cadence_total_text = tk.StringVar(value="Estimated missing: 0")
+        self.__cadence_quality_text = tk.StringVar(value="Evidence: unavailable")
+        self.__cadence_window = tk.IntVar(value=2)
         self.__preview_text = tk.StringVar(value="No waveform preview received.")
         self.__history_text = tk.StringVar(value="0 / 0")
         self.__result_text = tk.StringVar(value="No acquisition action requested.")
@@ -213,7 +233,7 @@ class AcquisitionGUI:
         if self.__own_window and hasattr(self.__root, "title"):
             self.__root.title("EUV Acquisition")
         if self.__own_window and hasattr(self.__root, "geometry"):
-            self.__root.geometry("1100x760")
+            self.__root.geometry("1400x800")
 
         outer = ttk.Frame(self.__root, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -237,10 +257,48 @@ class AcquisitionGUI:
         ttk.Label(metrics, textvariable=self.__dose_text).pack(side=tk.LEFT, padx=(0, 18))
         ttk.Label(metrics, textvariable=self.__runtime_text).pack(side=tk.LEFT)
 
-        waveform = ttk.LabelFrame(outer, text="Live Pulse Windows", padding=6)
-        waveform.grid(row=1, column=0, sticky="nsew")
+        live_panes = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
+        live_panes.grid(row=1, column=0, sticky="nsew")
+
+        cadence = ttk.LabelFrame(live_panes, text="Capture Integrity (timestamp-inferred)", padding=6)
+        cadence.columnconfigure(0, weight=1)
+        cadence.rowconfigure(1, weight=1)
+        live_panes.add(cadence, weight=1)
+
+        cadence_bar = ttk.Frame(cadence)
+        cadence_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        cadence_bar.columnconfigure(0, weight=1)
+        cadence_bar.columnconfigure(1, weight=1)
+        ttk.Label(cadence_bar, textvariable=self.__cadence_rate_text).grid(row=0, column=0, sticky="w")
+        ttk.Label(cadence_bar, textvariable=self.__cadence_loss_text).grid(row=0, column=1, sticky="w")
+        ttk.Label(cadence_bar, textvariable=self.__cadence_total_text).grid(row=1, column=0, sticky="w")
+        ttk.Label(cadence_bar, textvariable=self.__cadence_quality_text).grid(row=1, column=1, sticky="w")
+        window_selector = ttk.Frame(cadence_bar)
+        window_selector.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        ttk.Label(window_selector, text="Rolling window:").pack(side=tk.LEFT, padx=(0, 3))
+        for seconds in (1, 2, 3):
+            ttk.Radiobutton(
+                window_selector,
+                text=f"{seconds} s",
+                value=seconds,
+                variable=self.__cadence_window,
+                command=self.__select_cadence_window,
+            ).pack(side=tk.LEFT)
+        self.__open_cadence_button = ttk.Button(
+            window_selector,
+            text="Open Last Exposure",
+            command=self.__open_last_cadence,
+        )
+        self.__open_cadence_button.pack(side=tk.RIGHT)
+
+        cadence_host = ttk.Frame(cadence)
+        cadence_host.grid(row=1, column=0, sticky="nsew")
+        self.__cadence_chart = CaptureCadenceChart(cadence_host)
+
+        waveform = ttk.LabelFrame(live_panes, text="Live Pulse Windows", padding=6)
         waveform.columnconfigure(0, weight=1)
         waveform.rowconfigure(1, weight=1)
+        live_panes.add(waveform, weight=1)
 
         waveform_bar = ttk.Frame(waveform)
         waveform_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
@@ -353,8 +411,13 @@ class AcquisitionGUI:
                     uuids.UUID_EUV_ACQUISITION_CONTROLLER,
                     dds_subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"acquisition_preview", True, True, False),
                 )
+                self.__cadence_kv = handle.add_remote_kv(
+                    uuids.UUID_EUV_ACQUISITION_CONTROLLER,
+                    dds_subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"acquisition_cadence", True, True, False),
+                )
                 self.__status_kv.on_new_data_received(self.__on_status)
                 self.__preview_kv.on_new_data_received(self.__on_preview)
+                self.__cadence_kv.on_new_data_received(self.__on_cadence)
                 for event_name in (
                     *DIAGNOSTIC_EVENTS.values(),
                     SIMULATOR_SET_EVENT,
@@ -385,6 +448,13 @@ class AcquisitionGUI:
             return
         self.__work_queue.put(("preview", raw))
 
+    def __on_cadence(self, payload) -> None:
+        try:
+            raw = bytes(payload) if isinstance(payload, list) else bytes(payload)
+        except (TypeError, ValueError):
+            return
+        self.__work_queue.put(("cadence", raw))
+
     def __worker_loop(self) -> None:
         pending: list[_PendingEvent] = []
         while not self.__stop_event.is_set():
@@ -401,6 +471,33 @@ class AcquisitionGUI:
                         self.__ui_queue.put(("result", ("preview", f"Rejected waveform preview: {exc}")))
                     else:
                         self.__ui_queue.put(("preview", preview))
+                elif kind == "cadence":
+                    try:
+                        cadence = decode_live_cadence(payload)
+                    except Exception as exc:
+                        self.__ui_queue.put(("result", ("cadence", f"Rejected cadence data: {exc}")))
+                    else:
+                        self.__ui_queue.put(("cadence", cadence))
+                elif kind == "cadence_plot":
+                    run_id = payload
+                    reader = None
+                    try:
+                        if self.__data_path is None:
+                            raise RuntimeError("Experiment data path is unavailable.")
+                        reader = ExperimentReader(self.__data_path, "exposure")
+                        run = reader.locate_run_by_uuid(run_id)
+                        if run is None:
+                            raise FileNotFoundError(f"Exposure {run_id} was not found.")
+                        result = ensure_capture_cadence_graph(run_id, run.get_record(), self.__data_path)
+                        if result.graph is None:
+                            raise RuntimeError(f"Capture cadence is {result.status.replace('_', ' ')}.")
+                    except Exception as exc:
+                        self.__ui_queue.put(("cadence_plot_error", str(exc)))
+                    else:
+                        self.__ui_queue.put(("cadence_plot_ready", result.graph))
+                    finally:
+                        if reader is not None:
+                            reader.close()
                 elif kind == "event":
                     action, event_name, event_payload, label, timeout_seconds = payload
                     provider = self.__events.get(event_name)
@@ -529,6 +626,21 @@ class AcquisitionGUI:
                 self.__render_status(payload)
             elif kind == "preview":
                 self.__display_new_preview(payload)
+            elif kind == "cadence":
+                self.__cadence = payload
+                self.__cadence_chart.update(payload)
+                self.__render_cadence_metrics()
+            elif kind == "cadence_plot_ready":
+                self.__cadence_plot_pending = False
+                try:
+                    show_capture_cadence_figure(payload)
+                except Exception as exc:
+                    self.__result_text.set(f"Could not open capture integrity graph: {exc}")
+                else:
+                    self.__result_text.set("Opened capture integrity graph for the last exposure.")
+            elif kind == "cadence_plot_error":
+                self.__cadence_plot_pending = False
+                self.__result_text.set(f"Could not prepare capture integrity graph: {payload}")
             elif kind == "feedback":
                 _action, message = payload
                 self.__result_text.set(message)
@@ -539,6 +651,49 @@ class AcquisitionGUI:
             self.__render_controls()
         if self.__run:
             self.__ui_job = self.__root.after(self.UI_UPDATE_MS, self.__ui_tick)
+
+    def __select_cadence_window(self) -> None:
+        self.__cadence_chart.set_window(float(self.__cadence_window.get()))
+        self.__render_cadence_metrics()
+
+    def __open_last_cadence(self) -> None:
+        if self.__cadence_plot_pending or not isinstance(self.__status, dict):
+            return
+        value = self.__status.get("last_run_id")
+        try:
+            run_id = uuid.UUID(str(value))
+        except (TypeError, ValueError, AttributeError):
+            self.__result_text.set("No completed exposure is available for capture integrity analysis.")
+            return
+        self.__cadence_plot_pending = True
+        self.__result_text.set("Preparing capture integrity graph for the last exposure...")
+        self.__render_controls()
+        self.__work_queue.put(("cadence_plot", run_id))
+
+    def __render_cadence_metrics(self) -> None:
+        cadence = self.__cadence
+        if cadence is None:
+            return
+        window_seconds = float(self.__cadence_window.get())
+        latest_window = next(
+            (
+                window
+                for point in reversed(cadence.points)
+                for window in point.windows
+                if window.window_seconds == window_seconds and window.capture_rate_hz is not None
+            ),
+            None,
+        )
+        capture_rate = None if latest_window is None else latest_window.capture_rate_hz
+        lost_rate = None if latest_window is None else latest_window.estimated_lost_per_second
+        self.__cadence_rate_text.set(
+            "Capture rate: N/A" if capture_rate is None else f"Capture rate: {capture_rate:.1f} Hz"
+        )
+        self.__cadence_loss_text.set(
+            "Estimated lost: N/A" if lost_rate is None else f"Estimated lost: {lost_rate:.2f}/s"
+        )
+        self.__cadence_total_text.set(f"Estimated missing: {cadence.inferred_lost_count}")
+        self.__cadence_quality_text.set(f"Evidence: {cadence.quality.value.replace('_', '-')}")
 
     def __render_status(self, status: dict) -> None:
         state = str(status.get("state", "unknown"))
@@ -579,6 +734,16 @@ class AcquisitionGUI:
         self.__set_widget_enabled(
             self.__recover_orphan_button,
             allowed.recover_orphan_enabled and "recover_orphan" not in self.__pending_actions,
+        )
+        last_run_id = self.__status.get("last_run_id") if isinstance(self.__status, dict) else None
+        try:
+            uuid.UUID(str(last_run_id))
+            has_last_run = True
+        except (TypeError, ValueError, AttributeError):
+            has_last_run = False
+        self.__set_widget_enabled(
+            self.__open_cadence_button,
+            self.__data_path is not None and has_last_run and not self.__cadence_plot_pending,
         )
 
     @staticmethod
@@ -639,6 +804,7 @@ class AcquisitionGUI:
                 pass
             self.__ui_job = None
         self.__scope.close()
+        self.__cadence_chart.close()
         self.__stop_event.set()
         self.__worker.join(timeout=2.0)
         if self.__client is not None:

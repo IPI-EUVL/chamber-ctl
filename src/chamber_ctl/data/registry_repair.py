@@ -34,6 +34,8 @@ KNOWN_RESOURCE_TYPES = {
     "laser_config.bin": "Laser Config",
     "queue_state.bin": "Queue State",
     "ellipsometry.json": "Elllipsometry data",
+    "euv_exposure_dose_graph.h5": "euv_exposure_dose_graph",
+    "euv_capture_cadence.h5": "euv_capture_cadence",
 }
 
 
