@@ -66,6 +66,67 @@ def test_acquisition_transmission_check_fails_closed_until_timing_status_is_fres
     assert subsystem._is_laser_transmitting() is True
 
 
+def test_acquisition_status_publishes_live_dose_and_zero_runtime() -> None:
+    import threading
+
+    from chamber_ctl.data.acquisition_runtime import LiveDoseAccumulator
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem, _AcquisitionRun
+
+    class _Publisher:
+        def __init__(self) -> None:
+            self.value = None
+
+    accumulator = LiveDoseAccumulator(_profile())
+    accumulator.accumulated_dose_mj_cm2 = 2.5
+    accumulator.transmitting_runtime_seconds = 0.0
+    run = _AcquisitionRun(uuid.uuid4(), _profile(), None, None, 192.0, accumulator)
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._last_publish = float("-inf")
+    subsystem._run_lock = threading.RLock()
+    subsystem._timing_status_lock = threading.Lock()
+    subsystem._timing_status = None
+    subsystem._run = run
+    subsystem._diagnostic = None
+    subsystem._board_status = {}
+    subsystem._capture_client = object()
+    subsystem._deferred_finalization_detail = None
+    subsystem._diagnostic_error = None
+    subsystem._last_diagnostic_summary = None
+    subsystem._dose_publisher = _Publisher()
+    subsystem._time_publisher = _Publisher()
+    subsystem._status_publisher = _Publisher()
+    subsystem._health_publisher = _Publisher()
+
+    subsystem._publish_values()
+
+    status = json.loads(subsystem._status_publisher.value)
+    assert status["accumulated_dose_mj_cm2"] == 2.5
+    assert status["transmitting_runtime_seconds"] == 0.0
+
+
+def test_completed_diagnostic_retains_transferred_snapshot_summary() -> None:
+    import threading
+
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem, _DiagnosticCapture
+
+    diagnostic = _DiagnosticCapture(uuid.uuid4(), "one_shot", "simulated", "fixture", 0.0, report_count=1)
+    diagnostic.processed_snapshot_ids.add(uuid.uuid4())
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._run_lock = threading.RLock()
+    subsystem._diagnostic = diagnostic
+    subsystem._diagnostic_error = None
+    subsystem._last_diagnostic_summary = None
+    subsystem._log = lambda *_args, **_kwargs: None
+
+    subsystem._complete_diagnostic()
+
+    assert subsystem._last_diagnostic_summary == {
+        "mode": "one_shot",
+        "report_count": 1,
+        "snapshot_count": 1,
+    }
+
+
 def test_acquisition_timing_stream_records_initial_values_transitions_and_closure() -> None:
     from chamber_ctl.data.acquisition_runtime import LiveDoseAccumulator
     from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem, _AcquisitionRun

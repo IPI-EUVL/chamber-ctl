@@ -9,12 +9,12 @@ import uuid
 import segment_bytes
 
 from ipi_ecs.core.tcp import TCPClientSocket
-from ipi_ecs.dds import client, subsystem, types, magics
+from ipi_ecs.dds import client, subsystem, types
 from ipi_ecs.logging.client import LogClient
 from ipi_ecs.gui.experiment_controller_gui import ExperimentInterface, ExperimentControllerGUI
 from ipi_ecs.cli.captive_cli import wait_for
 
-from chamber_ctl import ECS_IP, ECS_PORT
+from chamber_ctl import ECS_IP
 from chamber_ctl.data.calibration import CalibrationRepository
 from chamber_ctl.gui.sample_motion_gui import draw_sample_stage, build_sample_data, RING_RADII
 from chamber_ctl.subsystems import uuids
@@ -92,10 +92,6 @@ class ExposureControllerGUI():
         self.__time_kv = None
         self.__acquisition_status_kv = None
         self.__acquisition_health_kv = None
-        self.__resume_acquisition_interlock_event = None
-        self.__recover_orphaned_capture_event = None
-        self.__acquisition_control_handle = None
-        self.__acquisition_control_name = None
         self.__laser_status_kv = None
         self.__target_status_kv = None
 
@@ -221,8 +217,6 @@ class ExposureControllerGUI():
             uuids.UUID_EUV_ACQUISITION_CONTROLLER,
             subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"acquisition_health", True, True, False),
         )
-        self.__resume_acquisition_interlock_event = handle.add_event_provider(b"resume_acquisition_interlock")
-        self.__recover_orphaned_capture_event = handle.add_event_provider(b"recover_orphaned_capture_session")
 
         self.__laser_status_kv = handle.add_remote_kv(
             uuids.UUID_LASER_CONTROLLER,
@@ -261,13 +255,17 @@ class ExposureControllerGUI():
 
     def __update_live_status(self):
         laser_status = None
-        self.__update_acquisition_control_result()
+        acquisition_status = self.__get_acquisition_status()
         if self.__status_dose_value is not None:
             dose_value = self.__dose_kv.value if self.__dose_kv is not None else None
+            if dose_value is None and acquisition_status is not None:
+                dose_value = acquisition_status.get("accumulated_dose_mj_cm2")
             self.__status_dose_value.config(text="N/A" if dose_value is None else f"{float(dose_value):.2f} mJ/cm²")
 
         if self.__status_time_value is not None:
             time_value = self.__time_kv.value if self.__time_kv is not None else None
+            if time_value is None and acquisition_status is not None:
+                time_value = acquisition_status.get("transmitting_runtime_seconds")
             self.__status_time_value.config(text="N/A" if time_value is None else f"{float(time_value):.2f} s")
 
         if self.__status_acquisition_value is not None:
@@ -348,15 +346,24 @@ class ExposureControllerGUI():
         if self.__root is not None:
             self.__root.after(250, self.__update_live_status)
 
-    def __format_acquisition_status(self) -> str:
+    def __get_acquisition_status(self) -> dict | None:
         status_value = self.__acquisition_status_kv.value if self.__acquisition_status_kv is not None else None
-        health_value = self.__acquisition_health_kv.value if self.__acquisition_health_kv is not None else None
         try:
             status_payload = bytes(status_value) if isinstance(status_value, list) else status_value
-            status = json.loads(bytes(status_payload).decode("utf-8")) if status_payload is not None else {}
+            status = json.loads(bytes(status_payload).decode("utf-8")) if status_payload is not None else None
+            return status if isinstance(status, dict) else None
+        except Exception:
+            return None
+
+    def __format_acquisition_status(self) -> str:
+        status = self.__get_acquisition_status()
+        health_value = self.__acquisition_health_kv.value if self.__acquisition_health_kv is not None else None
+        try:
             health_payload = bytes(health_value) if isinstance(health_value, list) else health_value
             health = AcquisitionHealth.decode(health_payload) if health_payload is not None else None
         except Exception:
+            return "Unavailable"
+        if status is None:
             return "Unavailable"
         state = str(status.get("state", "unknown"))
         if health is None:
@@ -388,65 +395,6 @@ class ExposureControllerGUI():
         detail = status.get("finalization_detail")
         suffix = f", {detail}" if state == "finalizing" and detail else ""
         return f"{prefix}, pulse {health.last_pulse_age_seconds:.2f}s ago{suffix}"
-
-    def __call_acquisition_control(self, event, payload: bytes, requested_text: str) -> None:
-        if self.__acquisition_control_handle is not None and self.__acquisition_control_handle.is_in_progress():
-            messagebox.showinfo("EUV Acquisition", f"{self.__acquisition_control_name} is already in progress.")
-            return
-        if event is None:
-            messagebox.showerror("EUV Acquisition", "Acquisition controls are not connected.")
-            return
-        handle = event.call(payload, [uuids.UUID_EUV_ACQUISITION_CONTROLLER])
-        if handle is None:
-            messagebox.showerror("EUV Acquisition", "Failed to send the acquisition control request.")
-            return
-        self.__acquisition_control_handle = handle
-        self.__acquisition_control_name = requested_text
-        if self.__status_acquisition_value is not None:
-            self.__status_acquisition_value.config(text=requested_text)
-
-    def __update_acquisition_control_result(self) -> None:
-        handle = self.__acquisition_control_handle
-        if handle is None or handle.is_in_progress():
-            return
-        control_name = self.__acquisition_control_name or "Acquisition control request"
-        self.__acquisition_control_handle = None
-        self.__acquisition_control_name = None
-        state = handle.get_state(uuids.UUID_EUV_ACQUISITION_CONTROLLER)
-        result = handle.get_result(uuids.UUID_EUV_ACQUISITION_CONTROLLER)
-        if isinstance(result, bytes):
-            message = result.decode("utf-8", errors="replace")
-        else:
-            message = "" if result is None else str(result)
-        if state == client.EVENT_OK:
-            completion = message or f"{control_name} completed."
-            if self.__status_acquisition_value is not None:
-                self.__status_acquisition_value.config(text=completion)
-            return
-        failure = message or f"{control_name} failed."
-        if self.__status_acquisition_value is not None:
-            self.__status_acquisition_value.config(text=failure)
-        messagebox.showerror("EUV Acquisition", failure, parent=self.__root)
-
-    def __on_resume_acquisition_interlock(self) -> None:
-        self.__call_acquisition_control(
-            self.__resume_acquisition_interlock_event,
-            bytes(),
-            "Recovery authorization requested",
-        )
-
-    def __on_recover_orphaned_capture(self) -> None:
-        if not messagebox.askyesno(
-            "Recover Orphaned Capture",
-            "Import all unacknowledged artifacts, reconcile the matching exposure, and release the digitizer spool?",
-            parent=self.__root,
-        ):
-            return
-        self.__call_acquisition_control(
-            self.__recover_orphaned_capture_event,
-            b"confirm",
-            "Orphan recovery requested",
-        )
 
     def __update_laser_canvas(self, laser_status):
         if self.__laser_status_canvas is None:
@@ -979,19 +927,6 @@ class ExposureControllerGUI():
         ttk.Label(status_grid, text="Acquisition:").grid(row=7, column=0, sticky=tk.NW, padx=(0, 8), pady=2)
         self.__status_acquisition_value = ttk.Label(status_grid, text="Unavailable", wraplength=180)
         self.__status_acquisition_value.grid(row=7, column=1, sticky=tk.W, pady=2)
-
-        acquisition_controls = ttk.Frame(status_grid)
-        acquisition_controls.grid(row=8, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0))
-        ttk.Button(
-            acquisition_controls,
-            text="Authorize Recovery",
-            command=self.__on_resume_acquisition_interlock,
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(
-            acquisition_controls,
-            text="Recover Orphan",
-            command=self.__on_recover_orphaned_capture,
-        ).pack(side=tk.LEFT)
 
         self.__laser_status_canvas = tk.Canvas(status_container, width=240, height=42, bg="black", highlightthickness=0)
         self.__laser_status_canvas.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))

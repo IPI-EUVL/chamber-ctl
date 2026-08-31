@@ -178,6 +178,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._diagnostic: _DiagnosticCapture | None = None
         self._diagnostic_start_pending = False
         self._diagnostic_error: str | None = None
+        self._last_diagnostic_summary: dict | None = None
         self._control_requests: queue.Queue[_AcquisitionControlRequest] = queue.Queue()
         self._recovery_active = False
         self._capture_client: AcquisitionClient | None = None
@@ -883,7 +884,9 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         result = self._capture_command("flush_snapshot", {})
         self._queue_diagnostic_snapshots_from_status(result)
         self._import_pending_diagnostic_snapshots()
-        return b"Flushed and published the current acquisition diagnostic snapshot."
+        with self._run_lock:
+            snapshot_count = len(self._require_diagnostic().processed_snapshot_ids)
+        return f"Flushed diagnostic; {snapshot_count} snapshot(s) transferred.".encode("utf-8")
 
     def _stop_diagnostic(self, reason: str) -> None:
         with self._run_lock:
@@ -1153,12 +1156,19 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
     def _complete_diagnostic(self) -> None:
         with self._run_lock:
             diagnostic = self._require_diagnostic()
+            snapshot_count = len(diagnostic.processed_snapshot_ids)
+            self._last_diagnostic_summary = {
+                "mode": diagnostic.mode,
+                "report_count": diagnostic.report_count,
+                "snapshot_count": snapshot_count,
+            }
             self._diagnostic = None
             self._diagnostic_error = diagnostic.terminal_error
         if diagnostic.terminal_error is None:
             message = (
                 f"Completed {diagnostic.mode.replace('_', '-')} acquisition diagnostic "
-                f"{diagnostic.session_id} with {diagnostic.report_count} pulse report(s)."
+                f"{diagnostic.session_id} with {diagnostic.report_count} pulse report(s) and "
+                f"{snapshot_count} transferred snapshot(s)."
             )
             for handle in diagnostic.completion_handles:
                 handle.ret(message.encode("utf-8"))
@@ -1619,6 +1629,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     "finalization_phase": None,
                     "finalization_detail": self._deferred_finalization_detail,
                     "diagnostic_error": self._diagnostic_error,
+                    "last_diagnostic": self._last_diagnostic_summary,
                 }
             elif run is not None:
                 dose = run.accumulator.accumulated_dose_mj_cm2
@@ -1708,6 +1719,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 )
             if run is None and diagnostic is None:
                 health = AcquisitionHealth(False, None, None, None, False, False, False)
+            status["accumulated_dose_mj_cm2"] = dose
+            status["transmitting_runtime_seconds"] = runtime
         if self._dose_publisher is not None:
             self._dose_publisher.value = dose
             self._time_publisher.value = runtime

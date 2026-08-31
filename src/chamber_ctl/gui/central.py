@@ -25,6 +25,7 @@ from ipi_ecs.dds import client, subsystem as dds_subsystem
 DEFAULT_DATA_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
 DEFAULT_EXPERIMENT_NAME = "exposure"
 DEFAULT_LIFECYCLE_UUID = uuid.uuid3(uuid.NAMESPACE_OID, "Lifecycle Manager")
+ACQUISITION_WORKSPACE_TABS = ("Exposure", "Capture Diagnostics")
 
 
 def _known_subsystems_from_uuids() -> list[tuple[str, uuid.UUID]]:
@@ -298,7 +299,6 @@ class CentralGUI:
 
 	def __build_tabs(self):
 		self.__build_experiments_tab()
-		self.__build_exposure_tab()
 		self.__build_acquisition_tab()
 		self.__build_batch_tab()
 		self.__build_settings_presets_tab()
@@ -662,23 +662,27 @@ class CentralGUI:
 		except Exception as exc:
 			self.__add_error_content(tab, "Experiments", exc)
 
-	def __build_exposure_tab(self):
-		tab = ttk.Frame(self.__notebook)
-		self.__notebook.add(tab, text="Exposure Controller")
-		try:
-			comp = ExposureControllerGUI(tab, own_window=False)
-			self.__register_component("Exposure Controller", comp, "close")
-		except Exception as exc:
-			self.__add_error_content(tab, "Exposure Controller", exc)
-
 	def __build_acquisition_tab(self):
 		tab = ttk.Frame(self.__notebook)
 		self.__notebook.add(tab, text="Acquisition")
+		workspace = ttk.Notebook(tab)
+		workspace.pack(fill=tk.BOTH, expand=True)
+
+		exposure_tab = ttk.Frame(workspace)
+		workspace.add(exposure_tab, text=ACQUISITION_WORKSPACE_TABS[0])
 		try:
-			comp = AcquisitionGUI(tab, own_window=False)
-			self.__register_component("Acquisition", comp, "close")
+			comp = ExposureControllerGUI(exposure_tab, own_window=False)
+			self.__register_component("Acquisition / Exposure", comp, "close")
 		except Exception as exc:
-			self.__add_error_content(tab, "Acquisition", exc)
+			self.__add_error_content(exposure_tab, "Exposure", exc)
+
+		diagnostics_tab = ttk.Frame(workspace)
+		workspace.add(diagnostics_tab, text=ACQUISITION_WORKSPACE_TABS[1])
+		try:
+			comp = AcquisitionGUI(diagnostics_tab, own_window=False)
+			self.__register_component("Acquisition / Capture Diagnostics", comp, "close")
+		except Exception as exc:
+			self.__add_error_content(diagnostics_tab, "Capture Diagnostics", exc)
 
 	def __build_batch_tab(self):
 		tab = ttk.Frame(self.__notebook)

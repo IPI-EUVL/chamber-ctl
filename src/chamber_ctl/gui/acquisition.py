@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import threading
 import time
@@ -8,7 +9,7 @@ import tkinter as tk
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 from ipi_ecs.dds import client, magics, subsystem as dds_subsystem, types
 
@@ -26,6 +27,8 @@ DIAGNOSTIC_EVENTS = {
 }
 SIMULATOR_SET_EVENT = b"set_acquisition_simulator_control"
 SIMULATOR_RESTORE_EVENT = b"restore_acquisition_simulator_controls"
+AUTHORIZE_RECOVERY_EVENT = b"resume_acquisition_interlock"
+RECOVER_ORPHAN_EVENT = b"recover_orphaned_capture_session"
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,8 @@ class AcquisitionControlState:
     flush_enabled: bool
     stop_enabled: bool
     simulator_enabled: bool
+    authorize_recovery_enabled: bool
+    recover_orphan_enabled: bool
 
 
 def decode_acquisition_status(payload) -> dict:
@@ -49,7 +54,7 @@ def decode_acquisition_status(payload) -> dict:
 
 def acquisition_control_state(status: dict | None, *, dds_connected: bool) -> AcquisitionControlState:
     if not dds_connected or not isinstance(status, dict):
-        return AcquisitionControlState(False, False, False, False, False)
+        return AcquisitionControlState(False, False, False, False, False, False, False)
     state = status.get("state")
     capture_connected = status.get("capture_connected") is True
     idle = state == "idle" and capture_connected
@@ -67,7 +72,65 @@ def acquisition_control_state(status: dict | None, *, dds_connected: bool) -> Ac
         flush_enabled=diagnostic_running and diagnostic_mode == "continuous",
         stop_enabled=state in {"diagnostic_running", "diagnostic_error"},
         simulator_enabled=simulator_enabled,
+        authorize_recovery_enabled=(
+            state == "running"
+            and status.get("pulse_loss") is True
+            and status.get("recovery_ready") is True
+            and status.get("resume_authorized") is not True
+        ),
+        recover_orphan_enabled=state == "recovery_required" or (state == "idle" and capture_connected),
     )
+
+
+def acquisition_status_metrics(status: dict | None) -> tuple[str, str]:
+    if not isinstance(status, dict):
+        return "N/A", "N/A"
+
+    def format_value(key: str, unit: str) -> str:
+        value = status.get(key)
+        if isinstance(value, bool):
+            return "N/A"
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if not math.isfinite(number):
+            return "N/A"
+        return f"{number:.2f} {unit}"
+
+    return (
+        format_value("accumulated_dose_mj_cm2", "mJ/cm2"),
+        format_value("transmitting_runtime_seconds", "s"),
+    )
+
+
+def acquisition_status_detail(status: dict) -> str:
+    state = str(status.get("state", "unknown"))
+    if state.startswith("diagnostic_"):
+        mode = str(status.get("diagnostic_mode", "unknown")).replace("_", "-")
+        reports = int(status.get("diagnostic_report_count", 0))
+        transferred = int(status.get("processed_snapshot_count", 0))
+        pending = int(status.get("pending_snapshot_count", 0))
+        detail = (
+            f"{mode}; {reports} pulse report(s); {transferred} snapshot(s) transferred; "
+            f"{pending} pending"
+        )
+        error = status.get("diagnostic_error")
+        return detail if not error else f"{detail}; {error}"
+    if state in {"running", "finalizing"}:
+        sequence = status.get("last_sequence")
+        return "Exposure capture" + ("; no pulse reports" if sequence is None else f"; sequence {sequence}")
+
+    detail = status.get("finalization_detail") or status.get("diagnostic_error")
+    if detail:
+        return str(detail)
+    last_diagnostic = status.get("last_diagnostic")
+    if isinstance(last_diagnostic, dict):
+        mode = str(last_diagnostic.get("mode", "unknown")).replace("_", "-")
+        reports = int(last_diagnostic.get("report_count", 0))
+        snapshots = int(last_diagnostic.get("snapshot_count", 0))
+        return f"Last {mode} test: {reports} pulse report(s); {snapshots} snapshot(s) transferred"
+    return "Ready for acquisition."
 
 
 class AcquisitionPreviewHistory:
@@ -131,6 +194,8 @@ class AcquisitionGUI:
         self.__state_text = tk.StringVar(value="Acquisition: unavailable")
         self.__source_text = tk.StringVar(value="Source: unavailable")
         self.__detail_text = tk.StringVar(value="Waiting for acquisition status.")
+        self.__dose_text = tk.StringVar(value="Dose: N/A")
+        self.__runtime_text = tk.StringVar(value="Transmitting time: N/A")
         self.__preview_text = tk.StringVar(value="No waveform preview received.")
         self.__history_text = tk.StringVar(value="0 / 0")
         self.__result_text = tk.StringVar(value="No acquisition action requested.")
@@ -167,6 +232,10 @@ class AcquisitionGUI:
         ttk.Label(status, textvariable=self.__detail_text).grid(row=1, column=1, sticky="w")
         ttk.Label(status, textvariable=self.__connection_text).grid(row=0, column=2, sticky="e")
         ttk.Label(status, textvariable=self.__source_text).grid(row=1, column=2, sticky="e")
+        metrics = ttk.Frame(status)
+        metrics.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(3, 0))
+        ttk.Label(metrics, textvariable=self.__dose_text).pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.__runtime_text).pack(side=tk.LEFT)
 
         waveform = ttk.LabelFrame(outer, text="Live Pulse Windows", padding=6)
         waveform.grid(row=1, column=0, sticky="nsew")
@@ -241,6 +310,21 @@ class AcquisitionGUI:
         self.__restore_button.grid(row=0, column=3, sticky="e")
         simulator.columnconfigure(3, weight=1)
 
+        recovery = ttk.LabelFrame(controls, text="Recovery", padding=8)
+        recovery.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.__authorize_recovery_button = ttk.Button(
+            recovery,
+            text="Authorize Pulse Recovery",
+            command=self.__authorize_recovery,
+        )
+        self.__recover_orphan_button = ttk.Button(
+            recovery,
+            text="Recover Orphaned Capture",
+            command=self.__recover_orphan,
+        )
+        self.__authorize_recovery_button.pack(side=tk.LEFT, padx=(0, 6))
+        self.__recover_orphan_button.pack(side=tk.LEFT)
+
         ttk.Label(outer, textvariable=self.__result_text, anchor=tk.W).grid(
             row=3, column=0, sticky="ew", pady=(6, 0)
         )
@@ -271,7 +355,13 @@ class AcquisitionGUI:
                 )
                 self.__status_kv.on_new_data_received(self.__on_status)
                 self.__preview_kv.on_new_data_received(self.__on_preview)
-                for event_name in (*DIAGNOSTIC_EVENTS.values(), SIMULATOR_SET_EVENT, SIMULATOR_RESTORE_EVENT):
+                for event_name in (
+                    *DIAGNOSTIC_EVENTS.values(),
+                    SIMULATOR_SET_EVENT,
+                    SIMULATOR_RESTORE_EVENT,
+                    AUTHORIZE_RECOVERY_EVENT,
+                    RECOVER_ORPHAN_EVENT,
+                ):
                     self.__events[event_name] = handle.add_event_provider(event_name)
             except Exception as exc:
                 self.__ui_queue.put(("connection_error", str(exc)))
@@ -399,6 +489,30 @@ class AcquisitionGUI:
     def __restore_simulator(self) -> None:
         self.__queue_event("simulator:restore", SIMULATOR_RESTORE_EVENT, bytes(), "Restore simulator inputs", 15.0)
 
+    def __authorize_recovery(self) -> None:
+        self.__queue_event(
+            "authorize_recovery",
+            AUTHORIZE_RECOVERY_EVENT,
+            bytes(),
+            "Pulse recovery authorization",
+            15.0,
+        )
+
+    def __recover_orphan(self) -> None:
+        if not messagebox.askyesno(
+            "Recover Orphaned Capture",
+            "Import all unacknowledged artifacts, reconcile the matching exposure, and release the digitizer spool?",
+            parent=self.__root,
+        ):
+            return
+        self.__queue_event(
+            "recover_orphan",
+            RECOVER_ORPHAN_EVENT,
+            b"confirm",
+            "Orphaned capture recovery",
+            120.0,
+        )
+
     def __ui_tick(self) -> None:
         while True:
             try:
@@ -432,17 +546,10 @@ class AcquisitionGUI:
         source_kind = status.get("source_kind") or "unknown"
         source_id = status.get("source_id")
         self.__source_text.set(f"Source: {source_kind}" + (f" / {source_id}" if source_id else ""))
-        if state.startswith("diagnostic_"):
-            mode = str(status.get("diagnostic_mode", "unknown")).replace("_", "-")
-            reports = int(status.get("diagnostic_report_count", 0))
-            pending = int(status.get("pending_snapshot_count", 0))
-            detail = f"{mode}; {reports} report(s); {pending} snapshot(s) pending"
-        elif state in {"running", "finalizing"}:
-            sequence = status.get("last_sequence")
-            detail = "Exposure capture" + ("; no pulse reports" if sequence is None else f"; sequence {sequence}")
-        else:
-            detail = status.get("finalization_detail") or status.get("diagnostic_error") or "Ready for acquisition."
-        self.__detail_text.set(str(detail))
+        self.__detail_text.set(acquisition_status_detail(status))
+        dose, runtime = acquisition_status_metrics(status)
+        self.__dose_text.set(f"Dose: {dose}")
+        self.__runtime_text.set(f"Transmitting time: {runtime}")
 
         simulator = status.get("simulator")
         if isinstance(simulator, dict):
@@ -465,6 +572,14 @@ class AcquisitionGUI:
         simulator_pending = any(action.startswith("simulator:") for action in self.__pending_actions)
         for widget in (self.__laser_toggle, self.__chopper_toggle, self.__pll_toggle, self.__restore_button):
             self.__set_widget_enabled(widget, allowed.simulator_enabled and not simulator_pending)
+        self.__set_widget_enabled(
+            self.__authorize_recovery_button,
+            allowed.authorize_recovery_enabled and "authorize_recovery" not in self.__pending_actions,
+        )
+        self.__set_widget_enabled(
+            self.__recover_orphan_button,
+            allowed.recover_orphan_enabled and "recover_orphan" not in self.__pending_actions,
+        )
 
     @staticmethod
     def __set_widget_enabled(widget, enabled: bool) -> None:

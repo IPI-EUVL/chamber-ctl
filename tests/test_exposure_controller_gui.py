@@ -1,6 +1,3 @@
-from ipi_ecs.dds import client
-
-import chamber_ctl.gui.exposure_controller as exposure_controller_gui
 from chamber_ctl.gui.exposure_controller import ExposureControllerGUI
 
 
@@ -18,17 +15,6 @@ class _Label:
 
     def config(self, *, text):
         self.text = text
-
-
-class _CompletedEvent:
-    def is_in_progress(self):
-        return False
-
-    def get_state(self, _subsystem_uuid):
-        return client.EVENT_REJ
-
-    def get_result(self, _subsystem_uuid):
-        return b"The digitizer spool has no unreleased capture session."
 
 
 def test_current_settings_serializes_calibration_revision_as_text() -> None:
@@ -55,22 +41,36 @@ def test_current_settings_serializes_calibration_revision_as_text() -> None:
     assert all(isinstance(value, str) for value in settings.values())
 
 
-def test_failed_acquisition_recovery_reports_its_event_result(monkeypatch) -> None:
+def test_exposure_status_preserves_zero_runtime_from_acquisition_status() -> None:
     gui = object.__new__(ExposureControllerGUI)
-    status = _Label()
-    errors = []
-    gui._ExposureControllerGUI__acquisition_control_handle = _CompletedEvent()
-    gui._ExposureControllerGUI__acquisition_control_name = "Orphan recovery requested"
-    gui._ExposureControllerGUI__status_acquisition_value = status
-    gui._ExposureControllerGUI__root = object()
-    monkeypatch.setattr(
-        exposure_controller_gui.messagebox,
-        "showerror",
-        lambda _title, message, **_kwargs: errors.append(message),
+    gui._ExposureControllerGUI__acquisition_status_kv = _Value(
+        b'{"state":"running","transmitting_runtime_seconds":0.0}'
     )
 
-    gui._ExposureControllerGUI__update_acquisition_control_result()
+    status = gui._ExposureControllerGUI__get_acquisition_status()
 
-    assert status.text == "The digitizer spool has no unreleased capture session."
-    assert errors == ["The digitizer spool has no unreleased capture session."]
-    assert gui._ExposureControllerGUI__acquisition_control_handle is None
+    assert status["transmitting_runtime_seconds"] == 0.0
+
+
+def test_exposure_live_labels_fall_back_to_acquisition_status_metrics() -> None:
+    gui = object.__new__(ExposureControllerGUI)
+    gui._ExposureControllerGUI__acquisition_status_kv = _Value(
+        b'{"state":"running","accumulated_dose_mj_cm2":2.5,"transmitting_runtime_seconds":0.0}'
+    )
+    gui._ExposureControllerGUI__dose_kv = _Value(None)
+    gui._ExposureControllerGUI__time_kv = _Value(None)
+    gui._ExposureControllerGUI__status_dose_value = _Label()
+    gui._ExposureControllerGUI__status_time_value = _Label()
+    gui._ExposureControllerGUI__status_acquisition_value = None
+    gui._ExposureControllerGUI__status_laser_value = None
+    gui._ExposureControllerGUI__status_chopper_value = None
+    gui._ExposureControllerGUI__status_chopper_phase_value = None
+    gui._ExposureControllerGUI__status_target_value = None
+    gui._ExposureControllerGUI__status_target_time_value = None
+    gui._ExposureControllerGUI__laser_status_canvas = None
+    gui._ExposureControllerGUI__root = None
+
+    gui._ExposureControllerGUI__update_live_status()
+
+    assert gui._ExposureControllerGUI__status_dose_value.text == "2.50 mJ/cm²"
+    assert gui._ExposureControllerGUI__status_time_value.text == "0.00 s"
