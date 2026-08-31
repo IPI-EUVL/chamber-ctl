@@ -1546,6 +1546,32 @@ class LaserSyncSubsystem(ExperimentClient):
     def __on_chopper_startup_time_read(self, _requester):
         return (magics.TRANSOP_STATE_OK, self.__chopper_startup_time)
 
+    def __on_chopper_frequency_write(self, _h, _requester, value: float):
+        if (
+            self.__experiment_active
+            or self.__preinit_handle is not None
+            or self.__start_handle is not None
+            or self.__stop_handle is not None
+        ):
+            return (magics.TRANSOP_STATE_REJ, b"Cannot change chopper target during an active exposure.")
+        ok, status = self.__sync.set_chopper_frequency_hz(value)
+        if not ok:
+            return (magics.TRANSOP_STATE_REJ, self.__to_bytes(status))
+        self.__logger.log(
+            f"Updated chopper target frequency to {float(value):.0f} Hz.",
+            level="INFO",
+            l_type="CTRL",
+            subsystem="Laser Sync Controller",
+            event="set_chopper_frequency",
+        )
+        return (magics.TRANSOP_STATE_OK, OP_OK)
+
+    def __on_chopper_frequency_read(self, _requester):
+        target_hz = self.__sync.get_hardware_status().target_chopper_frequency_hz
+        if target_hz is None:
+            return (magics.TRANSOP_STATE_REJ, b"Chopper target frequency is unavailable.")
+        return (magics.TRANSOP_STATE_OK, float(target_hz))
+
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):
         self.__subsystem = handle
 
@@ -1611,6 +1637,11 @@ class LaserSyncSubsystem(ExperimentClient):
         chopper_startup_kv.set_type(types.FloatTypeSpecifier())
         chopper_startup_kv.on_set(self.__on_chopper_startup_time_write)
         chopper_startup_kv.on_get(self.__on_chopper_startup_time_read)
+
+        chopper_frequency_kv = handle.add_kv_handler(b"chopper_frequency_hz")
+        chopper_frequency_kv.set_type(types.FloatTypeSpecifier())
+        chopper_frequency_kv.on_set(self.__on_chopper_frequency_write)
+        chopper_frequency_kv.on_get(self.__on_chopper_frequency_read)
 
         self._setup_subsystem(handle)
 

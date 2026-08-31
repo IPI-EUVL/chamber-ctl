@@ -19,7 +19,7 @@ import ipi_ecs.dds.types as types
 from ipi_ecs.logging.client import LogClient
 from ipi_ecs.cli.captive_cli import wait_for
 
-from chamber_ctl import ECS_IP, ECS_PORT
+from chamber_ctl import ECS_IP
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.laser import LaserSyncStatus
 
@@ -44,6 +44,7 @@ class LaserSyncTestGUI:
         self.__skew_rate_kv = None
         self.__laser_warmup_time_kv = None
         self.__chopper_startup_time_kv = None
+        self.__chopper_frequency_kv = None
         self.__status_kv = None
         self.__exp_state_kv = None
 
@@ -70,6 +71,7 @@ class LaserSyncTestGUI:
         self.__skew_rate_value = 1.0
         self.__laser_warmup_time_value = 5.0
         self.__chopper_startup_time_value = 5.0
+        self.__chopper_frequency_value = 192.0
 
         self.__progress_dialog = None
         self.__progress_text = None
@@ -159,6 +161,12 @@ class LaserSyncTestGUI:
         self.__chopper_startup_entry.insert(0, "5.0")
         self.__chopper_startup_entry.grid(row=2, column=1, padx=8, pady=8, sticky="w")
         tk.Button(tuning_frame, text="Set Chopper Startup", command=self.__on_set_chopper_startup_time).grid(row=2, column=2, padx=8, pady=8)
+
+        tk.Label(tuning_frame, text="Chopper Target (Hz)", font=("Arial", 11)).grid(row=3, column=0, padx=8, pady=8, sticky="w")
+        self.__chopper_frequency_entry = tk.Entry(tuning_frame, width=16)
+        self.__chopper_frequency_entry.insert(0, "192")
+        self.__chopper_frequency_entry.grid(row=3, column=1, padx=8, pady=8, sticky="w")
+        tk.Button(tuning_frame, text="Set Chopper Target", command=self.__on_set_chopper_frequency).grid(row=3, column=2, padx=8, pady=8)
 
         control_frame = tk.LabelFrame(frame, text="Isolated Control")
         control_frame.pack(fill=tk.X, pady=(8, 8))
@@ -260,6 +268,10 @@ class LaserSyncTestGUI:
             uuids.UUID_LASER_CONTROLLER,
             subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"chopper_startup_time", False, True, True),
         )
+        self.__chopper_frequency_kv = handle.add_remote_kv(
+            uuids.UUID_LASER_CONTROLLER,
+            subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"chopper_frequency_hz", False, True, True),
+        )
         self.__status_kv = handle.add_remote_kv(
             uuids.UUID_LASER_CONTROLLER,
             subsystem.KVDescriptor(types.ByteTypeSpecifier(), b"status", True, True, False),
@@ -317,6 +329,8 @@ class LaserSyncTestGUI:
                     self.__set_tuning_kv(self.__laser_warmup_time_kv, payload, "laser_warmup_time")
                 elif cmd == "set_chopper_startup_time":
                     self.__set_tuning_kv(self.__chopper_startup_time_kv, payload, "chopper_startup_time")
+                elif cmd == "set_chopper_frequency":
+                    self.__set_chopper_frequency(payload)
                 elif cmd == "preinit":
                     self.__call_preinit()
                 elif cmd == "init":
@@ -384,6 +398,16 @@ class LaserSyncTestGUI:
 
         self.__ui_queue.put(("timing", (self.__skew_rate_value, self.__laser_warmup_time_value, self.__chopper_startup_time_value)))
         self.__ui_queue.put(("result", msg))
+
+    def __set_chopper_frequency(self, value: float):
+        if self.__chopper_frequency_kv is None:
+            self.__ui_queue.put(("result", "Not connected to laser subsystem."))
+            return
+
+        awaiter = self.__chopper_frequency_kv.try_set(float(value))
+        wait_for(awaiter, timeout=5.0)
+        self.__chopper_frequency_value = float(value)
+        self.__ui_queue.put(("result", f"Set chopper controller target to {value:.0f} Hz"))
 
     def __call_preinit(self):
         if self.__preinit_event is None:
@@ -524,6 +548,11 @@ class LaserSyncTestGUI:
             if startup is not None:
                 self.__chopper_startup_time_value = startup
 
+        if self.__chopper_frequency_kv is not None:
+            frequency, _, _ = wait_for(self.__chopper_frequency_kv.try_get(), timeout=5.0)
+            if frequency is not None:
+                self.__chopper_frequency_value = frequency
+
         self.__ui_queue.put(("configured", (self.__preinit_phase_value, self.__target_phase_value, self.__initial_phase_value)))
         self.__ui_queue.put(("timing", (self.__skew_rate_value, self.__laser_warmup_time_value, self.__chopper_startup_time_value)))
 
@@ -660,6 +689,15 @@ class LaserSyncTestGUI:
             return
 
         self.__cmd_queue.put(("set_chopper_startup_time", value))
+
+    def __on_set_chopper_frequency(self):
+        try:
+            value = float(self.__chopper_frequency_entry.get().strip())
+        except ValueError:
+            self.__result_label.config(text="Last action: invalid chopper target value")
+            return
+
+        self.__cmd_queue.put(("set_chopper_frequency", value))
 
     def __on_preinit(self):
         self.__cmd_queue.put(("preinit", None))
