@@ -96,6 +96,55 @@ def test_live_tracker_reports_steady_rate_and_provisional_loss() -> None:
     assert two_second.estimated_lost_per_second == pytest.approx(1.5)
 
 
+def test_late_reports_reconcile_provisional_graph_history() -> None:
+    session_id = uuid.uuid4()
+    tracker = CaptureCadenceTracker()
+    tracker.reset(session_id)
+    tracker.set_expected_rate(100.0)
+    tracker.ingest(_observation(session_id, 0, 0), received_at_monotonic_ns=0)
+    tracker.ingest(_observation(session_id, 1, 10_000_000), received_at_monotonic_ns=10_000_000)
+
+    delayed = tracker.snapshot(100_000_000)
+
+    assert delayed.points[-1].provisional_lost_count == 8
+
+    for sequence in range(2, 21):
+        tracker.ingest(
+            _observation(session_id, sequence, sequence * 10_000_000),
+            received_at_monotonic_ns=200_000_000,
+        )
+    reconciled = tracker.snapshot(200_000_000)
+    historical = next(point for point in reconciled.points if point.sampled_at_monotonic_ns == 100_000_000)
+    two_second = next(item for item in historical.windows if item.window_seconds == 2.0)
+
+    assert historical.provisional_lost_count == 0
+    assert two_second.capture_rate_hz == pytest.approx(100.0)
+    assert two_second.estimated_lost_per_second == 0.0
+
+
+def test_late_report_converts_provisional_history_to_confirmed_loss() -> None:
+    session_id = uuid.uuid4()
+    tracker = CaptureCadenceTracker()
+    tracker.reset(session_id)
+    tracker.set_expected_rate(100.0)
+    tracker.ingest(_observation(session_id, 0, 0), received_at_monotonic_ns=0)
+    tracker.ingest(_observation(session_id, 1, 10_000_000), received_at_monotonic_ns=10_000_000)
+    tracker.snapshot(30_000_000)
+
+    for sequence, timestamp_ns in enumerate(range(40_000_000, 140_000_000, 10_000_000), start=2):
+        tracker.ingest(
+            _observation(session_id, sequence, timestamp_ns),
+            received_at_monotonic_ns=130_000_000,
+        )
+    reconciled = tracker.snapshot(130_000_000)
+    historical = next(point for point in reconciled.points if point.sampled_at_monotonic_ns == 30_000_000)
+    latest_window = next(item for item in reconciled.points[-1].windows if item.window_seconds == 2.0)
+
+    assert historical.provisional_lost_count == 0
+    assert reconciled.inferred_lost_count == 2
+    assert latest_window.estimated_lost_count == 2
+
+
 def test_timing_transition_starts_a_new_segment_without_counting_disabled_gap() -> None:
     session_id = uuid.uuid4()
     tracker = CaptureCadenceTracker()

@@ -146,6 +146,12 @@ class PhosphorScopeTk:
         self.buf += self.gain * hits.astype(np.float32)
 
     def _tick_render(self):
+        try:
+            visible = self.master.winfo_viewable()
+        except (AttributeError, tk.TclError):
+            visible = True
+        if not visible:
+            return
         if not self.paused:
             # Decay persistence
             self.buf *= self.decay

@@ -50,11 +50,27 @@ class AcquisitionControlState:
 @dataclass(frozen=True)
 class AcquisitionPipelineStatus:
     mode: str
+    worker: str
     fallback: str
     accepted_rate: str
     queues: str
     timings: str
     fault: str
+
+
+def coalesce_acquisition_ui_updates(
+    updates: list[tuple[str, object]],
+) -> tuple[tuple[str, object], ...]:
+    latest: dict[str, tuple[str, object]] = {}
+    ordered = []
+    for update in updates:
+        kind, _payload = update
+        if kind in {"status", "cadence"}:
+            latest[kind] = update
+        else:
+            ordered.append(update)
+    ordered.extend(latest[kind] for kind in ("status", "cadence") if kind in latest)
+    return tuple(ordered)
 
 
 def decode_acquisition_status(payload) -> dict:
@@ -120,7 +136,7 @@ def acquisition_status_metrics(status: dict | None) -> tuple[str, str]:
 
 
 def acquisition_pipeline_status(status: dict | None) -> AcquisitionPipelineStatus:
-    unavailable = AcquisitionPipelineStatus("N/A", "N/A", "N/A", "N/A", "N/A", "N/A")
+    unavailable = AcquisitionPipelineStatus("N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A")
     if not isinstance(status, dict):
         return unavailable
     metrics = status.get("pipeline_metrics")
@@ -144,6 +160,28 @@ def acquisition_pipeline_status(status: dict | None) -> AcquisitionPipelineStatu
     mode = effective or requested or "N/A"
     if requested is not None and effective is not None and requested != effective:
         mode = f"{effective} (requested {requested})"
+
+    capture_worker = metrics.get("capture_worker")
+    worker = "N/A"
+    if isinstance(capture_worker, dict):
+        pid = capture_worker.get("pid")
+        cpu = capture_worker.get("cpu")
+        scheduler = capture_worker.get("scheduler")
+        priority = capture_worker.get("realtime_priority")
+        if (
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and pid > 0
+            and isinstance(cpu, int)
+            and not isinstance(cpu, bool)
+            and cpu >= 0
+            and isinstance(scheduler, str)
+            and scheduler.strip()
+            and isinstance(priority, int)
+            and not isinstance(priority, bool)
+            and priority >= 0
+        ):
+            worker = f"PID {pid}; CPU {cpu}; {scheduler.upper()} {priority}"
 
     counters = metrics.get("counters")
     accepted = counters.get("accepted") if isinstance(counters, dict) else None
@@ -200,6 +238,7 @@ def acquisition_pipeline_status(status: dict | None) -> AcquisitionPipelineStatu
     fault = terminal_error.strip() if isinstance(terminal_error, str) and terminal_error.strip() else "none"
     return AcquisitionPipelineStatus(
         mode=mode,
+        worker=worker,
         fallback=fallback_reason or "none",
         accepted_rate=accepted_rate,
         queues=" | ".join(queue_values) or "N/A",
@@ -311,14 +350,15 @@ class AcquisitionGUI:
         self.__dose_text = tk.StringVar(value="Dose: N/A")
         self.__runtime_text = tk.StringVar(value="Transmitting time: N/A")
         self.__pipeline_mode_text = tk.StringVar(value="Mode: N/A")
+        self.__pipeline_worker_text = tk.StringVar(value="Worker: N/A")
         self.__pipeline_rate_text = tk.StringVar(value="Accepted: N/A")
         self.__pipeline_queues_text = tk.StringVar(value="Queues: N/A")
         self.__pipeline_timings_text = tk.StringVar(value="p95: N/A")
         self.__pipeline_fallback_text = tk.StringVar(value="Fallback: N/A")
         self.__pipeline_fault_text = tk.StringVar(value="Fault: N/A")
         self.__cadence_rate_text = tk.StringVar(value="Capture rate: N/A")
-        self.__cadence_loss_text = tk.StringVar(value="Estimated lost: N/A")
-        self.__cadence_total_text = tk.StringVar(value="Estimated missing: 0")
+        self.__cadence_loss_text = tk.StringVar(value="Live loss estimate: N/A")
+        self.__cadence_total_text = tk.StringVar(value="Confirmed missing: 0")
         self.__cadence_quality_text = tk.StringVar(value="Evidence: unavailable")
         self.__cadence_window = tk.IntVar(value=2)
         self.__preview_text = tk.StringVar(value="No waveform preview received.")
@@ -366,11 +406,12 @@ class AcquisitionGUI:
         pipeline.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(4, 0))
         pipeline.columnconfigure(2, weight=1)
         ttk.Label(pipeline, textvariable=self.__pipeline_mode_text).grid(row=0, column=0, sticky="w", padx=(0, 16))
-        ttk.Label(pipeline, textvariable=self.__pipeline_rate_text).grid(row=0, column=1, sticky="w", padx=(0, 16))
-        ttk.Label(pipeline, textvariable=self.__pipeline_queues_text).grid(row=0, column=2, sticky="w")
-        ttk.Label(pipeline, textvariable=self.__pipeline_timings_text).grid(row=1, column=0, columnspan=3, sticky="w")
-        ttk.Label(pipeline, textvariable=self.__pipeline_fallback_text).grid(row=2, column=0, columnspan=2, sticky="w", padx=(0, 16))
-        ttk.Label(pipeline, textvariable=self.__pipeline_fault_text).grid(row=2, column=2, sticky="w")
+        ttk.Label(pipeline, textvariable=self.__pipeline_worker_text).grid(row=0, column=1, sticky="w", padx=(0, 16))
+        ttk.Label(pipeline, textvariable=self.__pipeline_rate_text).grid(row=0, column=2, sticky="w")
+        ttk.Label(pipeline, textvariable=self.__pipeline_queues_text).grid(row=1, column=0, columnspan=3, sticky="w")
+        ttk.Label(pipeline, textvariable=self.__pipeline_timings_text).grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Label(pipeline, textvariable=self.__pipeline_fallback_text).grid(row=3, column=0, columnspan=2, sticky="w", padx=(0, 16))
+        ttk.Label(pipeline, textvariable=self.__pipeline_fault_text).grid(row=3, column=2, sticky="w")
 
         live_panes = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
         live_panes.grid(row=1, column=0, sticky="nsew")
@@ -726,46 +767,51 @@ class AcquisitionGUI:
         )
 
     def __ui_tick(self) -> None:
-        while True:
-            try:
-                kind, payload = self.__ui_queue.get_nowait()
-            except queue.Empty:
-                break
-            if kind == "connected":
-                self.__connection_text.set("DDS: connected")
-            elif kind == "connection_error":
-                self.__connection_text.set("DDS: unavailable")
-                self.__result_text.set(f"DDS setup failed: {payload}")
-            elif kind == "status":
-                self.__status = payload
-                self.__render_status(payload)
-            elif kind == "preview":
-                self.__display_new_preview(payload)
-            elif kind == "cadence":
-                self.__cadence = payload
-                self.__cadence_chart.update(payload)
-                self.__render_cadence_metrics()
-            elif kind == "cadence_plot_ready":
-                self.__cadence_plot_pending = False
+        try:
+            updates = []
+            while True:
                 try:
-                    show_capture_cadence_figure(payload)
-                except Exception as exc:
-                    self.__result_text.set(f"Could not open capture integrity graph: {exc}")
-                else:
-                    self.__result_text.set("Opened capture integrity graph for the last exposure.")
-            elif kind == "cadence_plot_error":
-                self.__cadence_plot_pending = False
-                self.__result_text.set(f"Could not prepare capture integrity graph: {payload}")
-            elif kind == "feedback":
-                _action, message = payload
-                self.__result_text.set(message)
-            elif kind == "result":
-                action, message = payload
-                self.__pending_actions.discard(action)
-                self.__result_text.set(message)
-            self.__render_controls()
-        if self.__run:
-            self.__ui_job = self.__root.after(self.UI_UPDATE_MS, self.__ui_tick)
+                    updates.append(self.__ui_queue.get_nowait())
+                except queue.Empty:
+                    break
+            for kind, payload in coalesce_acquisition_ui_updates(updates):
+                if kind == "connected":
+                    self.__connection_text.set("DDS: connected")
+                elif kind == "connection_error":
+                    self.__connection_text.set("DDS: unavailable")
+                    self.__result_text.set(f"DDS setup failed: {payload}")
+                elif kind == "status":
+                    self.__status = payload
+                    self.__render_status(payload)
+                elif kind == "preview":
+                    self.__display_new_preview(payload)
+                elif kind == "cadence":
+                    self.__cadence = payload
+                    self.__cadence_chart.update(payload)
+                    self.__render_cadence_metrics()
+                elif kind == "cadence_plot_ready":
+                    self.__cadence_plot_pending = False
+                    try:
+                        show_capture_cadence_figure(payload)
+                    except Exception as exc:
+                        self.__result_text.set(f"Could not open capture integrity graph: {exc}")
+                    else:
+                        self.__result_text.set("Opened capture integrity graph for the last exposure.")
+                elif kind == "cadence_plot_error":
+                    self.__cadence_plot_pending = False
+                    self.__result_text.set(f"Could not prepare capture integrity graph: {payload}")
+                elif kind == "feedback":
+                    _action, message = payload
+                    self.__result_text.set(message)
+                elif kind == "result":
+                    action, message = payload
+                    self.__pending_actions.discard(action)
+                    self.__result_text.set(message)
+            if updates:
+                self.__render_controls()
+        finally:
+            if self.__run:
+                self.__ui_job = self.__root.after(self.UI_UPDATE_MS, self.__ui_tick)
 
     def __select_cadence_window(self) -> None:
         self.__cadence_chart.set_window(float(self.__cadence_window.get()))
@@ -805,14 +851,14 @@ class AcquisitionGUI:
             "Capture rate: N/A" if capture_rate is None else f"Capture rate: {capture_rate:.1f} Hz"
         )
         self.__cadence_loss_text.set(
-            "Estimated lost: N/A" if lost_rate is None else f"Estimated lost: {lost_rate:.2f}/s"
+            "Live loss estimate: N/A" if lost_rate is None else f"Live loss estimate: {lost_rate:.2f}/s"
         )
         omitted = (
             ""
             if cadence.omitted_gap_count == 0
             else f" ({cadence.omitted_gap_count} live marker(s) omitted)"
         )
-        self.__cadence_total_text.set(f"Estimated missing: {cadence.inferred_lost_count}{omitted}")
+        self.__cadence_total_text.set(f"Confirmed missing: {cadence.inferred_lost_count}{omitted}")
         self.__cadence_quality_text.set(f"Evidence: {cadence.quality.value.replace('_', '-')}")
 
     def __render_status(self, status: dict) -> None:
@@ -827,6 +873,7 @@ class AcquisitionGUI:
         self.__runtime_text.set(f"Transmitting time: {runtime}")
         pipeline = acquisition_pipeline_status(status)
         self.__pipeline_mode_text.set(f"Mode: {pipeline.mode}")
+        self.__pipeline_worker_text.set(f"Worker: {pipeline.worker}")
         self.__pipeline_rate_text.set(f"Accepted: {pipeline.accepted_rate}")
         self.__pipeline_queues_text.set(f"Queues: {pipeline.queues}")
         self.__pipeline_timings_text.set(f"p95: {pipeline.timings}")

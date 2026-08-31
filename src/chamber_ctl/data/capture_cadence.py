@@ -561,6 +561,7 @@ class CaptureCadenceTracker:
         self._segment_anchor_board_ns: int | None = None
         self._segment_anchor_local_ns: int | None = None
         self._last_sample_ns: int | None = None
+        self._points_need_reconciliation = False
         self._captured_count = 0
         self._inferred_lost_count = 0
         self._ambiguous_gap_count = 0
@@ -625,6 +626,7 @@ class CaptureCadenceTracker:
                 self._ambiguous_gap_count += 1
         self._observations.append(live_observation)
         self._segment_observations.append(live_observation)
+        self._points_need_reconciliation = bool(self._points)
         self._captured_count += 1
         self._prune(received_ns)
         return gap
@@ -647,6 +649,7 @@ class CaptureCadenceTracker:
     def sample(self, sampled_at_monotonic_ns: int | None = None) -> LiveCadencePoint:
         sampled_ns = time.monotonic_ns() if sampled_at_monotonic_ns is None else sampled_at_monotonic_ns
         _non_negative_integer("sampled_at_monotonic_ns", sampled_ns)
+        self._reconcile_segment_points()
         provisional = self._provisional_lost_count(sampled_ns)
         windows = tuple(self._rolling_cadence(sampled_ns, window, provisional) for window in self.rolling_windows_seconds)
         quality = CadenceQuality.TIMESTAMP_INFERRED if self._expected_rate_hz is not None else CadenceQuality.UNAVAILABLE
@@ -713,6 +716,29 @@ class CaptureCadenceTracker:
             captured_count=captured,
             estimated_lost_count=lost,
         )
+
+    def _reconcile_segment_points(self) -> None:
+        if not self._points_need_reconciliation or not self._segment_observations:
+            return
+        segment_start_ns = self._segment_observations[0].projected_monotonic_ns
+        self._points = deque(
+            point
+            if point.sampled_at_monotonic_ns < segment_start_ns
+            else replace(
+                point,
+                windows=tuple(
+                    self._rolling_cadence(
+                        point.sampled_at_monotonic_ns,
+                        window.window_seconds,
+                        self._provisional_lost_count(point.sampled_at_monotonic_ns),
+                    )
+                    for window in point.windows
+                ),
+                provisional_lost_count=self._provisional_lost_count(point.sampled_at_monotonic_ns),
+            )
+            for point in self._points
+        )
+        self._points_need_reconciliation = False
 
     def _prune(self, now_ns: int) -> None:
         cutoff = now_ns - self._retention_ns

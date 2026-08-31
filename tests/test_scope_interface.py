@@ -24,16 +24,23 @@ class _Axis:
 
 
 class _Canvas:
+    def __init__(self):
+        self.draw_count = 0
+
     def draw_idle(self):
-        pass
+        self.draw_count += 1
 
 
 class _Master:
     def __init__(self):
         self.cancelled = []
+        self.viewable = True
 
     def after_cancel(self, job):
         self.cancelled.append(job)
+
+    def winfo_viewable(self):
+        return self.viewable
 
 
 def _scope() -> PhosphorScopeTk:
@@ -49,6 +56,8 @@ def _scope() -> PhosphorScopeTk:
     scope.im = _Image()
     scope.ax = _Axis()
     scope.canvas = _Canvas()
+    scope.paused = False
+    scope.decay = 0.5
     scope._closed = False
     scope._after_job = "job-1"
     return scope
@@ -77,3 +86,20 @@ def test_scope_close_cancels_scheduled_redraw_once() -> None:
     assert scope.master.cancelled == ["job-1"]
     assert scope._after_job is None
     assert scope._closed is True
+
+
+def test_scope_skips_rendering_while_its_tab_is_hidden() -> None:
+    scope = _scope()
+    scope.buf.fill(1.0)
+    scope.master.viewable = False
+
+    scope._tick_render()
+
+    assert np.all(scope.buf == 1.0)
+    assert scope.canvas.draw_count == 0
+
+    scope.master.viewable = True
+    scope._tick_render()
+
+    assert np.all(scope.buf == 0.5)
+    assert scope.canvas.draw_count == 1

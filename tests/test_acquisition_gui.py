@@ -8,6 +8,7 @@ from chamber_ctl.gui.acquisition import (
     acquisition_pipeline_status,
     acquisition_status_detail,
     acquisition_status_metrics,
+    coalesce_acquisition_ui_updates,
     decode_acquisition_status,
 )
 from chamber_ctl.gui.central import ACQUISITION_WORKSPACE_TABS, CentralGUI
@@ -58,6 +59,26 @@ def test_status_decoder_accepts_dds_byte_lists() -> None:
     assert status == {"state": "idle"}
 
 
+def test_ui_updates_keep_only_latest_status_and_cadence() -> None:
+    updates = [
+        ("status", {"sequence": 1}),
+        ("preview", "first-preview"),
+        ("cadence", "first-cadence"),
+        ("result", ("stop", "complete")),
+        ("status", {"sequence": 2}),
+        ("preview", "second-preview"),
+        ("cadence", "latest-cadence"),
+    ]
+
+    assert coalesce_acquisition_ui_updates(updates) == (
+        ("preview", "first-preview"),
+        ("result", ("stop", "complete")),
+        ("preview", "second-preview"),
+        ("status", {"sequence": 2}),
+        ("cadence", "latest-cadence"),
+    )
+
+
 def test_acquisition_status_formats_live_metrics_and_transferred_snapshots() -> None:
     status = {
         "state": "diagnostic_running",
@@ -83,6 +104,12 @@ def test_pipeline_status_formats_mode_rate_queues_timings_and_fault() -> None:
                 "effective": "single-shot",
                 "fallback_reason": "AXI unavailable",
             },
+            "capture_worker": {
+                "pid": 123,
+                "cpu": 1,
+                "scheduler": "fifo",
+                "realtime_priority": 20,
+            },
             "counters": {"accepted": 192},
             "elapsed_seconds": 2.0,
             "queues": {
@@ -102,6 +129,7 @@ def test_pipeline_status_formats_mode_rate_queues_timings_and_fault() -> None:
     pipeline = acquisition_pipeline_status(status)
 
     assert pipeline.mode == "single-shot (requested auto)"
+    assert pipeline.worker == "PID 123; CPU 1; FIFO 20"
     assert pipeline.fallback == "AXI unavailable"
     assert pipeline.accepted_rate == "96.0 Hz (192 total)"
     assert pipeline.queues == (

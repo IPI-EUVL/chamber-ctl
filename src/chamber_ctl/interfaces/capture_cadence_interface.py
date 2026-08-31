@@ -92,7 +92,7 @@ class CaptureCadenceChart:
             [], [], color="#df6b62", linewidth=1.8, label="Estimated loss"
         )
         self._provisional_markers = self.loss_axis.scatter(
-            [], [], color="#f0a84f", marker="o", s=24, zorder=4, label="Provisional"
+            [], [], color="#f0a84f", marker="o", s=24, zorder=4, label="Awaiting report"
         )
         self._gap_markers = self.loss_axis.scatter(
             [], [], color="#f5d76e", marker="v", s=40, zorder=5, label="Confirmed gap"
@@ -179,7 +179,15 @@ class CaptureCadenceChart:
         loss_max = _finite_max(series.estimated_lost_per_second, 1.0)
         self.capture_axis.set_ylim(0.0, capture_max * 1.12)
         self.loss_axis.set_ylim(0.0, loss_max * 1.2)
-        self.canvas.draw_idle()
+        self._draw_idle_if_visible()
+
+    def _draw_idle_if_visible(self) -> None:
+        try:
+            visible = self.canvas.get_tk_widget().winfo_viewable()
+        except (AttributeError, tk.TclError):
+            visible = True
+        if visible:
+            self.canvas.draw_idle()
 
     @staticmethod
     def _loss_value_at(series: CadencePlotSeries, relative_seconds: float) -> float:
@@ -204,7 +212,7 @@ class CaptureCadenceChart:
         self.capture_axis.set_xlim(-5.0, 0.0)
         self.capture_axis.set_ylim(0.0, 1.0)
         self.loss_axis.set_ylim(0.0, 1.0)
-        self.canvas.draw_idle()
+        self._draw_idle_if_visible()
 
     def close(self) -> None:
         if self._closed:
