@@ -175,6 +175,104 @@ def test_experiment_entry_analysis_dispatches_hdf5_with_embedded_calibration(tmp
         library.close()
 
 
+def test_experiment_entry_analysis_ignores_non_authoritative_hdf5_sessions(tmp_path) -> None:
+    from euv_acquisition.analysis import analyze_pulse
+    from euv_acquisition.models import CaptureConfig, CapturedPulse, PulseRecord, SnapshotCloseReason
+    from euv_acquisition.snapshot import SnapshotStore
+
+    profile = _profile()
+    config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=4e-6, pretrigger_seconds=1e-6)
+    source_store = SnapshotStore(tmp_path / "source")
+    primary_session = uuid.uuid4()
+    observer_session = uuid.uuid4()
+    primary_samples = np.array([0.0, 0.2, 0.2, 0.0], dtype=np.float32)
+    observer_samples = np.array([0.0, 0.9, 0.9, 0.0], dtype=np.float32)
+    primary = source_store.write(
+        [PulseRecord(primary_session, 0, CapturedPulse(primary_samples, 1, 1), analyze_pulse(primary_samples, config))],
+        config,
+        SnapshotCloseReason.CAPTURE_STOP,
+        source_kind="red_pitaya",
+        source_id="primary",
+    )
+    observer = source_store.write(
+        [PulseRecord(observer_session, 0, CapturedPulse(observer_samples, 2, 2), analyze_pulse(observer_samples, config))],
+        config,
+        SnapshotCloseReason.CAPTURE_STOP,
+        source_kind="siglent",
+        source_id="observer",
+    )
+    expected = analyze_hdf5_snapshot(source_store.path_for(primary), profile)
+    records_path = tmp_path / "records"
+    records_path.mkdir()
+    library = Library(records_path)
+    entry = library.create_entry("Exposure", "Mixed-source fixture")
+    try:
+        with entry.resource("euv_calibration_profile.json", "euv_calibration_profile", "w") as resource:
+            json.dump(profile.to_dict(), resource)
+        with entry.resource("euv_capture_session.json", "euv_capture_session", "w") as resource:
+            json.dump(
+                {
+                    "session_id": str(primary_session),
+                    "role": "authoritative",
+                    "source_kind": "red_pitaya",
+                    "source_id": "primary",
+                },
+                resource,
+            )
+        for manifest in (primary, observer):
+            with entry.resource(manifest.filename, "euv_snapshot", "wb") as resource:
+                resource.write(source_store.path_for(manifest).read_bytes())
+
+        result = analyze_experiment_entry(uuid.uuid4(), entry, runtime_seconds=0.0)
+
+        assert tuple(summary.snapshot_id for summary in result.snapshots) == (primary.snapshot_id,)
+        assert result.total_dose_mj_cm2 == pytest.approx(expected.total_dose_mj_cm2)
+    finally:
+        library.close()
+
+
+def test_experiment_entry_analysis_rejects_mismatched_authoritative_source_identity(tmp_path) -> None:
+    from euv_acquisition.analysis import analyze_pulse
+    from euv_acquisition.models import CaptureConfig, CapturedPulse, PulseRecord, SnapshotCloseReason
+    from euv_acquisition.snapshot import SnapshotStore
+
+    profile = _profile()
+    config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=4e-6, pretrigger_seconds=1e-6)
+    session_id = uuid.uuid4()
+    samples = np.array([0.0, 0.2, 0.2, 0.0], dtype=np.float32)
+    source_store = SnapshotStore(tmp_path / "source")
+    manifest = source_store.write(
+        [PulseRecord(session_id, 0, CapturedPulse(samples, 1, 1), analyze_pulse(samples, config))],
+        config,
+        SnapshotCloseReason.CAPTURE_STOP,
+        source_kind="red_pitaya",
+        source_id="actual",
+    )
+    records_path = tmp_path / "records"
+    records_path.mkdir()
+    library = Library(records_path)
+    entry = library.create_entry("Exposure", "Mismatched-source fixture")
+    try:
+        with entry.resource("euv_calibration_profile.json", "euv_calibration_profile", "w") as resource:
+            json.dump(profile.to_dict(), resource)
+        with entry.resource("euv_capture_session.json", "euv_capture_session", "w") as resource:
+            json.dump(
+                {
+                    "session_id": str(session_id),
+                    "source_kind": "red_pitaya",
+                    "source_id": "wrong",
+                },
+                resource,
+            )
+        with entry.resource(manifest.filename, "euv_snapshot", "wb") as resource:
+            resource.write(source_store.path_for(manifest).read_bytes())
+
+        with pytest.raises(ValueError, match="does not match HDF5 source identity"):
+            analyze_experiment_entry(uuid.uuid4(), entry)
+    finally:
+        library.close()
+
+
 def test_hdf5_dose_series_uses_measured_dose_and_exact_capture_runtime(tmp_path) -> None:
     from euv_acquisition.analysis import analyze_pulse
     from euv_acquisition.models import CaptureConfig, CapturedPulse, PulseRecord, SnapshotCloseReason

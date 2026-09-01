@@ -27,6 +27,77 @@ def _finite(name: str, value: float, *, positive: bool = False) -> float:
     return result
 
 
+@dataclass(frozen=True, order=True)
+class SourceKey:
+    source_kind: str
+    source_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("source_kind", "source_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be non-empty text.")
+
+
+@dataclass(frozen=True)
+class SourceCalibrationBinding:
+    source_kind: str
+    source_id: str
+    profile_id: uuid.UUID
+    revision: int
+
+    def __post_init__(self) -> None:
+        SourceKey(self.source_kind, self.source_id)
+        if not isinstance(self.profile_id, uuid.UUID):
+            raise ValueError("Source calibration profile_id must be a UUID.")
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int) or self.revision < 1:
+            raise ValueError("Source calibration revision must be a positive integer.")
+
+    @property
+    def source_key(self) -> SourceKey:
+        return SourceKey(self.source_kind, self.source_id)
+
+    def to_dict(self) -> dict:
+        return {
+            "source_kind": self.source_kind,
+            "source_id": self.source_id,
+            "profile_id": str(self.profile_id),
+            "revision": self.revision,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SourceCalibrationBinding":
+        expected = {"source_kind", "source_id", "profile_id", "revision"}
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError("Source calibration binding contains unknown or missing fields.")
+        try:
+            profile_id = uuid.UUID(str(value["profile_id"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Source calibration profile_id is invalid.") from exc
+        revision = value["revision"]
+        if isinstance(revision, bool) or not isinstance(revision, int):
+            raise ValueError("Source calibration revision must be an integer.")
+        return cls(
+            source_kind=value["source_kind"],
+            source_id=value["source_id"],
+            profile_id=profile_id,
+            revision=revision,
+        )
+
+
+def normalize_source_calibration_bindings(values: object) -> tuple[SourceCalibrationBinding, ...]:
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("Source calibration bindings must be a list.")
+    bindings = tuple(
+        value if isinstance(value, SourceCalibrationBinding) else SourceCalibrationBinding.from_dict(value)
+        for value in values
+    )
+    keys = [binding.source_key for binding in bindings]
+    if len(set(keys)) != len(keys):
+        raise ValueError("Source calibration bindings must have unique source identities.")
+    return bindings
+
+
 @dataclass(frozen=True)
 class CalibrationProfile:
     profile_id: uuid.UUID

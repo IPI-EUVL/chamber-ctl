@@ -12,17 +12,112 @@ from typing import Any
 import numpy as np
 
 from chamber_ctl.data.calibration import CalibrationProfile
+from chamber_ctl.data.legacy_siglent import (
+    EXPOSURE_START_UNSPECIFIED,
+    LEGACY_ANALYSIS_VERSION,
+    analyze_legacy_siglent_snapshot,
+)
 
 
 ANALYSIS_SCHEMA_VERSION = 1
 ANALYSIS_RESOURCE_TYPE = "dose_analysis"
 HDF5_SNAPSHOT_RESOURCE_TYPE = "euv_snapshot"
-LEGACY_ANALYSIS_VERSION = "legacy-siglent-v1-sequence-gap-compensation"
 HDF5_ANALYSIS_VERSION = "pitaya-hdf5-v1-exact-pulse-sum"
 CALIBRATION_PROVENANCE_RESOURCE = "euv_calibration_profile.json"
+CAPTURE_SESSION_RESOURCE = "euv_capture_session.json"
+CAPTURE_SESSION_RESOURCE_TYPE = "euv_capture_session"
 CAPTURE_TIMELINE_RESOURCE = "euv_capture_timeline.json"
 CAPTURE_TIMELINE_RESOURCE_TYPE = "euv_capture_timeline"
 CAPTURE_TIMELINE_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class Hdf5SnapshotIdentity:
+    session_id: uuid.UUID
+    source_kind: str
+    source_id: str
+
+
+def hdf5_snapshot_identity(payload: bytes, *, filename: str = "HDF5 snapshot") -> Hdf5SnapshotIdentity:
+    import h5py
+
+    try:
+        with h5py.File(io.BytesIO(payload), "r") as snapshot:
+            identity = Hdf5SnapshotIdentity(
+                session_id=uuid.UUID(str(snapshot.attrs["session_id"])),
+                source_kind=str(snapshot.attrs["source_kind"]),
+                source_id=str(snapshot.attrs["source_id"]),
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"HDF5 snapshot {filename} has invalid source identity.") from exc
+    if not identity.source_kind.strip() or not identity.source_id.strip():
+        raise ValueError(f"HDF5 snapshot {filename} has empty source identity.")
+    return identity
+
+
+def hdf5_snapshot_session_id(payload: bytes, *, filename: str = "HDF5 snapshot") -> uuid.UUID:
+    return hdf5_snapshot_identity(payload, filename=filename).session_id
+
+
+def _hdf5_session_id(entry, filename: str) -> uuid.UUID:
+    with entry.resource(filename, HDF5_SNAPSHOT_RESOURCE_TYPE, "rb") as resource:
+        return hdf5_snapshot_session_id(resource.read(), filename=filename)
+
+
+def resolve_authoritative_hdf5_session(entry, resources: dict[str, str] | None = None) -> uuid.UUID | None:
+    inventory = dict(entry.list_resources()) if resources is None else resources
+    hdf5_names = tuple(
+        name
+        for name, resource_type in inventory.items()
+        if resource_type == HDF5_SNAPSHOT_RESOURCE_TYPE and name.startswith("snap_") and name.endswith(".h5")
+    )
+    if not hdf5_names:
+        return None
+
+    identities = {}
+    for name in hdf5_names:
+        with entry.resource(name, HDF5_SNAPSHOT_RESOURCE_TYPE, "rb") as resource:
+            identities[name] = hdf5_snapshot_identity(resource.read(), filename=name)
+    session_ids = {identity.session_id for identity in identities.values()}
+    session_value = None
+    source_kind = None
+    source_id = None
+    if CAPTURE_SESSION_RESOURCE in inventory:
+        if inventory[CAPTURE_SESSION_RESOURCE] != CAPTURE_SESSION_RESOURCE_TYPE:
+            raise ValueError("Capture session resource has an unexpected type.")
+        with entry.resource(CAPTURE_SESSION_RESOURCE, CAPTURE_SESSION_RESOURCE_TYPE, "r") as resource:
+            value = json.load(resource)
+        if not isinstance(value, dict):
+            raise ValueError("Capture session resource must contain an object.")
+        session_value = value.get("session_id")
+        source_kind = value.get("source_kind")
+        source_id = value.get("source_id")
+        if (source_kind is None) != (source_id is None):
+            raise ValueError("Authoritative capture provenance has incomplete source identity.")
+    elif entry.get_tags().get("euv_capture_session_id") is not None:
+        session_value = entry.get_tags()["euv_capture_session_id"]
+
+    if session_value is not None:
+        try:
+            authoritative = uuid.UUID(str(session_value))
+        except ValueError as exc:
+            raise ValueError("Authoritative capture session ID is not a UUID.") from exc
+        if authoritative not in session_ids:
+            raise ValueError("Authoritative capture session has no registered HDF5 snapshots.")
+        authoritative_identities = {
+            identity for identity in identities.values() if identity.session_id == authoritative
+        }
+        if len(authoritative_identities) != 1:
+            raise ValueError("Authoritative capture session has conflicting HDF5 source identities.")
+        actual = next(iter(authoritative_identities))
+        if source_kind is not None and (actual.source_kind != source_kind or actual.source_id != source_id):
+            raise ValueError("Authoritative capture provenance does not match HDF5 source identity.")
+        return authoritative
+    if len(session_ids) == 1:
+        if len(set(identities.values())) != 1:
+            raise ValueError("HDF5 capture session has conflicting source identities.")
+        return next(iter(session_ids))
+    raise ValueError("Multiple HDF5 capture sessions require authoritative capture provenance.")
 
 
 def load_hdf5_snapshot_pulses(entry, snapshot_id: uuid.UUID) -> np.ndarray:
@@ -350,62 +445,26 @@ def analyze_legacy_snapshot(
     *,
     source_sha256: str,
 ) -> SnapshotDoseSummary:
-    data = np.asarray(waveform, dtype=float)
-    pulse_indexes = np.asarray(indexes)
-    if data.ndim != 2 or data.shape[1] < 2 or not np.isfinite(data[:, :2]).all():
-        raise ValueError("Legacy snapshot waveform must have finite time and voltage columns.")
-    if pulse_indexes.ndim != 2 or pulse_indexes.shape[1] < 2:
-        raise ValueError("Legacy snapshot indexes must include sample index and timestamp columns.")
-    if len(pulse_indexes) == 0:
-        return SnapshotDoseSummary(snapshot_id, "legacy_siglent_npz", LEGACY_ANALYSIS_VERSION, source_sha256, 0, None, None, 0.0, 0.0)
-    sample_indexes = pulse_indexes[:, 0].astype(int)
-    pulse_times = pulse_indexes[:, 1].astype(float)
-    if np.any(sample_indexes < 0) or np.any(sample_indexes >= len(data)) or np.any(np.diff(sample_indexes) <= 0):
-        raise ValueError("Legacy snapshot indexes must be ordered valid sample offsets.")
-    if not np.isfinite(pulse_times).all() or np.any(np.diff(pulse_times) < 0):
-        raise ValueError("Legacy snapshot pulse timestamps must be finite and ordered.")
-
-    pulse_doses = []
-    for position, sample_index in enumerate(sample_indexes):
-        stop = sample_indexes[position + 1] if position + 1 < len(sample_indexes) else len(data)
-        pulse = data[sample_index:stop, :2]
-        baseline = float(np.mean(pulse[: min(25, len(pulse)), 1]))
-        integral = float(np.trapezoid(pulse[:, 1] - baseline, pulse[:, 0]))
-        pulse_doses.append(calibration.dose_for_integral(integral))
-
-    average = float(np.mean(pulse_doses))
-    pulse_span = float(pulse_times[-1] - pulse_times[0]) if len(pulse_times) > 1 else 0.0
-    inferred_step = len(pulse_doses) < 2 or float(np.mean(pulse_doses[-50:])) < 0.1 * average
-    is_step = metadata.get("is_step_exposure", inferred_step)
-    if not isinstance(is_step, bool):
-        raise ValueError("Legacy is_step_exposure must be boolean.")
-    wall_duration = (_finite("end_unix_ns", end_unix_ns) - _finite("start_unix_ns", start_unix_ns)) / 1e9
-    if wall_duration < 0:
-        raise ValueError("Legacy snapshot end timestamp precedes start timestamp.")
-    effective_duration = pulse_span if is_step else wall_duration
-    total = average * effective_duration * 100.0
-
-    if "exposure_start_ns" not in metadata:
-        runtime = effective_duration
-    elif metadata["exposure_start_ns"] is None:
-        runtime = 0.0
-    else:
-        runtime = max(
-            0.0,
-            _finite("end_unix_ns", end_unix_ns)
-            - max(_finite("start_unix_ns", start_unix_ns), _finite("exposure_start_ns", metadata["exposure_start_ns"]))
-        ) / 1e9
+    analysis = analyze_legacy_siglent_snapshot(
+        start_unix_ns,
+        end_unix_ns,
+        waveform,
+        indexes,
+        dose_for_integral=calibration.dose_for_integral,
+        is_step_exposure=metadata.get("is_step_exposure"),
+        exposure_start_ns=metadata.get("exposure_start_ns", EXPOSURE_START_UNSPECIFIED),
+    )
     return SnapshotDoseSummary(
         snapshot_id=snapshot_id,
         source_format="legacy_siglent_npz",
         source_algorithm_version=LEGACY_ANALYSIS_VERSION,
         source_sha256=source_sha256,
-        pulse_count=len(pulse_doses),
+        pulse_count=len(analysis.pulse_doses_mj_cm2),
         first_sequence=None,
         final_sequence=None,
-        total_dose_mj_cm2=total,
-        average_pulse_dose_mj_cm2=average,
-        runtime_seconds=runtime,
+        total_dose_mj_cm2=analysis.total_dose_mj_cm2,
+        average_pulse_dose_mj_cm2=analysis.average_pulse_dose_mj_cm2,
+        runtime_seconds=analysis.runtime_contribution_seconds,
     )
 
 
@@ -529,11 +588,13 @@ def write_analysis_revision(entry, revision: DoseAnalysisRevision, *, promote: b
 def analyze_experiment_entry(run_uuid: uuid.UUID, entry, *, runtime_seconds: float | None = None) -> DoseAnalysisResult:
     resources = dict(entry.list_resources())
     calibration = load_experiment_calibration(entry)
+    authoritative_session = resolve_authoritative_hdf5_session(entry, resources)
 
     summaries = []
     for filename, resource_type in resources.items():
         if resource_type == HDF5_SNAPSHOT_RESOURCE_TYPE and filename.startswith("snap_") and filename.endswith(".h5"):
-            summaries.append(analyze_hdf5_snapshot_resource(entry, uuid.UUID(filename[5:-3]), calibration))
+            if _hdf5_session_id(entry, filename) == authoritative_session:
+                summaries.append(analyze_hdf5_snapshot_resource(entry, uuid.UUID(filename[5:-3]), calibration))
         elif resource_type == "snapshot" and filename.startswith("snap_") and filename.endswith(".npz"):
             snapshot_id = uuid.UUID(filename[5:-4])
             with entry.resource(filename, "snapshot", "rb") as resource:

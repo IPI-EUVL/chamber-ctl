@@ -22,8 +22,10 @@ from chamber_ctl.data.dose_analysis import (
     HDF5_SNAPSHOT_RESOURCE_TYPE,
     CaptureTimelinePoint,
     analyze_legacy_snapshot,
+    hdf5_snapshot_session_id,
     load_capture_timeline,
     load_experiment_calibration,
+    resolve_authoritative_hdf5_session,
 )
 from ipi_ecs.subsystems.run_events import RUN_EVENT_RESOURCE, load_run_event_timeline
 
@@ -452,6 +454,10 @@ def _active_analysis_totals(entry: Any, resources: dict[str, str], source_digest
 def _source_graph(run_id: uuid.UUID, entry: Any) -> _SourceGraph:
     resources = dict(entry.list_resources())
     calibration = load_experiment_calibration(entry)
+    try:
+        authoritative_session = resolve_authoritative_hdf5_session(entry, resources)
+    except ValueError as exc:
+        raise ExposureGraphValidationError(f"Authoritative capture session is invalid: {exc}") from exc
     source_digests: dict[str, str] = {}
     if CALIBRATION_PROVENANCE_RESOURCE in resources:
         source_digests[CALIBRATION_PROVENANCE_RESOURCE] = _resource_digest(
@@ -480,6 +486,12 @@ def _source_graph(run_id: uuid.UUID, entry: Any) -> _SourceGraph:
         if resource_type == HDF5_SNAPSHOT_RESOURCE_TYPE and name.endswith(".h5"):
             snapshot_id = _snapshot_id_from_name(name, ".h5")
             payload = _resource_bytes(entry, name, resource_type)
+            try:
+                session_id = hdf5_snapshot_session_id(payload, filename=name)
+            except ValueError as exc:
+                raise ExposureGraphValidationError(str(exc)) from exc
+            if session_id != authoritative_session:
+                continue
             source_digests[name] = _resource_digest(payload)
             snapshot_pulses = _native_snapshot_pulses(payload, snapshot_id, calibration, source_index_start=source_index)
             source_index += len(snapshot_pulses)

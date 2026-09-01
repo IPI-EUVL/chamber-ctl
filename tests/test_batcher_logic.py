@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from chamber_ctl.data.calibration import SourceCalibrationBinding
 from chamber_ctl.subsystems.batcher import (
     BatchCoordinator,
     BatchCoordinatorConfig,
@@ -119,6 +120,7 @@ def test_empty_history_starts_first_sample_with_independent_full_settings() -> N
         "calibration_profile_id": "",
         "calibration_revision": 0,
         "chopper_frequency_hz": 192.0,
+        "source_calibrations": [],
     }
     assert second.decision.settings is not first.decision.settings
 
@@ -142,7 +144,7 @@ def test_sample_overrides_round_trip_merge_into_settings_and_survive_target_rege
         (2,),
     )
 
-    assert encoded["schema_version"] == 3
+    assert encoded["schema_version"] == 4
     assert dict(restored.entries[0].overrides) == {"operator": "Override operator", "flow_sccm": 4.5}
     assert settings.get_operator() == "Override operator"
     assert settings.get_flow_sccm() == pytest.approx(4.5)
@@ -157,6 +159,7 @@ def test_legacy_plan_entries_load_without_overrides() -> None:
     encoded["template"].pop("calibration_profile_id")
     encoded["template"].pop("calibration_revision")
     encoded["template"].pop("chopper_frequency_hz")
+    encoded["template"].pop("source_calibrations")
     encoded["entries"][0].pop("overrides")
 
     restored = batch_plan_from_dict(encoded)
@@ -172,6 +175,7 @@ def test_schema_two_plan_entries_preserve_overrides_without_calibration_fields()
     encoded["template"].pop("calibration_profile_id")
     encoded["template"].pop("calibration_revision")
     encoded["template"].pop("chopper_frequency_hz")
+    encoded["template"].pop("source_calibrations")
 
     restored = batch_plan_from_dict(encoded)
 
@@ -179,6 +183,30 @@ def test_schema_two_plan_entries_preserve_overrides_without_calibration_fields()
     assert restored.template.calibration_profile_id == ""
     assert restored.template.calibration_revision == 0
     assert restored.template.chopper_frequency_hz is None
+
+
+def test_schema_three_plan_loads_without_source_calibrations() -> None:
+    encoded = batch_plan_to_dict(_plan())
+    encoded["schema_version"] = 3
+    encoded["template"].pop("source_calibrations")
+
+    restored = batch_plan_from_dict(encoded)
+
+    assert restored.template.source_calibrations == ()
+
+
+def test_batch_plan_round_trips_source_calibration_bindings() -> None:
+    binding = SourceCalibrationBinding("siglent", "scope-1", uuid.uuid4(), 2)
+    plan = BatchPlan(
+        ExposureTemplate("Source calibrated", source_calibrations=(binding,)),
+        (BatchPlanEntry(0, TargetMode.DOSE, 10.0),),
+    )
+
+    restored = batch_plan_from_dict(batch_plan_to_dict(plan))
+    settings = restored.template.settings_for(restored.entries[0], 5.0)
+
+    assert restored.template.source_calibrations == (binding,)
+    assert settings.get_source_calibrations() == (binding,)
 
 
 def test_finalization_and_metric_repair_precede_tallying() -> None:

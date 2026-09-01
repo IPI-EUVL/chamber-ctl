@@ -145,6 +145,72 @@ def test_native_graph_preserves_terminal_total_across_resolutions_and_rejects_ta
         library.close()
 
 
+def test_native_graph_ignores_non_authoritative_hdf5_sessions(tmp_path) -> None:
+    from euv_acquisition.analysis import analyze_pulse
+    from euv_acquisition.models import CaptureConfig, CapturedPulse, PulseRecord, SnapshotCloseReason
+    from euv_acquisition.snapshot import SnapshotStore
+
+    profile = _profile()
+    config = CaptureConfig(sample_rate_hz=1_000_000.0, window_seconds=4e-6, pretrigger_seconds=1e-6)
+    primary_session = uuid.uuid4()
+    observer_session = uuid.uuid4()
+    source_store = SnapshotStore(tmp_path / "source")
+    primary_samples = np.array([0.0, 0.2, 0.2, 0.0], dtype=np.float32)
+    observer_samples = np.array([0.0, 0.9, 0.9, 0.0], dtype=np.float32)
+    primary_analysis = analyze_pulse(primary_samples, config)
+    primary = source_store.write(
+        [PulseRecord(primary_session, 0, CapturedPulse(primary_samples, 1_000_000_000, 10), primary_analysis)],
+        config,
+        SnapshotCloseReason.CAPTURE_STOP,
+        source_kind="red_pitaya",
+        source_id="primary",
+    )
+    observer = source_store.write(
+        [
+            PulseRecord(
+                observer_session,
+                0,
+                CapturedPulse(observer_samples, 1_000_000_001, 11),
+                analyze_pulse(observer_samples, config),
+            )
+        ],
+        config,
+        SnapshotCloseReason.CAPTURE_STOP,
+        source_kind="siglent",
+        source_id="observer",
+    )
+    records_path = tmp_path / "records"
+    records_path.mkdir()
+    library = Library(records_path)
+    entry = library.create_entry("Exposure", "Mixed-source fixture")
+    run_id = uuid.uuid4()
+    try:
+        with entry.resource("euv_calibration_profile.json", "euv_calibration_profile", "w") as resource:
+            json.dump(profile.to_dict(), resource)
+        with entry.resource("euv_capture_session.json", "euv_capture_session", "w") as resource:
+            json.dump({"session_id": str(primary_session)}, resource)
+        for manifest in (primary, observer):
+            with entry.resource(manifest.filename, "euv_snapshot", "wb") as resource:
+                resource.write(source_store.path_for(manifest).read_bytes())
+        append_capture_timeline_point(
+            entry,
+            CaptureTimelinePoint(primary.snapshot_id, 0, cumulative_dose_mj_cm2=0.0, cumulative_runtime_seconds=0.25),
+        )
+        with entry.resource("end_metadata.json", "metadata", "w") as resource:
+            json.dump({"outcome": "STOPPED"}, resource)
+
+        ensure_exposure_graph(run_id, entry, records_path)
+        graph = read_exposure_graph(entry, records_path, run_id)
+
+        assert graph.raw_pulse_count == 1
+        assert graph.final_sequence == 0
+        assert graph.full.cumulative_dose_mj_cm2[-1] == pytest.approx(
+            profile.dose_for_integral(primary_analysis.integral_volt_seconds)
+        )
+    finally:
+        library.close()
+
+
 def test_legacy_graph_clamps_negative_compensated_snapshot_totals(tmp_path) -> None:
     run_id = uuid.uuid4()
     waveform = np.column_stack(

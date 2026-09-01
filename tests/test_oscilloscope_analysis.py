@@ -40,10 +40,12 @@ def test_analysis_preserves_legacy_two_pulse_values_without_mutating_input() -> 
 
     assert np.array_equal(data, data_before)
     assert analysis.average_pulse_dose_mj_cm2 == pytest.approx(0.00012428571428571428)
+    assert analysis.average_pulse_dose_mj_cm2.hex() == "0x1.04a56280c13cdp-13"
     assert analysis.is_step_exposure is False
     assert analysis.pulse_span_seconds == pytest.approx(10.0)
     assert analysis.effective_duration_seconds == pytest.approx(1.0)
     assert analysis.total_dose_mj_cm2 == pytest.approx(0.012428571428571428)
+    assert analysis.total_dose_mj_cm2.hex() == "0x1.974269e92def0p-7"
     assert analysis.delivered_dose_rate_mj_cm2_s == pytest.approx(0.012428571428571428)
     assert calculate_avg_pulsedose(data, indexes) == pytest.approx((0.00012428571428571428, True, 10.0))
     assert calculate_dose_raw(0, 1_000_000_000, data, indexes) == pytest.approx((0.012428571428571428, 1.0))
@@ -61,6 +63,7 @@ def test_analysis_uses_explicit_step_mode_and_handles_fewer_than_two_pulses() ->
 
     assert stepped.inferred_step_exposure is False
     assert stepped.effective_duration_seconds == pytest.approx(10.0)
+    assert stepped.total_dose_mj_cm2.hex() == "0x1.fd130463796acp-4"
     assert continuous.effective_duration_seconds == pytest.approx(1.0)
     assert empty.total_dose_mj_cm2 == 0.0
     assert empty.is_step_exposure is True
@@ -81,6 +84,7 @@ def test_analysis_keeps_dose_compensation_separate_from_exposure_runtime() -> No
     assert crossing.total_dose_mj_cm2 == pytest.approx(preinit.total_dose_mj_cm2)
     assert crossing.effective_duration_seconds == pytest.approx(1.0)
     assert crossing.runtime_contribution_seconds == pytest.approx(0.6)
+    assert crossing.runtime_contribution_seconds.hex() == "0x1.3333333333333p-1"
 
 
 def test_analysis_uses_persisted_step_and_runtime_context() -> None:

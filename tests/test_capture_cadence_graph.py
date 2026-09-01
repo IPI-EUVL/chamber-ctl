@@ -103,6 +103,30 @@ def test_persisted_cadence_infers_gap_across_snapshots_and_rejects_tampering(tmp
         library.close()
 
 
+def test_persisted_cadence_ignores_non_authoritative_hdf5_sessions(tmp_path) -> None:
+    records_path, library, entry, run_id, session_id = _entry(
+        tmp_path,
+        [[(0, 0), (1, 10_000_000)]],
+    )
+    observer_session = uuid.uuid4()
+    _write_snapshots(
+        tmp_path / "observer-source",
+        entry,
+        observer_session,
+        [[(0, 5_000_000), (1, 15_000_000)]],
+    )
+    try:
+        graph = ensure_capture_cadence_graph(run_id, entry, records_path).graph
+
+        assert graph is not None
+        assert graph.session_id == session_id
+        assert graph.raw_capture_count == 2
+        assert graph.source_sequence.tolist() == [0, 1]
+        assert graph.inferred_lost_count == 0
+    finally:
+        library.close()
+
+
 def test_trigger_disabled_interval_starts_a_new_cadence_segment(tmp_path) -> None:
     records_path, library, entry, run_id, session_id = _entry(
         tmp_path,

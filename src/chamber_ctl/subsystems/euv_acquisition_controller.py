@@ -59,21 +59,42 @@ CAPTURE_SESSION_RESOURCE = "euv_capture_session.json"
 SIMULATOR_CONTROL_NAMES = frozenset({"laser_enabled", "chopper_enabled", "pll_locked"})
 
 
-def write_capture_provenance(entry, session_id: uuid.UUID, calibration: CalibrationProfile, chopper_frequency_hz: float) -> None:
+def write_capture_provenance(
+    entry,
+    session_id: uuid.UUID,
+    calibration: CalibrationProfile,
+    chopper_frequency_hz: float,
+    *,
+    source_kind: str | None = None,
+    source_id: str | None = None,
+) -> None:
     if chopper_frequency_hz <= 0:
         raise ValueError("chopper_frequency_hz must be positive.")
+    if (source_kind is None) != (source_id is None):
+        raise ValueError("Capture source kind and source ID must be provided together.")
+    if source_kind is not None and (not source_kind.strip() or not source_id.strip()):
+        raise ValueError("Capture source kind and source ID cannot be empty.")
     entry.set_tag("euv_capture_session_id", str(session_id))
     with entry.resource(CALIBRATION_PROVENANCE_RESOURCE, "euv_calibration_profile", "w") as resource:
         json.dump(calibration.to_dict(), resource, allow_nan=False, separators=(",", ":"))
     with entry.resource(CAPTURE_SESSION_RESOURCE, "euv_capture_session", "w") as resource:
+        provenance = {
+            "session_id": str(session_id),
+            "calibration_profile_id": str(calibration.profile_id),
+            "calibration_revision": calibration.revision,
+            "calibration_hash": calibration.content_hash,
+            "chopper_frequency_hz": chopper_frequency_hz,
+        }
+        if source_kind is not None:
+            provenance.update(
+                {
+                    "role": "authoritative",
+                    "source_kind": source_kind,
+                    "source_id": source_id,
+                }
+            )
         json.dump(
-            {
-                "session_id": str(session_id),
-                "calibration_profile_id": str(calibration.profile_id),
-                "calibration_revision": calibration.revision,
-                "calibration_hash": calibration.content_hash,
-                "chopper_frequency_hz": chopper_frequency_hz,
-            },
+            provenance,
             resource,
             allow_nan=False,
             separators=(",", ":"),
@@ -2120,6 +2141,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 session_id,
                 run.calibration,
                 run.chopper_frequency_hz,
+                source_kind=run.source_kind,
+                source_id=run.source_id,
             )
         finally:
             reader.close()

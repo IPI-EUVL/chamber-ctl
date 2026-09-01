@@ -334,12 +334,23 @@ def test_capture_provenance_is_persisted_before_snapshot_import(tmp_path) -> Non
     entry = library.create_entry("Exposure", "Fixture")
     session_id = uuid.uuid4()
     try:
-        write_capture_provenance(entry, session_id, profile, 192.0)
+        write_capture_provenance(
+            entry,
+            session_id,
+            profile,
+            192.0,
+            source_kind="red_pitaya",
+            source_id="pitaya-host",
+        )
         assert entry.get_tags()["euv_capture_session_id"] == str(session_id)
         with entry.resource(CALIBRATION_PROVENANCE_RESOURCE, "euv_calibration_profile", "r") as resource:
             assert json.load(resource)["content_hash"] == profile.content_hash
         with entry.resource(CAPTURE_SESSION_RESOURCE, "euv_capture_session", "r") as resource:
-            assert json.load(resource)["session_id"] == str(session_id)
+            provenance = json.load(resource)
+        assert provenance["session_id"] == str(session_id)
+        assert provenance["role"] == "authoritative"
+        assert provenance["source_kind"] == "red_pitaya"
+        assert provenance["source_id"] == "pitaya-host"
     finally:
         library.close()
 

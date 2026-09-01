@@ -486,6 +486,7 @@ class BatchControllerGUI:
             calibration_profile_id=calibration[0],
             calibration_revision=calibration[1],
             chopper_frequency_hz=float(self._chopper_frequency.get()),
+            source_calibrations=self._template_value.source_calibrations,
         )
 
     def _set_template_calibration(self, profile_id: str, revision: int) -> None:

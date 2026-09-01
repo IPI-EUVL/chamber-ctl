@@ -12,6 +12,10 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol
 
+from chamber_ctl.data.calibration import (
+    SourceCalibrationBinding,
+    normalize_source_calibration_bindings,
+)
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 
 
@@ -65,6 +69,7 @@ class ExposureTemplate:
     calibration_profile_id: str = ""
     calibration_revision: int = 0
     chopper_frequency_hz: float | None = 192.0
+    source_calibrations: tuple[SourceCalibrationBinding, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in ("base_pressure", "operating_pressure", "flow_sccm"):
@@ -79,6 +84,11 @@ class ExposureTemplate:
             raise ValueError("chopper_frequency_hz must be finite when provided.")
         if self.chopper_frequency_hz is not None and float(self.chopper_frequency_hz) <= 0:
             raise ValueError("chopper_frequency_hz must be positive when provided.")
+        object.__setattr__(
+            self,
+            "source_calibrations",
+            normalize_source_calibration_bindings(self.source_calibrations),
+        )
 
     def settings_for(self, entry: "BatchPlanEntry", target: float) -> ExposureSettings:
         if not math.isfinite(target) or target <= 0:
@@ -96,6 +106,7 @@ class ExposureTemplate:
             "calibration_profile_id": self.calibration_profile_id,
             "calibration_revision": self.calibration_revision,
             "chopper_frequency_hz": self.chopper_frequency_hz,
+            "source_calibrations": self.source_calibrations,
         }
         values.update(entry.overrides)
         settings = ExposureSettings(
@@ -111,6 +122,7 @@ class ExposureTemplate:
             calibration_profile_id=values["calibration_profile_id"],
             calibration_revision=values["calibration_revision"],
             chopper_frequency_hz=values["chopper_frequency_hz"],
+            source_calibrations=values["source_calibrations"],
         )
         settings.set_attr("name", values["name"])
         settings.set_attr("description", values["description"])
@@ -181,7 +193,7 @@ class BatchPlan:
         object.__setattr__(self, "entries", entries)
 
 
-BATCH_PLAN_SCHEMA_VERSION = 3
+BATCH_PLAN_SCHEMA_VERSION = 4
 BATCH_MANIFEST_SCHEMA_VERSION = 1
 
 
@@ -200,6 +212,9 @@ def batch_plan_to_dict(plan: BatchPlan) -> dict[str, Any]:
             "calibration_profile_id": plan.template.calibration_profile_id,
             "calibration_revision": plan.template.calibration_revision,
             "chopper_frequency_hz": plan.template.chopper_frequency_hz,
+            "source_calibrations": [
+                binding.to_dict() for binding in plan.template.source_calibrations
+            ],
         },
         "entries": [
             {
@@ -214,7 +229,7 @@ def batch_plan_to_dict(plan: BatchPlan) -> dict[str, Any]:
 
 
 def batch_plan_from_dict(value: object) -> BatchPlan:
-    if not isinstance(value, dict) or value.get("schema_version") not in (1, 2, BATCH_PLAN_SCHEMA_VERSION):
+    if not isinstance(value, dict) or value.get("schema_version") not in (1, 2, 3, BATCH_PLAN_SCHEMA_VERSION):
         raise ValueError("Unsupported or missing batch plan schema version.")
     if set(value) != {"schema_version", "template", "entries"}:
         raise ValueError("Batch plan contains unknown or missing fields.")
@@ -232,8 +247,10 @@ def batch_plan_from_dict(value: object) -> BatchPlan:
         "operating_pressure",
         "flow_sccm",
     }
-    if value["schema_version"] == BATCH_PLAN_SCHEMA_VERSION:
+    if value["schema_version"] >= 3:
         required_template |= {"calibration_profile_id", "calibration_revision", "chopper_frequency_hz"}
+    if value["schema_version"] >= 4:
+        required_template.add("source_calibrations")
     if set(template) != required_template:
         raise ValueError("Batch plan template contains unknown or missing fields.")
     schema_version = value["schema_version"]
@@ -262,9 +279,12 @@ def batch_plan_from_dict(value: object) -> BatchPlan:
             base_pressure=template["base_pressure"],
             operating_pressure=template["operating_pressure"],
             flow_sccm=template["flow_sccm"],
-            calibration_profile_id="" if schema_version < BATCH_PLAN_SCHEMA_VERSION else str(template["calibration_profile_id"]),
-            calibration_revision=0 if schema_version < BATCH_PLAN_SCHEMA_VERSION else int(template["calibration_revision"]),
-            chopper_frequency_hz=None if schema_version < BATCH_PLAN_SCHEMA_VERSION else template["chopper_frequency_hz"],
+            calibration_profile_id="" if schema_version < 3 else str(template["calibration_profile_id"]),
+            calibration_revision=0 if schema_version < 3 else int(template["calibration_revision"]),
+            chopper_frequency_hz=None if schema_version < 3 else template["chopper_frequency_hz"],
+            source_calibrations=()
+            if schema_version < 4
+            else normalize_source_calibration_bindings(template["source_calibrations"]),
         ),
         tuple(parsed_entries),
     )

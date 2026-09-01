@@ -308,13 +308,17 @@ def _source_graph(run_id: uuid.UUID, entry: Any) -> CaptureCadenceGraph:
             continue
         snapshot_id = _snapshot_id_from_name(name)
         payload = _resource_bytes(entry, name, resource_type)
+        snapshot_captures = _native_snapshot_captures(payload, snapshot_id)
+        snapshot_sessions = {capture.session_id for capture in snapshot_captures}
+        if session_id not in snapshot_sessions:
+            continue
+        if snapshot_sessions != {session_id}:
+            raise CaptureCadenceGraphValidationError("Snapshot contains conflicting capture sessions.")
         source_digests[name] = _resource_digest(payload)
-        captures.extend(_native_snapshot_captures(payload, snapshot_id))
+        captures.extend(snapshot_captures)
     if not captures:
         raise CaptureCadenceGraphNotReady("Exposure has no native HDF5 capture data.")
     captures.sort(key=lambda item: item.sequence)
-    if any(capture.session_id != session_id for capture in captures):
-        raise CaptureCadenceGraphValidationError("Snapshot session does not match capture provenance.")
     if any(right.sequence <= left.sequence for left, right in zip(captures, captures[1:])):
         raise CaptureCadenceGraphValidationError("Capture sequences must increase across snapshots.")
     if any(
