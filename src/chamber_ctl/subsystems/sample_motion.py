@@ -38,8 +38,8 @@ STATE_OFFLINE = 3
 EXPOSURE_OFFSET_Z = 88
 EXPOSURE_OFFSET_X = -1
 
-HOME_POS = 70
-HOME_ANGLE = -53
+HOME_POS = 74
+HOME_ANGLE = -58
 
 #SAMPLE_SLOT_ORDER = [11, 4, 10, 3, 0, 5, 9, 2, 1, 6, 8, 7]
 SAMPLE_SLOT_ORDER = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
@@ -413,14 +413,23 @@ class PiStageController(StageProvider):
         self.__state = STATE_HOMING
 
         self.__home_lin()
-        self.__home_rot()
+
+        self.__rot_homing_routine()
 
         self.__state = STATE_IDLE
 
     def __rot_homing_routine(self):
+        MAX_ATTEMPTS = 3
         self.__state = STATE_HOMING
 
-        self.__home_rot()
+        for i in range(MAX_ATTEMPTS):
+            if self.__home_rot():
+                break
+            else:
+                print(f"Rot homing attempt {i+1} failed, retrying...")
+                time.sleep(0.5)
+        else:
+            raise Exception("Rot homing failed after multiple attempts!")
 
         self.__state = STATE_IDLE
         
@@ -442,14 +451,14 @@ class PiStageController(StageProvider):
         self.__linear_homed = True
        
     def __home_rot(self):
+        TOL_FAST_SLOW = 30000.0 # deg
+        TOL_SLOW_SLOW = 1.0 # deg
         self.__move_blocking(1, -HOME_POS / (2.54 / STEPS_PER_ROT))
+        self.__move_blocking(0, 0)
         time.sleep(0.1)
 
-        self.__move_blocking(0, STEPS_PER_ROT * -0.3)
+        self.__client.queue_set(0, 0)
 
-        self.__client.queue_set(0, 0)
-        self.__move_blocking(0, STEPS_PER_ROT * 1.2)
-        self.__client.queue_set(0, 0)
         self.__client.queue_home(0, True, 400)
         self.__client.queue_move(0, STEPS_PER_ROT * 1.2)
         self.__client.wait_ack()
@@ -461,12 +470,19 @@ class PiStageController(StageProvider):
         h_pos = self.__client.get_home(0)
         if h_pos is None:
             raise Exception("Could not home rot!")
-        time.sleep(1)
 
-        self.__move_blocking(0, STEPS_PER_ROT * 0.9)
+        print(f"Rot home position FAST: {h_pos / STEPS_PER_ROT * 360.0} deg")
+        h_fast = h_pos
+
+        self.__move_blocking(0, STEPS_PER_ROT * -0.2)
+        self.__move_blocking(0, STEPS_PER_ROT * -0.1)
+
+        self.__client.queue_set(0, 0)
+        self.__client.queue_move(0, 0)
+        self.__client.wait_ack()
 
         self.__client.queue_home(0, True, 50)
-        self.__client.queue_move(0, STEPS_PER_ROT * 1.2)
+        self.__client.queue_move(0, STEPS_PER_ROT * 0.3)
         self.__client.wait_ack()
 
         time.sleep(0.5)
@@ -476,15 +492,80 @@ class PiStageController(StageProvider):
         h_pos = self.__client.get_home(0)
         if h_pos is None:
             raise Exception("Could not home rot!")
-        
+
+        print(f"Rot home position SLOW (A): {h_pos / STEPS_PER_ROT * 360.0} deg")
+        h_a = h_pos
+
+        self.__client.queue_set(0, h_pos)
+        self.__client.queue_move(0, h_pos)
+        self.__client.wait_ack()
+
+        self.__move_blocking(0, STEPS_PER_ROT * -0.1)
+        self.__move_blocking(0, 0)
+
+        self.__client.queue_home(0, True, 50)
+        self.__client.queue_move(0, STEPS_PER_ROT * 0.3)
+        self.__client.wait_ack()
+
         time.sleep(0.5)
+        while self.__client.is_moving():
+            time.sleep(0.1)
+
+        h_pos = self.__client.get_home(0)
+        if h_pos is None:
+            raise Exception("Could not home rot!")
+
+        print(f"Rot home position SLOW (B): {h_pos / STEPS_PER_ROT * 360.0} deg")
+        h_b = h_pos
+
+        """
+        self.__client.queue_set(0, h_pos)
+        self.__client.queue_move(0, h_pos)
+        self.__client.wait_ack()
+
+        
+        self.__move_blocking(0, STEPS_PER_ROT * -0.2)
+        self.__move_blocking(0, STEPS_PER_ROT * -0.1)
+
+        self.__client.queue_home(0, True, 50)
+        self.__client.queue_move(0, STEPS_PER_ROT * 0.3)
+        self.__client.wait_ack()
+
+        time.sleep(0.5)
+        while self.__client.is_moving():
+            time.sleep(0.1)
+
+        h_pos = self.__client.get_home(0)
+        if h_pos is None:
+            raise Exception("Could not home rot!")
+
+        print(f"Rot home position SLOW (C): {h_pos / STEPS_PER_ROT * 360.0} deg")
+        h_c = h_pos
+        """
+
+
+        if abs(h_fast - h_a) > (TOL_FAST_SLOW / 360.0 * STEPS_PER_ROT):
+            time.sleep(0.5)
+            self.__client.queue_set(0, math.floor(-STEPS_PER_ROT * (HOME_ANGLE / 360.0)))
+            self.__client.wait_ack()
+            return False
+
+        if abs(h_a - h_b) > (TOL_SLOW_SLOW / 360.0 * STEPS_PER_ROT):
+            time.sleep(0.5)
+            self.__client.queue_set(0, math.floor(-STEPS_PER_ROT * (HOME_ANGLE / 360.0)))
+            self.__client.wait_ack()
+            return False
+
         self.__client.queue_set(0, 0)
         self.__client.wait_ack()
+        
         self.__move_blocking(0, STEPS_PER_ROT * (HOME_ANGLE / 360.0))
         self.__client.queue_set(0, 0)
         self.__client.queue_move(0, 0)
         self.__client.wait_ack()
         time.sleep(0.5)
+
+        return True
 
     def __shortest_path(self, a2):
         a1 = (-self.__client.get_position(0) / STEPS_PER_ROT) * 2 * math.pi
@@ -671,6 +752,7 @@ class MockStageController(StageProvider):
 
 class SampleMotionSubsystem(ExperimentClient):
     def __init__(self):
+        print("Initializing sample motion subsystem...")
         self.__run = True
         self.__connected = False
         self.__did_config = False
