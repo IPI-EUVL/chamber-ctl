@@ -56,3 +56,49 @@ Completed native exposures receive a strict `euv_capture_cadence.h5` resource.
 Its interactive Plotly view supports zoom, pan, and the same one-, two-, and
 three-second windows. Open it with **Open Last Exposure** in Capture Diagnostics
 or **Capture Integrity (Selected)** for one selected row in Experiments.
+
+## Passive Siglent observer
+
+The Siglent comparison path uses two process-computer sidecars. Start
+`euv-acquisition-siglent` first to own the VISA instrument and ports
+`11762`/`11763`, then start `chamber-siglent-recorder` before exposure PREINIT.
+The recorder subscribes read-only to exposure and laser timing state, attaches
+source-qualified artifacts to the run, and never supplies canonical dose,
+runtime, interlock, or stop decisions.
+
+The source ID must match the acquisition service exactly. A calibration bound
+in the exposure settings takes precedence. Until every exposure editor exposes
+source bindings, configure an explicit fallback profile on the recorder:
+
+```powershell
+chamber-siglent-recorder `
+	--source-id "SDS2HBAX900425" `
+	--calibration-profile-id "<profile-uuid>" `
+	--calibration-revision 1 `
+	--capture-host 127.0.0.1 `
+	--dds-host 127.0.0.1
+```
+
+The profile revision must already exist in the same experiment dataset used by
+the chamber controller. Run-level source bindings override the fallback. If
+neither is present, the recorder logs a warning and deliberately skips the
+exposure.
+
+The legacy `DummyOscilloscope` and `euv-acquisition-sim` do not implement the
+Siglent sequence-batch protocol. For a local observer rehearsal, run the
+dedicated service alongside the authoritative simulator:
+
+```powershell
+euv-acquisition-siglent-sim `
+	--spool C:\temp\euv-siglent-sim-spool
+
+chamber-siglent-recorder `
+	--source-id "siglent-simulator" `
+	--calibration-profile-id "<profile-uuid>" `
+	--calibration-revision 1 `
+	--capture-host 127.0.0.1 `
+	--dds-host 127.0.0.1
+```
+
+The simulator and physical Siglent service share ports `11762`/`11763`, so only
+one may run at a time. Both expose the same recorder-facing contract.

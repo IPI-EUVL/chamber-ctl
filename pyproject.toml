@@ -33,6 +33,7 @@ maintainers = [
 [project.scripts]
 chamber-lifecycle-manager = "chamber_ctl.services.lifecycle_manager_service:main"
 chamber-ctl = "chamber_ctl.cli.main:main"
+chamber-siglent-recorder = "chamber_ctl.subsystems.siglent_observer:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

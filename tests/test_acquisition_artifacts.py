@@ -119,3 +119,27 @@ def test_importer_exposes_verified_persisted_file_before_acknowledgement(tmp_pat
         assert client.acknowledged == [str(manifest.snapshot_id)]
     finally:
         library.close()
+
+
+def test_importer_source_validation_runs_before_record_write_or_acknowledgement(tmp_path) -> None:
+    store, manifest = _manifest(tmp_path)
+    records_path = tmp_path / "records"
+    records_path.mkdir()
+    library = Library(records_path)
+    entry = library.create_entry("Exposure", "Fixture")
+    client = _Client(store, manifest)
+    importer = AcquisitionArtifactImporter(client, tmp_path / "received")
+    try:
+        with pytest.raises(ArtifactImportError, match="source-specific validation"):
+            importer.import_snapshot(
+                entry,
+                manifest,
+                validate=lambda _manifest, _path: (_ for _ in ()).throw(
+                    ValueError("wrong observer source")
+                ),
+            )
+
+        assert manifest.filename not in dict(entry.list_resources())
+        assert client.acknowledged == []
+    finally:
+        library.close()

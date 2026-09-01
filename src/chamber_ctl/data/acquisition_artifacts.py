@@ -22,10 +22,19 @@ class AcquisitionArtifactImporter:
         record,
         manifest,
         *,
+        validate: Callable[[object, Path], None] | None = None,
         before_ack: Callable[[object], None] | None = None,
         after_persist: Callable[[object, Path], None] | None = None,
     ) -> Path:
         local_path = self.fetch_verified_snapshot(manifest)
+
+        if validate is not None:
+            try:
+                validate(manifest, local_path)
+            except Exception as exc:
+                raise ArtifactImportError(
+                    f"Snapshot {manifest.snapshot_id} failed source-specific validation: {exc}"
+                ) from exc
 
         entry = record.get_record() if hasattr(record, "get_record") else record
         try:
