@@ -344,6 +344,7 @@ def _apply_native_runtime(
         previous_monotonic = pulse.monotonic_ns
         previous_valid = valid
 
+    raw_values = values.copy()
     anchors = {point.final_sequence: point.cumulative_runtime_seconds for point in capture_timeline}
     previous_index = -1
     previous_runtime = 0.0
@@ -354,8 +355,8 @@ def _apply_native_runtime(
             continue
         if expected_runtime < previous_runtime:
             raise ExposureGraphValidationError("Capture timeline runtime decreases.")
-        segment = values[previous_index + 1:index + 1]
-        raw_start = values[previous_index] if previous_index >= 0 else 0.0
+        segment = raw_values[previous_index + 1:index + 1]
+        raw_start = raw_values[previous_index] if previous_index >= 0 else 0.0
         increments = np.diff(np.concatenate(([raw_start], segment)))
         target_delta = expected_runtime - previous_runtime
         raw_delta = float(increments.sum())

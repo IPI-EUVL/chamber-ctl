@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import uuid
 
 import h5py
@@ -11,6 +12,8 @@ from chamber_ctl.data.dose_analysis import CaptureTimelinePoint, append_capture_
 from chamber_ctl.data.exposure_graph import (
     EXPOSURE_GRAPH_RESOURCE,
     ExposureGraphValidationError,
+    _RawPulse,
+    _apply_native_runtime,
     ensure_exposure_graph,
     read_exposure_graph,
 )
@@ -29,6 +32,48 @@ def _profile() -> CalibrationProfile:
         photodiode_responsivity_a_per_w=0.14,
         illuminated_area_cm2=0.05,
     )
+
+
+def test_native_runtime_anchor_rescaling_uses_the_unmodified_runtime_baseline() -> None:
+    snapshot_id = uuid.uuid4()
+    pulses = [
+        _RawPulse(
+            wall_unix_ns=1_000_000_000 + index * 100_000_000,
+            monotonic_ns=10_000_000_000 + index * 100_000_000,
+            dose_increment_mj_cm2=0.0,
+            source_index=index,
+            source_sequence=index,
+            snapshot_id=snapshot_id,
+        )
+        for index in range(4)
+    ]
+    events = (
+        SimpleNamespace(
+            kind="lifecycle.phase",
+            producer_unix_ns=0,
+            sequence=0,
+            next_sequence=None,
+            payload={"phase": "RUNNING"},
+        ),
+        SimpleNamespace(
+            kind="timing.euv_transmitting",
+            producer_unix_ns=0,
+            sequence=1,
+            next_sequence=0,
+            payload={"value": True},
+        ),
+    )
+    timeline = (
+        CaptureTimelinePoint(snapshot_id, 1, cumulative_dose_mj_cm2=0.0, cumulative_runtime_seconds=0.25),
+        CaptureTimelinePoint(snapshot_id, 3, cumulative_dose_mj_cm2=0.0, cumulative_runtime_seconds=0.5),
+    )
+
+    runtime, quality = _apply_native_runtime(pulses, events, timeline)
+
+    assert quality == "capture_timeline_anchored"
+    assert np.all(np.diff(runtime) >= 0)
+    assert runtime[1] == pytest.approx(0.25)
+    assert runtime[3] == pytest.approx(0.5)
 
 
 def test_native_graph_preserves_terminal_total_across_resolutions_and_rejects_tampering(tmp_path) -> None:
