@@ -6,6 +6,7 @@ import math
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -18,6 +19,8 @@ CALIBRATION_RESOURCE_TYPE = "calibration_profile"
 CALIBRATION_TAG = "euv_calibration_profile"
 SOURCE_CALIBRATIONS_TAG = "source_calibrations"
 SOURCE_CALIBRATIONS_TAG_SCHEMA_VERSION = 1
+PRIMARY_SOURCE_TAG = "primary_source"
+PRIMARY_SOURCE_TAG_SCHEMA_VERSION = 1
 
 
 def _finite(name: str, value: float, *, positive: bool = False) -> float:
@@ -39,6 +42,15 @@ class SourceKey:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be non-empty text.")
+
+    def to_dict(self) -> dict[str, str]:
+        return {"source_kind": self.source_kind, "source_id": self.source_id}
+
+    @classmethod
+    def from_dict(cls, value: object) -> "SourceKey":
+        if not isinstance(value, dict) or set(value) != {"source_kind", "source_id"}:
+            raise ValueError("Source key contains unknown or missing fields.")
+        return cls(value["source_kind"], value["source_id"])
 
 
 @dataclass(frozen=True)
@@ -84,6 +96,26 @@ class SourceCalibrationBinding:
             source_id=value["source_id"],
             profile_id=profile_id,
             revision=revision,
+        )
+
+
+@dataclass(frozen=True)
+class SourceConfiguration:
+    calibrations: tuple[SourceCalibrationBinding, ...]
+    primary_source: SourceKey
+
+    def __post_init__(self) -> None:
+        bindings = normalize_source_calibration_bindings(self.calibrations)
+        if not isinstance(self.primary_source, SourceKey):
+            raise ValueError("Primary source must be a source key.")
+        if not any(binding.source_key == self.primary_source for binding in bindings):
+            raise ValueError("Primary source must have an explicit calibration binding.")
+        object.__setattr__(self, "calibrations", bindings)
+
+    def calibration_for(self, source_key: SourceKey) -> SourceCalibrationBinding | None:
+        return next(
+            (binding for binding in self.calibrations if binding.source_key == source_key),
+            None,
         )
 
 
@@ -148,6 +180,64 @@ def source_calibration_for_source(
             if binding.source_key == source_key
         ),
         None,
+    )
+
+
+def encode_primary_source_tag(source_key: SourceKey) -> str:
+    if not isinstance(source_key, SourceKey):
+        raise ValueError("Primary source must be a source key.")
+    return json.dumps(
+        {
+            "schema_version": PRIMARY_SOURCE_TAG_SCHEMA_VERSION,
+            "source_kind": source_key.source_kind,
+            "source_id": source_key.source_id,
+        },
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def decode_primary_source_tag(value: object) -> SourceKey:
+    if not isinstance(value, str) or not value:
+        raise ValueError("Primary source tag must be non-empty JSON text.")
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Primary source tag is not valid JSON.") from exc
+    if not isinstance(payload, dict) or set(payload) != {"schema_version", "source_kind", "source_id"}:
+        raise ValueError("Primary source tag contains unknown or missing fields.")
+    if payload["schema_version"] != PRIMARY_SOURCE_TAG_SCHEMA_VERSION:
+        raise ValueError("Primary source tag has an unsupported schema version.")
+    return SourceKey(payload["source_kind"], payload["source_id"])
+
+
+def source_configuration_run_tags(
+    values: object,
+    primary_source: SourceKey,
+) -> dict[str, str]:
+    configuration = SourceConfiguration(
+        normalize_source_calibration_bindings(values),
+        primary_source,
+    )
+    return {
+        SOURCE_CALIBRATIONS_TAG: encode_source_calibrations_tag(configuration.calibrations),
+        PRIMARY_SOURCE_TAG: encode_primary_source_tag(configuration.primary_source),
+    }
+
+
+def source_configuration_from_run_tags(
+    tags: Mapping[str, object],
+) -> SourceConfiguration | None:
+    has_calibrations = SOURCE_CALIBRATIONS_TAG in tags
+    has_primary = PRIMARY_SOURCE_TAG in tags
+    if not has_calibrations and not has_primary:
+        return None
+    if has_calibrations != has_primary:
+        raise ValueError("Source calibration and primary source run tags must be provided together.")
+    return SourceConfiguration(
+        decode_source_calibrations_tag(tags[SOURCE_CALIBRATIONS_TAG]),
+        decode_primary_source_tag(tags[PRIMARY_SOURCE_TAG]),
     )
 
 

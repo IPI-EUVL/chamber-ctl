@@ -16,6 +16,8 @@ import h5py
 import numpy as np
 import portalocker
 
+from chamber_ctl.data.analysis_selection import active_dose_product_from_tags
+from chamber_ctl.data.calibration import PRIMARY_SOURCE_TAG, SourceKey, source_configuration_from_run_tags
 from chamber_ctl.data.dose_analysis import (
     CAPTURE_TIMELINE_RESOURCE,
     CALIBRATION_PROVENANCE_RESOURCE,
@@ -23,9 +25,16 @@ from chamber_ctl.data.dose_analysis import (
     CaptureTimelinePoint,
     analyze_legacy_snapshot,
     hdf5_snapshot_session_id,
+    load_capture_source_key,
     load_capture_timeline,
     load_experiment_calibration,
     resolve_authoritative_hdf5_session,
+)
+from chamber_ctl.data.observer_analysis import (
+    CAPTURED_ALGORITHM,
+    LEGACY_COMPENSATED_ALGORITHM,
+    load_observer_dose_products,
+    observer_analysis_filename,
 )
 from ipi_ecs.subsystems.run_events import RUN_EVENT_RESOURCE, load_run_event_timeline
 
@@ -35,6 +44,7 @@ EXPOSURE_GRAPH_RESOURCE_TYPE = "euv_exposure_dose_graph"
 EXPOSURE_GRAPH_SCHEMA_VERSION = 1
 EXPOSURE_GRAPH_ALGORITHM_VERSION = "exposure-dose-graph-v1"
 EXPOSURE_GRAPH_RUNTIME_BASIS = "controller-transmitting-v1"
+OBSERVER_GRAPH_RUNTIME_BASIS = "controller-event-interpolated-v1"
 FULL_POINT_LIMIT = 10_000
 THUMBNAIL_POINT_LIMIT = 1_000
 MAX_RUNTIME_GAP_SECONDS = 0.25
@@ -113,6 +123,7 @@ class ExposureGraph:
     issues: tuple[str, ...]
     full: ExposureGraphLevel
     thumbnail: ExposureGraphLevel
+    source_key: SourceKey | None = None
 
 
 @dataclass(frozen=True)
@@ -451,8 +462,182 @@ def _active_analysis_totals(entry: Any, resources: dict[str, str], source_digest
         raise ExposureGraphValidationError("Active dose analysis resource is invalid.") from exc
 
 
-def _source_graph(run_id: uuid.UUID, entry: Any) -> _SourceGraph:
+def _observer_runtime(wall_unix_ns: np.ndarray, events: tuple[Any, ...]) -> tuple[np.ndarray, str]:
+    anchors = sorted(
+        (
+            int(event.producer_unix_ns),
+            float(event.runtime_seconds),
+        )
+        for event in events
+        if event.runtime_seconds is not None
+        and math.isfinite(float(event.runtime_seconds))
+        and float(event.runtime_seconds) >= 0
+    )
+    if not anchors:
+        return np.zeros(len(wall_unix_ns), dtype=np.float64), "unavailable"
+    collapsed: dict[int, float] = {}
+    for timestamp, runtime in anchors:
+        collapsed[timestamp] = max(runtime, collapsed.get(timestamp, 0.0))
+    timestamps = np.asarray(sorted(collapsed), dtype=np.int64)
+    runtimes = np.asarray([collapsed[int(timestamp)] for timestamp in timestamps], dtype=np.float64)
+    if np.any(np.diff(runtimes) < -1e-12):
+        raise ExposureGraphValidationError("Controller runtime anchors decrease.")
+    origin = min(int(wall_unix_ns[0]), int(timestamps[0]))
+    coordinates = (wall_unix_ns - origin).astype(np.float64) / 1e9
+    anchor_coordinates = (timestamps - origin).astype(np.float64) / 1e9
+    return (
+        np.interp(coordinates, anchor_coordinates, runtimes, left=runtimes[0], right=runtimes[-1]),
+        "controller_event_interpolated",
+    )
+
+
+def _observer_level(
+    level: Any,
+    *,
+    wall_origin_unix_ns: int,
+    events: tuple[Any, ...],
+) -> tuple[ExposureGraphLevel, str]:
+    wall_unix_ns = np.asarray(level.wall_unix_ns, dtype=np.int64)
+    runtime, runtime_quality = _observer_runtime(wall_unix_ns, events)
+    source_index = np.arange(len(wall_unix_ns), dtype=np.int64) - 1
+    return (
+        ExposureGraphLevel(
+            wall_elapsed_seconds=np.maximum(0.0, (wall_unix_ns - wall_origin_unix_ns) / 1e9),
+            runtime_seconds=runtime,
+            dose_increment_mj_cm2=np.asarray(level.dose_increment_mj_cm2, dtype=np.float64),
+            cumulative_dose_mj_cm2=np.asarray(level.cumulative_dose_mj_cm2, dtype=np.float64),
+            source_index=source_index,
+            source_sequence=np.asarray(level.source_sequence, dtype=np.int64),
+            represented_pulse_count=np.asarray(level.represented_pulse_count, dtype=np.int64),
+        ),
+        runtime_quality,
+    )
+
+
+def _observer_source_graph(
+    run_id: uuid.UUID,
+    entry: Any,
+    data_path: str | Path,
+    source_key: SourceKey,
+    active_product: Any,
+) -> _SourceGraph:
+    try:
+        products = load_observer_dose_products(entry, data_path, run_id)
+    except ValueError as exc:
+        raise ExposureGraphValidationError(f"Observer dose products are invalid: {exc}") from exc
+    algorithm = CAPTURED_ALGORITHM if active_product is None else active_product.algorithm
+    if algorithm not in {CAPTURED_ALGORITHM, LEGACY_COMPENSATED_ALGORITHM}:
+        raise ExposureGraphValidationError("Primary observer dose algorithm is unsupported.")
+    matches = [
+        product
+        for product in products
+        if product.analysis.source_key == source_key
+        and product.analysis.algorithm == algorithm
+        and (
+            active_product is None
+            or observer_analysis_filename(product.analysis.session_id, product.analysis.algorithm)
+            == active_product.analysis_resource
+        )
+    ]
+    if not matches:
+        raise ExposureGraphNotReady(
+            f"Primary source {source_key.source_kind}/{source_key.source_id} has no finalized dose product."
+        )
+    if len(matches) != 1:
+        raise ExposureGraphValidationError("Primary source has multiple matching observer dose products.")
+    product = matches[0]
+    source_digests: dict[str, str] = {}
+    event_origin, events = _run_event_origin(entry, dict(entry.list_resources()), source_digests)
+    wall_origin = (
+        event_origin
+        if event_origin is not None
+        else int(product.graph.full.wall_unix_ns[0])
+    )
+    full, runtime_quality = _observer_level(
+        product.graph.full,
+        wall_origin_unix_ns=wall_origin,
+        events=events,
+    )
+    thumbnail, thumbnail_runtime_quality = _observer_level(
+        product.graph.thumbnail,
+        wall_origin_unix_ns=wall_origin,
+        events=events,
+    )
+    if thumbnail_runtime_quality != runtime_quality:
+        raise ExposureGraphValidationError("Observer graph runtime projections disagree.")
+    selection = (
+        {
+            "source_kind": source_key.source_kind,
+            "source_id": source_key.source_id,
+            "algorithm": algorithm,
+            "analysis_resource": observer_analysis_filename(
+                product.analysis.session_id,
+                product.analysis.algorithm,
+            ),
+        }
+        if active_product is None
+        else active_product.to_dict()
+    )
+    fingerprint_payload = {
+        "algorithm_version": EXPOSURE_GRAPH_ALGORITHM_VERSION,
+        "runtime_basis": OBSERVER_GRAPH_RUNTIME_BASIS,
+        "run_id": str(run_id),
+        "active_product": selection,
+        "observer_source_fingerprint": product.analysis.source_fingerprint,
+        "resources": dict(sorted(source_digests.items())),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    issues = product.analysis.issues
+    if runtime_quality == "unavailable":
+        issues += ("Controller runtime anchors are unavailable for the primary observer graph.",)
+    sequences = full.source_sequence[full.source_sequence >= 0]
+    graph = ExposureGraph(
+        run_id=run_id,
+        generated_at_unix_seconds=time.time(),
+        source_fingerprint=fingerprint,
+        raw_pulse_count=product.analysis.pulse_count,
+        final_sequence=None if len(sequences) == 0 else int(sequences[-1]),
+        calibration_profile_id=product.analysis.calibration.profile_id,
+        calibration_revision=product.analysis.calibration.revision,
+        calibration_hash=product.analysis.calibration.content_hash,
+        wall_origin_quality="run_preinit" if event_origin is not None else "observer_capture",
+        runtime_basis=OBSERVER_GRAPH_RUNTIME_BASIS,
+        runtime_quality=runtime_quality,
+        issues=issues,
+        full=full,
+        thumbnail=thumbnail,
+        source_key=source_key,
+    )
+    return _SourceGraph(graph, fingerprint)
+
+
+def _source_graph(run_id: uuid.UUID, entry: Any, data_path: str | Path) -> _SourceGraph:
     resources = dict(entry.list_resources())
+    tags = dict(entry.get_tags())
+    try:
+        configuration = (
+            source_configuration_from_run_tags(tags)
+            if PRIMARY_SOURCE_TAG in tags
+            else None
+        )
+        active_product = active_dose_product_from_tags(tags)
+    except ValueError as exc:
+        raise ExposureGraphValidationError(f"Dose source selection is invalid: {exc}") from exc
+    try:
+        capture_source = load_capture_source_key(entry, resources)
+    except ValueError as exc:
+        raise ExposureGraphValidationError(f"Capture source identity is invalid: {exc}") from exc
+    if configuration is not None:
+        primary_source = configuration.primary_source
+        if active_product is not None and active_product.source_key != primary_source:
+            raise ExposureGraphValidationError("Active dose product does not belong to the primary source.")
+        if (
+            active_product is not None
+            and active_product.algorithm in {CAPTURED_ALGORITHM, LEGACY_COMPENSATED_ALGORITHM}
+        ) or (capture_source is not None and capture_source != primary_source):
+            return _observer_source_graph(run_id, entry, data_path, primary_source, active_product)
     calibration = load_experiment_calibration(entry)
     try:
         authoritative_session = resolve_authoritative_hdf5_session(entry, resources)
@@ -563,6 +748,11 @@ def _source_graph(run_id: uuid.UUID, entry: Any) -> _SourceGraph:
         "run_id": str(run_id),
         "calibration_hash": calibration.content_hash,
         "active_analysis_id": active_analysis_id,
+        "active_product": None if active_product is None else active_product.to_dict(),
+        "capture_source": None if capture_source is None else capture_source.to_dict(),
+        "primary_source": (
+            None if configuration is None else configuration.primary_source.to_dict()
+        ),
         "resources": dict(sorted(source_digests.items())),
     }
     fingerprint = hashlib.sha256(
@@ -583,6 +773,7 @@ def _source_graph(run_id: uuid.UUID, entry: Any) -> _SourceGraph:
         issues=tuple(issues),
         full=_graph_level(pulses, wall_elapsed, runtime, FULL_POINT_LIMIT),
         thumbnail=_graph_level(pulses, wall_elapsed, runtime, THUMBNAIL_POINT_LIMIT),
+        source_key=capture_source or (None if configuration is None else configuration.primary_source),
     )
     return _SourceGraph(graph, fingerprint)
 
@@ -647,6 +838,14 @@ def read_exposure_graph_path(path: str | Path, *, expected_run_id: uuid.UUID | N
                 issues=tuple(issues),
                 full=_read_level(source["full"], limit=FULL_POINT_LIMIT),
                 thumbnail=_read_level(source["thumbnail"], limit=THUMBNAIL_POINT_LIMIT),
+                source_key=(
+                    None
+                    if "source_kind" not in source.attrs and "source_id" not in source.attrs
+                    else SourceKey(
+                        _decode_attribute(source.attrs["source_kind"]),
+                        _decode_attribute(source.attrs["source_id"]),
+                    )
+                ),
             )
     except (OSError, ValueError, KeyError) as exc:
         if isinstance(exc, ExposureGraphValidationError):
@@ -691,6 +890,9 @@ def _write_exposure_graph(path: Path, graph: ExposureGraph) -> None:
             destination.attrs["wall_origin_quality"] = graph.wall_origin_quality
             destination.attrs["runtime_quality"] = graph.runtime_quality
             destination.attrs["issues_json"] = json.dumps(graph.issues, allow_nan=False, separators=(",", ":"))
+            if graph.source_key is not None:
+                destination.attrs["source_kind"] = graph.source_key.source_kind
+                destination.attrs["source_id"] = graph.source_key.source_id
             _write_level(destination.create_group("full"), graph.full)
             _write_level(destination.create_group("thumbnail"), graph.thumbnail)
             destination.flush()
@@ -728,7 +930,10 @@ def ensure_exposure_graph(
             timeout=0,
             flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
         ):
-            source = _source_graph(run_id, entry)
+            try:
+                source = _source_graph(run_id, entry, data_path)
+            except ExposureGraphNotReady:
+                return EnsureExposureGraphResult("waiting_for_completion", None)
             path = folder / EXPOSURE_GRAPH_RESOURCE
             previous: ExposureGraph | None = None
             try:

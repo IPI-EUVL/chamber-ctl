@@ -8,15 +8,27 @@ from pathlib import Path
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader
 
 from chamber_ctl.data.acquisition_artifacts import AcquisitionArtifactImporter
+from chamber_ctl.data.analysis_selection import (
+    ACTIVE_DOSE_PRODUCT_TAG,
+    ActiveDoseProduct,
+    encode_active_dose_product_tag,
+)
 from chamber_ctl.data.calibration import (
+    PRIMARY_SOURCE_TAG,
     SOURCE_CALIBRATIONS_TAG,
     CalibrationProfile,
     CalibrationRepository,
     SourceCalibrationBinding,
     SourceKey,
     source_calibration_for_source,
+    source_configuration_from_run_tags,
 )
-from chamber_ctl.data.observer_analysis import write_observer_dose_products
+from chamber_ctl.data.exposure_graph import ensure_exposure_graph
+from chamber_ctl.data.observer_analysis import (
+    CAPTURED_ALGORITHM,
+    observer_analysis_filename,
+    write_observer_dose_products,
+)
 from euv_acquisition.models import SnapshotCloseReason
 from euv_acquisition.snapshot import SnapshotContents, read_snapshot
 from euv_acquisition.sources.siglent import (
@@ -125,7 +137,7 @@ class ObserverArtifactRecorder:
                 observer_context_filename(run.session_id),
                 OBSERVER_CONTEXT_RESOURCE_TYPE,
             )
-            write_observer_dose_products(
+            products = write_observer_dose_products(
                 entry,
                 self.data_path,
                 run,
@@ -134,6 +146,41 @@ class ObserverArtifactRecorder:
                 context,
                 expected_native_analysis_version=self.expected_native_analysis_version,
             )
+            configuration = (
+                source_configuration_from_run_tags(entry.get_tags())
+                if PRIMARY_SOURCE_TAG in entry.get_tags()
+                else None
+            )
+            if configuration is not None and configuration.primary_source == self.source_key:
+                captured = next(
+                    product
+                    for product in products
+                    if product.analysis.algorithm == CAPTURED_ALGORITHM
+                )
+                analysis = captured.analysis
+                entry.set_tag(
+                    ACTIVE_DOSE_PRODUCT_TAG,
+                    encode_active_dose_product_tag(
+                        ActiveDoseProduct(
+                            self.source_key,
+                            analysis.algorithm,
+                            observer_analysis_filename(analysis.session_id, analysis.algorithm),
+                        )
+                    ),
+                )
+                entry.set_tag("dose", analysis.total_dose_mj_cm2)
+                entry.set_tag("calibration_profile_id", str(analysis.calibration.profile_id))
+                entry.set_tag("calibration_revision", str(analysis.calibration.revision))
+                entry.set_tag("calibration_hash", analysis.calibration.content_hash)
+                entry.remove_tag("active_dose_analysis")
+                graph_result = ensure_exposure_graph(
+                    run.run_id,
+                    entry,
+                    self.data_path,
+                    allow_incomplete=True,
+                )
+                if graph_result.graph is None:
+                    raise RuntimeError("Primary observer dose graph is not ready after product finalization.")
             descriptor = self._descriptor(
                 run,
                 profile,

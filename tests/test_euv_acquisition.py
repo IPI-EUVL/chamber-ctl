@@ -5,11 +5,23 @@ from types import SimpleNamespace
 
 import pytest
 
-from chamber_ctl.data.calibration import CalibrationProfile, CalibrationRepository
+from chamber_ctl.data.calibration import (
+    CalibrationProfile,
+    CalibrationRepository,
+    SourceCalibrationBinding,
+    SourceKey,
+    source_calibration_run_tags,
+    source_configuration_run_tags,
+)
+from chamber_ctl.data.analysis_selection import (
+    ACTIVE_DOSE_PRODUCT_TAG,
+    active_dose_product_from_tags,
+)
 from chamber_ctl.data.capture_cadence import PulseCadenceObservation, decode_live_cadence
 from chamber_ctl.subsystems.euv_acquisition_controller import (
     CALIBRATION_PROVENANCE_RESOURCE,
     CAPTURE_SESSION_RESOURCE,
+    resolve_acquisition_source_configuration,
     resolve_exposure_calibration,
     write_capture_provenance,
 )
@@ -54,6 +66,52 @@ def test_exposure_calibration_resolution_requires_explicit_existing_revision(tmp
         )
 
 
+def test_acquisition_resolves_its_binding_independently_of_primary_and_order(tmp_path) -> None:
+    primary_profile = _profile()
+    pitaya_profile = _profile()
+    repository = CalibrationRepository(tmp_path)
+    repository.create(primary_profile)
+    repository.create(pitaya_profile)
+    repository.close()
+    primary = SourceCalibrationBinding("siglent", "scope-1", primary_profile.profile_id, 1)
+    pitaya = SourceCalibrationBinding("red_pitaya", "red-pitaya", pitaya_profile.profile_id, 1)
+    tags = source_configuration_run_tags((primary, pitaya), primary.source_key)
+
+    primary_source, calibration = resolve_acquisition_source_configuration(
+        ExposureSettings(),
+        tags,
+        pitaya.source_key,
+        tmp_path,
+    )
+
+    assert primary_source == primary.source_key
+    assert calibration == pitaya_profile
+
+
+def test_acquisition_preserves_source_tag_only_legacy_primary(tmp_path) -> None:
+    pitaya_profile = _profile()
+    observer_profile = _profile()
+    repository = CalibrationRepository(tmp_path)
+    repository.create(pitaya_profile)
+    repository.create(observer_profile)
+    repository.close()
+    observer = SourceCalibrationBinding("siglent", "scope-1", observer_profile.profile_id, 1)
+    pitaya = SourceKey("red_pitaya", "red-pitaya")
+
+    primary_source, calibration = resolve_acquisition_source_configuration(
+        ExposureSettings(
+            calibration_profile_id=str(pitaya_profile.profile_id),
+            calibration_revision=1,
+        ),
+        source_calibration_run_tags((observer,)),
+        pitaya,
+        tmp_path,
+    )
+
+    assert primary_source == pitaya
+    assert calibration == pitaya_profile
+
+
 def test_acquisition_transmission_check_fails_closed_until_timing_status_is_fresh() -> None:
     from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem
 
@@ -89,6 +147,8 @@ def test_acquisition_status_publishes_live_dose_and_zero_runtime() -> None:
     subsystem._run = run
     subsystem._diagnostic = None
     subsystem._board_status = {
+        "source_kind": "red_pitaya",
+        "source_id": "red-pitaya",
         "pipeline_metrics": {
             "schema_version": 1,
             "state": "active",
@@ -112,6 +172,8 @@ def test_acquisition_status_publishes_live_dose_and_zero_runtime() -> None:
     assert status["accumulated_dose_mj_cm2"] == 2.5
     assert status["transmitting_runtime_seconds"] == 0.0
     assert status["pipeline_metrics"]["counters"]["accepted"] == 12
+    assert status["configured_source_kind"] == "red_pitaya"
+    assert status["configured_source_id"] == "red-pitaya"
     assert cadence.context == "exposure"
     assert cadence.run_id == run.run_id
 
@@ -297,7 +359,12 @@ def test_can_start_rejects_an_unreleased_digitizer_session_before_preinit(monkey
 
         def command(self, command):
             assert command == "status"
-            return {"session": orphaned_session.to_dict()}
+            return {
+                "source_kind": "red_pitaya",
+                "source_id": "red-pitaya",
+                "capabilities": {},
+                "session": orphaned_session.to_dict(),
+            }
 
         def close(self):
             self.closed = True
@@ -312,6 +379,8 @@ def test_can_start_rejects_an_unreleased_digitizer_session_before_preinit(monkey
     subsystem._temporary_directory = None
     subsystem._next_capture_connect_monotonic = 0.0
     subsystem._data_path = "unused"
+    subsystem._source_key = SourceKey("red_pitaya", "red-pitaya")
+    subsystem._read_run_tags = lambda _run_id: {}
     subsystem._log = lambda *_args, **_kwargs: None
     state = RunState("exposure", ExposureSettings(target_dose=1.0, chopper_frequency_hz=192.0), s_uuid=uuid.uuid4())
 
@@ -353,6 +422,18 @@ def test_capture_provenance_is_persisted_before_snapshot_import(tmp_path) -> Non
         assert provenance["source_id"] == "pitaya-host"
     finally:
         library.close()
+
+
+def test_acquisition_rejects_capture_service_with_another_source_identity() -> None:
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem
+
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._source_key = SourceKey("red_pitaya", "red-pitaya")
+
+    with pytest.raises(ValueError, match="does not match the configured source"):
+        subsystem._validate_capture_source(
+            {"source_kind": "red_pitaya", "source_id": "another-board"}
+        )
 
 
 def test_rejected_preinit_run_clears_without_waiting_for_a_capture_client() -> None:
@@ -749,6 +830,7 @@ def test_capture_connection_polls_board_status_on_the_existing_client() -> None:
             self.commands.append(command)
             return {
                 "source_kind": "red_pitaya",
+                    "source_id": "red-pitaya",
                 "capabilities": {"pipeline_metrics": True},
                 "pipeline_metrics": {"schema_version": 1, "state": "active"},
             }
@@ -1116,6 +1198,42 @@ def test_final_analysis_tags_survive_a_stale_terminal_record_write(tmp_path) -> 
         assert float(tags["dose"]) == 0.0
         assert float(tags["runtime"]) == 2.5
         assert "active_dose_analysis" in tags
+        assert active_dose_product_from_tags(tags).source_key == SourceKey("red_pitaya", "red-pitaya")
+    finally:
+        subsystem._reader.close()
+        library.close()
+
+
+def test_non_primary_final_analysis_preserves_runtime_without_promoting_dose(tmp_path) -> None:
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem, _AcquisitionRun
+
+    run_id = uuid.uuid4()
+    library = Library(tmp_path)
+    entry = library.create_entry("Exposure", "Fixture")
+    entry.set_tag("experiment", "exposure")
+    entry.set_tag("run", run_id.hex)
+    result = DoseAnalysisResult(run_id, _profile(), (), runtime_seconds=2.5)
+    run = _AcquisitionRun(
+        run_id,
+        _profile(),
+        None,
+        None,
+        192.0,
+        object(),
+        primary_source=SourceKey("siglent", "scope-1"),
+    )
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._reader = ExperimentReader(str(tmp_path), "exposure")
+    subsystem._source_key = SourceKey("red_pitaya", "red-pitaya")
+    subsystem._log = lambda *_args, **_kwargs: None
+    try:
+        subsystem._promote_final_analysis(run, result)
+        tags = library.read_entry(entry.get_uuid()).get_tags()
+
+        assert float(tags["runtime"]) == 2.5
+        assert "dose" not in tags
+        assert "active_dose_analysis" not in tags
+        assert ACTIVE_DOSE_PRODUCT_TAG not in tags
     finally:
         subsystem._reader.close()
         library.close()

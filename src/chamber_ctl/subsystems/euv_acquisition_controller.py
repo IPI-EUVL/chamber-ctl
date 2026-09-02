@@ -34,14 +34,22 @@ from chamber_ctl.data.acquisition_preview import build_acquisition_preview
 from chamber_ctl.data.acquisition_runtime import LiveDoseAccumulator, PulseSequenceGap
 from chamber_ctl.data.capture_cadence import CaptureCadenceTracker, observation_from_report
 from chamber_ctl.data.capture_cadence_graph import ensure_capture_cadence_graph
-from chamber_ctl.data.calibration import CalibrationProfile, CalibrationRepository
+from chamber_ctl.data.calibration import (
+    PRIMARY_SOURCE_TAG,
+    SOURCE_CALIBRATIONS_TAG,
+    CalibrationProfile,
+    CalibrationRepository,
+    SourceKey,
+    source_calibration_for_source,
+    source_configuration_from_run_tags,
+)
 from chamber_ctl.data.dose_analysis import (
     CaptureTimelinePoint,
     DoseAnalysisResult,
     DoseAnalysisRevision,
     analyze_experiment_entry,
     append_capture_timeline_point,
-    write_analysis_revision,
+    write_capture_analysis_revision,
 )
 from chamber_ctl.data.exposure_graph import ensure_exposure_graph
 from chamber_ctl.subsystems import uuids
@@ -52,11 +60,13 @@ from euv_acquisition.models import PulseQuality, PulseReport
 from euv_acquisition.health import AcquisitionHealth
 from euv_acquisition.service import AcquisitionClient
 from euv_acquisition.session import CapturePurpose, CaptureSessionManifest, CaptureSessionState, StoredSnapshot
+from euv_acquisition.source_identity import RED_PITAYA_SOURCE_ID, RED_PITAYA_SOURCE_KIND
 
 
 CALIBRATION_PROVENANCE_RESOURCE = "euv_calibration_profile.json"
 CAPTURE_SESSION_RESOURCE = "euv_capture_session.json"
 SIMULATOR_CONTROL_NAMES = frozenset({"laser_enabled", "chopper_enabled", "pll_locked"})
+DEFAULT_CAPTURE_SOURCE = SourceKey(RED_PITAYA_SOURCE_KIND, RED_PITAYA_SOURCE_ID)
 
 
 def write_capture_provenance(
@@ -67,6 +77,7 @@ def write_capture_provenance(
     *,
     source_kind: str | None = None,
     source_id: str | None = None,
+    primary_source: SourceKey | None = None,
 ) -> None:
     if chopper_frequency_hz <= 0:
         raise ValueError("chopper_frequency_hz must be positive.")
@@ -93,6 +104,8 @@ def write_capture_provenance(
                     "source_id": source_id,
                 }
             )
+        if primary_source is not None:
+            provenance["primary_source"] = primary_source.to_dict()
         json.dump(
             provenance,
             resource,
@@ -122,6 +135,47 @@ def resolve_exposure_calibration(settings: ExposureSettings, data_path: str | Pa
     return profile
 
 
+def resolve_acquisition_source_configuration(
+    settings: ExposureSettings,
+    tags: dict[str, object],
+    source_key: SourceKey,
+    data_path: str | Path,
+) -> tuple[SourceKey, CalibrationProfile]:
+    if SOURCE_CALIBRATIONS_TAG in tags and PRIMARY_SOURCE_TAG not in tags:
+        binding = source_calibration_for_source(tags[SOURCE_CALIBRATIONS_TAG], source_key)
+        if binding is None:
+            return source_key, resolve_exposure_calibration(settings, data_path)
+        repository = CalibrationRepository(data_path)
+        try:
+            profile = repository.get(binding.profile_id, binding.revision)
+        finally:
+            repository.close()
+        if profile is None:
+            raise ValueError(
+                f"Calibration profile {binding.profile_id} revision {binding.revision} was not found."
+            )
+        return source_key, profile
+    configuration = source_configuration_from_run_tags(tags)
+    if configuration is None:
+        return source_key, resolve_exposure_calibration(settings, data_path)
+    binding = configuration.calibration_for(source_key)
+    if binding is None:
+        raise ValueError(
+            "Exposure has no calibration binding for configured acquisition source "
+            f"{source_key.source_kind}/{source_key.source_id}."
+        )
+    repository = CalibrationRepository(data_path)
+    try:
+        profile = repository.get(binding.profile_id, binding.revision)
+    finally:
+        repository.close()
+    if profile is None:
+        raise ValueError(
+            f"Calibration profile {binding.profile_id} revision {binding.revision} was not found."
+        )
+    return configuration.primary_source, profile
+
+
 @dataclass
 class _AcquisitionRun:
     run_id: uuid.UUID
@@ -130,6 +184,7 @@ class _AcquisitionRun:
     target_time: float | None
     chopper_frequency_hz: float
     accumulator: LiveDoseAccumulator
+    primary_source: SourceKey | None = None
     cadence: CaptureCadenceTracker = field(default_factory=CaptureCadenceTracker)
     session_id: uuid.UUID | None = None
     imported_snapshot_ids: set[uuid.UUID] = field(default_factory=set)
@@ -197,9 +252,17 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
     CAPTURE_RECONNECT_DELAY_SECONDS = 2.0
     ONE_SHOT_TIMEOUT_SECONDS = 15.0
 
-    def __init__(self, data_path: str | None = None) -> None:
+    def __init__(
+        self,
+        data_path: str | None = None,
+        *,
+        source_key: SourceKey = DEFAULT_CAPTURE_SOURCE,
+    ) -> None:
         self._data_path = data_path or os.path.join(os.environ["EUVL_PATH"], "datasets")
+        if not isinstance(source_key, SourceKey):
+            raise ValueError("Configured acquisition source must be a source key.")
         self._run_lock = threading.RLock()
+        self._source_key = source_key
         self._run: _AcquisitionRun | None = None
         self._diagnostic: _DiagnosticCapture | None = None
         self._diagnostic_start_pending = False
@@ -276,6 +339,13 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._did_configure = True
         handle = self._dds_client.register_subsystem("EUV Acquisition Controller", uuids.UUID_EUV_ACQUISITION_CONTROLLER)
         self._subsystem = handle
+        handle.put_status_item(
+            dds_subsystem.StatusItem(
+                dds_subsystem.StatusItem.STATE_INFO,
+                10,
+                f"Configured source: {self._source_key.source_kind}/{self._source_key.source_id}",
+            )
+        )
         self._dose_publisher = handle.get_kv_property(b"cur_dose", False, True, True)
         self._time_publisher = handle.get_kv_property(b"cur_time", False, True, True)
         self._segment_publisher = handle.get_kv_property(b"new_segment", False, True, True)
@@ -601,7 +671,12 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
     def _can_start(self, settings: ExposureSettings, state: RunState) -> tuple[bool, bytes]:
         self._log("Checking whether EUV acquisition can start.", level="DEBUG", event="acquisition_start_check", run_id=str(state.get_uuid()))
         try:
-            calibration = resolve_exposure_calibration(settings, self._data_path)
+            primary_source, calibration = resolve_acquisition_source_configuration(
+                settings,
+                self._read_run_tags(state.get_uuid()),
+                self._source_key,
+                self._data_path,
+            )
             frequency = settings.get_chopper_frequency_hz()
             if frequency is None or float(frequency) <= 0:
                 raise ValueError("Exposure requires a positive configured chopper frequency.")
@@ -639,9 +714,17 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     target_time=target_time,
                     chopper_frequency_hz=frequency,
                     accumulator=LiveDoseAccumulator(calibration),
+                    primary_source=primary_source,
                 )
                 self._log("Reserved acquisition state for exposure start.", event="acquisition_start_reserved", run_id=str(state.get_uuid()), calibration_profile_id=str(calibration.profile_id), calibration_revision=calibration.revision, chopper_frequency_hz=frequency)
         return super()._can_start(settings, state)
+
+    def _read_run_tags(self, run_id: uuid.UUID) -> dict[str, object]:
+        reader = ExperimentReader(self._data_path, "exposure")
+        try:
+            return dict(reader.get_run(run_id).get_record().get_tags())
+        finally:
+            reader.close()
 
     def _check_capture_service_ready(self) -> None:
         capture_client = self._ensure_capture_client(force=True)
@@ -673,6 +756,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     capture_session = CaptureSessionManifest.from_dict(session_value)
                     if capture_session.session_id != session_id:
                         raise ValueError("Digitizer start response returned the wrong capture session.")
+                    if SourceKey(capture_session.source_kind, capture_session.source_id) != self._source_key:
+                        raise ValueError("Digitizer start response returned a session from another source.")
                     run.source_kind = capture_session.source_kind
                     run.source_id = capture_session.source_id
                 self._write_preinit_provenance(session_id, run)
@@ -1677,10 +1762,21 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
     def _promote_final_analysis(self, run: _AcquisitionRun, result: DoseAnalysisResult) -> None:
         record = self._get_record(run.run_id)
         revision = DoseAnalysisRevision(uuid.uuid4(), time.time(), result)
-        write_analysis_revision(record.get_record(), revision, promote=True)
+        entry = record.get_record()
+        source_key = getattr(self, "_source_key", DEFAULT_CAPTURE_SOURCE)
+        _filename, promote = write_capture_analysis_revision(
+            entry,
+            revision,
+            source_key,
+            primary_source=run.primary_source,
+        )
         self._log(
-            "Promoted final acquisition dose analysis to exposure tags.",
-            event="dose_analysis_promoted",
+            (
+                "Promoted final acquisition dose analysis to exposure tags."
+                if promote
+                else "Persisted non-primary acquisition analysis and authoritative runtime."
+            ),
+            event="dose_analysis_promoted" if promote else "dose_analysis_persisted",
             run_id=str(run.run_id),
             dose_mj_cm2=result.total_dose_mj_cm2,
             runtime_seconds=result.runtime_seconds,
@@ -1819,6 +1915,9 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 )
             if run is None and diagnostic is None:
                 health = AcquisitionHealth(False, None, None, None, False, False, False)
+            source_key = getattr(self, "_source_key", DEFAULT_CAPTURE_SOURCE)
+            status["configured_source_kind"] = source_key.source_kind
+            status["configured_source_id"] = source_key.source_id
             status["accumulated_dose_mj_cm2"] = dose
             status["transmitting_runtime_seconds"] = runtime
             if run is not None:
@@ -1919,6 +2018,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         try:
             capture_client.connect()
             initial_status = capture_client.command("status")
+            self._validate_capture_source(initial_status)
         except Exception as exc:
             capture_client.close()
             self._next_capture_connect_monotonic = now + self.CAPTURE_RECONNECT_DELAY_SECONDS
@@ -2013,10 +2113,26 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         if not isinstance(result, dict):
             return
         if "source_kind" in result and "capabilities" in result:
+            self._validate_capture_source(result)
             self._board_status = dict(result)
         elif "simulator" in result:
             self._board_status = dict(getattr(self, "_board_status", {}))
             self._board_status["simulator"] = result["simulator"]
+
+    def _validate_capture_source(self, status: object) -> None:
+        if not isinstance(status, dict):
+            raise ValueError("Digitizer status must be an object.")
+        try:
+            actual = SourceKey(status["source_kind"], status["source_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Digitizer status omitted its source identity.") from exc
+        expected = getattr(self, "_source_key", DEFAULT_CAPTURE_SOURCE)
+        if actual != expected:
+            raise ValueError(
+                "Digitizer source identity does not match the configured source: "
+                f"expected {expected.source_kind}/{expected.source_id}, "
+                f"received {actual.source_kind}/{actual.source_id}."
+            )
 
     def _close_capture_client(self) -> None:
         if self._capture_client is not None:
@@ -2090,10 +2206,11 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     imported += 1
                     self._log("Recalculating dose analysis for recovered capture session.", event="orphan_recovery_analysis_started", session_id=str(session.session_id), imported_snapshot_count=imported)
             result = analyze_experiment_entry(run_id, entry)
-            write_analysis_revision(
+            source_key = getattr(self, "_source_key", DEFAULT_CAPTURE_SOURCE)
+            write_capture_analysis_revision(
                 entry,
                 DoseAnalysisRevision(uuid.uuid4(), time.time(), result),
-                promote=True,
+                source_key,
             )
             self._ensure_persisted_exposure_graph(run_id, entry, context="orphaned capture recovery")
             self._log("Reconciled recovered capture analysis; releasing digitizer spool.", event="orphan_recovery_release_started", session_id=str(session.session_id))
@@ -2143,6 +2260,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 run.chopper_frequency_hz,
                 source_kind=run.source_kind,
                 source_id=run.source_id,
+                primary_source=run.primary_source,
             )
         finally:
             reader.close()

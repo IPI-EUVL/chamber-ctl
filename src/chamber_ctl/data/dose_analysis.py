@@ -11,7 +11,17 @@ from typing import Any
 
 import numpy as np
 
-from chamber_ctl.data.calibration import CalibrationProfile
+from chamber_ctl.data.analysis_selection import (
+    ACTIVE_DOSE_PRODUCT_TAG,
+    ActiveDoseProduct,
+    encode_active_dose_product_tag,
+)
+from chamber_ctl.data.calibration import (
+    PRIMARY_SOURCE_TAG,
+    CalibrationProfile,
+    SourceKey,
+    source_configuration_from_run_tags,
+)
 from chamber_ctl.data.legacy_siglent import (
     EXPOSURE_START_UNSPECIFIED,
     LEGACY_ANALYSIS_VERSION,
@@ -118,6 +128,37 @@ def resolve_authoritative_hdf5_session(entry, resources: dict[str, str] | None =
             raise ValueError("HDF5 capture session has conflicting source identities.")
         return next(iter(session_ids))
     raise ValueError("Multiple HDF5 capture sessions require authoritative capture provenance.")
+
+
+def load_capture_source_key(entry, resources: dict[str, str] | None = None) -> SourceKey | None:
+    inventory = dict(entry.list_resources()) if resources is None else resources
+    if CAPTURE_SESSION_RESOURCE in inventory:
+        if inventory[CAPTURE_SESSION_RESOURCE] != CAPTURE_SESSION_RESOURCE_TYPE:
+            raise ValueError("Capture session resource has an unexpected type.")
+        with entry.resource(CAPTURE_SESSION_RESOURCE, CAPTURE_SESSION_RESOURCE_TYPE, "r") as resource:
+            value = json.load(resource)
+        if not isinstance(value, dict):
+            raise ValueError("Capture session resource must contain an object.")
+        source_kind = value.get("source_kind")
+        source_id = value.get("source_id")
+        if source_kind is not None or source_id is not None:
+            if source_kind is None or source_id is None:
+                raise ValueError("Capture session resource has incomplete source identity.")
+            return SourceKey(str(source_kind), str(source_id))
+    session_id = resolve_authoritative_hdf5_session(entry, inventory)
+    if session_id is None:
+        return None
+    identities = set()
+    for name, resource_type in inventory.items():
+        if resource_type != HDF5_SNAPSHOT_RESOURCE_TYPE or not name.startswith("snap_") or not name.endswith(".h5"):
+            continue
+        with entry.resource(name, resource_type, "rb") as resource:
+            identity = hdf5_snapshot_identity(resource.read(), filename=name)
+        if identity.session_id == session_id:
+            identities.add(SourceKey(identity.source_kind, identity.source_id))
+    if len(identities) != 1:
+        raise ValueError("Authoritative capture session has no unique source identity.")
+    return next(iter(identities))
 
 
 def load_hdf5_snapshot_pulses(entry, snapshot_id: uuid.UUID) -> np.ndarray:
@@ -571,7 +612,13 @@ def load_experiment_peak_voltage_series(entry) -> PeakVoltageSeries:
     return PeakVoltageSeries(ordered_times - ordered_times[0], np.asarray(peaks, dtype=float)[order])
 
 
-def write_analysis_revision(entry, revision: DoseAnalysisRevision, *, promote: bool) -> str:
+def write_analysis_revision(
+    entry,
+    revision: DoseAnalysisRevision,
+    *,
+    promote: bool,
+    active_source: SourceKey | None = None,
+) -> str:
     filename = f"dose_analysis_{revision.analysis_id}.json"
     with entry.resource(filename, ANALYSIS_RESOURCE_TYPE, "w") as resource:
         json.dump(revision.to_dict(), resource, allow_nan=False, separators=(",", ":"))
@@ -582,7 +629,46 @@ def write_analysis_revision(entry, revision: DoseAnalysisRevision, *, promote: b
         entry.set_tag("calibration_profile_id", str(revision.result.calibration.profile_id))
         entry.set_tag("calibration_revision", str(revision.result.calibration.revision))
         entry.set_tag("calibration_hash", revision.result.calibration.content_hash)
+        if active_source is None:
+            entry.remove_tag(ACTIVE_DOSE_PRODUCT_TAG)
+        else:
+            entry.set_tag(
+                ACTIVE_DOSE_PRODUCT_TAG,
+                encode_active_dose_product_tag(
+                    ActiveDoseProduct(active_source, HDF5_ANALYSIS_VERSION, filename)
+                ),
+            )
     return filename
+
+
+def write_capture_analysis_revision(
+    entry,
+    revision: DoseAnalysisRevision,
+    source_key: SourceKey,
+    *,
+    primary_source: SourceKey | None = None,
+) -> tuple[str, bool]:
+    if not isinstance(source_key, SourceKey):
+        raise ValueError("Capture analysis requires an exact source key.")
+    tags = dict(entry.get_tags())
+    configuration = (
+        source_configuration_from_run_tags(tags)
+        if PRIMARY_SOURCE_TAG in tags
+        else None
+    )
+    selected_primary = primary_source if primary_source is not None else (
+        None if configuration is None else configuration.primary_source
+    )
+    promote = selected_primary is None or selected_primary == source_key
+    filename = write_analysis_revision(
+        entry,
+        revision,
+        promote=promote,
+        active_source=source_key if promote else None,
+    )
+    if not promote:
+        entry.set_tag("runtime", revision.result.runtime_seconds)
+    return filename, promote
 
 
 def analyze_experiment_entry(run_uuid: uuid.UUID, entry, *, runtime_seconds: float | None = None) -> DoseAnalysisResult:

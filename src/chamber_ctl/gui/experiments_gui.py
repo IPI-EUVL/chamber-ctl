@@ -13,9 +13,11 @@ from chamber_ctl.subsystems.development_metrics import DevelopmentMetrics
 from chamber_ctl.data.dose_analysis import (
     DoseAnalysisRevision,
     analyze_experiment_entry,
+    load_capture_source_key,
     load_experiment_dose_series,
     load_experiment_peak_voltage_series,
     write_analysis_revision,
+    write_capture_analysis_revision,
 )
 from chamber_ctl.data.capture_cadence_graph import ensure_capture_cadence_graph
 from chamber_ctl.gui.capture_cadence_plot import show_capture_cadence_figure
@@ -1566,13 +1568,16 @@ class ExperimentsGUI:
             try:
                 worker_record = experiment_reader.get_run(run_uuid)
                 result = analyze_experiment_entry(run_uuid, worker_record.get_record())
-                write_analysis_revision(
-                    worker_record.get_record(),
-                    DoseAnalysisRevision(uuid.uuid4(), time.time(), result),
-                    promote=True,
-                )
-                dose = result.total_dose_mj_cm2
-                runtime = result.runtime_seconds
+                entry = worker_record.get_record()
+                revision = DoseAnalysisRevision(uuid.uuid4(), time.time(), result)
+                source_key = load_capture_source_key(entry)
+                if source_key is None:
+                    write_analysis_revision(entry, revision, promote=True)
+                else:
+                    write_capture_analysis_revision(entry, revision, source_key)
+                tags = entry.get_tags()
+                dose = float(tags.get("dose", result.total_dose_mj_cm2))
+                runtime = float(tags.get("runtime", result.runtime_seconds))
                 processed += 1
                 self.__dose_recalc_queue.put(("progress", i, total, record, run_uuid, float(dose), float(runtime)))
             except Exception as e:

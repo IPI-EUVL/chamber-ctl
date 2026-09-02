@@ -7,13 +7,16 @@ import numpy as np
 import pytest
 
 from chamber_ctl.data.acquisition_artifacts import ArtifactImportError
+from chamber_ctl.data.analysis_selection import active_dose_product_from_tags
 from chamber_ctl.data.calibration import (
     CalibrationProfile,
     CalibrationRepository,
     SourceCalibrationBinding,
     SourceKey,
     source_calibration_run_tags,
+    source_configuration_run_tags,
 )
+from chamber_ctl.data.exposure_graph import read_exposure_graph
 from chamber_ctl.data.observer_artifacts import (
     OBSERVER_CAPTURE_RESOURCE_TYPE,
     OBSERVER_CONTEXT_RESOURCE_TYPE,
@@ -83,13 +86,18 @@ def _profile() -> CalibrationProfile:
     )
 
 
-def _run_record(data_path, run_id, settings, *, source_calibrations=()) -> None:
+def _run_record(data_path, run_id, settings, *, source_calibrations=(), primary_source=None) -> None:
     library = Library(data_path)
     try:
         entry = library.create_entry("Exposure", "Observer fixture")
         entry.set_tag("experiment", "exposure")
         entry.set_tag("run", run_id.hex)
-        for key, value in source_calibration_run_tags(source_calibrations).items():
+        run_tags = (
+            source_calibration_run_tags(source_calibrations)
+            if primary_source is None
+            else source_configuration_run_tags(source_calibrations, primary_source)
+        )
+        for key, value in run_tags.items():
             entry.set_tag(key, value)
         with entry.resource("run.json", "run_state", "w") as resource:
             resource.write(RunState("exposure", settings, run_id).encode())
@@ -125,7 +133,13 @@ def _snapshot(tmp_path, session_id, *, analysis_version=SIGLENT_NATIVE_ANALYSIS_
     return store, manifest
 
 
-def _fixture(tmp_path, *, analysis_version=SIGLENT_NATIVE_ANALYSIS_VERSION, timing_observations=()):
+def _fixture(
+    tmp_path,
+    *,
+    analysis_version=SIGLENT_NATIVE_ANALYSIS_VERSION,
+    timing_observations=(),
+    primary=False,
+):
     data_path = tmp_path / "records"
     data_path.mkdir()
     profile = _profile()
@@ -137,7 +151,13 @@ def _fixture(tmp_path, *, analysis_version=SIGLENT_NATIVE_ANALYSIS_VERSION, timi
     binding = SourceCalibrationBinding(SOURCE.source_kind, SOURCE.source_id, profile.profile_id, profile.revision)
     run_id = uuid.uuid4()
     session_id = uuid.uuid4()
-    _run_record(data_path, run_id, ExposureSettings(), source_calibrations=(binding,))
+    _run_record(
+        data_path,
+        run_id,
+        ExposureSettings(),
+        source_calibrations=(binding,),
+        primary_source=SOURCE if primary else None,
+    )
     store, manifest = _snapshot(tmp_path, session_id, analysis_version=analysis_version)
     session = CaptureSessionManifest(
         server_boot_id=uuid.uuid4(),
@@ -323,5 +343,36 @@ def test_observer_recorder_accepts_timing_metadata_added_after_prepare(tmp_path)
             descriptor = json.load(resource)
         assert descriptor["timing_observation_count"] == 1
         assert client.acknowledged == [str(manifest.snapshot_id)]
+    finally:
+        library.close()
+
+
+def test_primary_observer_promotes_captured_product_and_canonical_graph(tmp_path) -> None:
+    data_path, run, store, manifest, session = _fixture(tmp_path, primary=True)
+    client = _Client(store, manifest)
+    recorder = ObserverArtifactRecorder(data_path, SOURCE, temporary_directory=tmp_path / "received")
+
+    recorder.prepare_run(run, client)
+    recorder.finalize_run(run, session, client)
+
+    library = Library(data_path)
+    try:
+        entry = library.query({"tags": {"run": run.run_id.hex}}, limit=1)[0]
+        tags = entry.get_tags()
+        active = active_dose_product_from_tags(tags)
+        products = {
+            product.analysis.algorithm: product
+            for product in load_observer_dose_products(entry, data_path, run.run_id)
+        }
+        graph = read_exposure_graph(entry, data_path, run.run_id)
+
+        assert active is not None
+        assert active.source_key == SOURCE
+        assert active.algorithm == CAPTURED_ALGORITHM
+        assert float(tags["dose"]) == products[CAPTURED_ALGORITHM].analysis.total_dose_mj_cm2
+        assert "active_dose_analysis" not in tags
+        assert graph.source_key == SOURCE
+        assert graph.full.cumulative_dose_mj_cm2[-1] == products[CAPTURED_ALGORITHM].analysis.total_dose_mj_cm2
+        assert LEGACY_COMPENSATED_ALGORITHM in products
     finally:
         library.close()

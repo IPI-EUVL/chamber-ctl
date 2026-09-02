@@ -15,6 +15,7 @@ from chamber_ctl.subsystems.siglent_observer import (
     SiglentObserverCoordinator,
     _parse_args,
     decode_observer_exposure_state,
+    observer_subsystem_uuid,
 )
 from chamber_ctl.subsystems import uuids
 from euv_acquisition.session import CaptureSessionManifest, CaptureSessionState
@@ -144,6 +145,11 @@ def test_observer_cli_uses_independent_siglent_ports() -> None:
     assert args.control_port == 11762
     assert args.artifact_port == 11763
     assert args.source_kind == "siglent"
+
+
+def test_observer_subsystem_identity_is_stable_and_source_qualified() -> None:
+    assert observer_subsystem_uuid(SOURCE) == observer_subsystem_uuid(SourceKey("siglent", "default"))
+    assert observer_subsystem_uuid(SOURCE) != observer_subsystem_uuid(SourceKey("siglent", "other"))
 
 
 def test_observer_cli_requires_a_complete_fallback_calibration() -> None:

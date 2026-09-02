@@ -534,6 +534,13 @@ class SiglentObserverDdsAdapter:
         timing_state.on_new_data_received(self._on_timing_state)
 
 
+def observer_subsystem_uuid(source_key: SourceKey) -> uuid.UUID:
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"euvl/acquisition-observer/{source_key.source_kind}\0{source_key.source_id}",
+    )
+
+
 class SiglentObserverService:
     def __init__(
         self,
@@ -552,10 +559,11 @@ class SiglentObserverService:
     ) -> None:
         self._events: queue.Queue[tuple[str, bytes]] = queue.Queue()
         self._stop = threading.Event()
+        self._subsystem_uuid = observer_subsystem_uuid(source_key)
         self._logger, self._logger_transport = open_ecs_logger(
             logger_host,
             logger_port,
-            origin_uuid=uuid.uuid4(),
+            origin_uuid=self._subsystem_uuid,
         )
         recorder = ObserverArtifactRecorder(
             data_path,
@@ -596,9 +604,17 @@ class SiglentObserverService:
 
     def _on_dds_ready(self) -> None:
         handle = self._dds_client.register_subsystem(
-            f"__siglent_observer_{uuid.uuid4()}",
-            uuid.uuid4(),
+            f"EUV Observer [{self._coordinator.source_key.source_kind}/{self._coordinator.source_key.source_id}]",
+            self._subsystem_uuid,
             temporary=True,
+        )
+        handle.put_status_item(
+            dds_subsystem.StatusItem(
+                dds_subsystem.StatusItem.STATE_INFO,
+                10,
+                "Configured source: "
+                f"{self._coordinator.source_key.source_kind}/{self._coordinator.source_key.source_id}",
+            )
         )
         self._adapter.configure(handle)
         self._log("Passive Siglent observer subscribed to exposure and laser state.", "INFO")

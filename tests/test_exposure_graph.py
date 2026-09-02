@@ -7,13 +7,20 @@ import h5py
 import numpy as np
 import pytest
 
-from chamber_ctl.data.calibration import CalibrationProfile
+from chamber_ctl.data.analysis_selection import ActiveDoseProduct, encode_active_dose_product_tag
+from chamber_ctl.data.calibration import (
+    CalibrationProfile,
+    SourceCalibrationBinding,
+    SourceKey,
+    source_configuration_run_tags,
+)
 from chamber_ctl.data.dose_analysis import CaptureTimelinePoint, append_capture_timeline_point
 from chamber_ctl.data.exposure_graph import (
     EXPOSURE_GRAPH_RESOURCE,
     ExposureGraphValidationError,
     _RawPulse,
     _apply_native_runtime,
+    _observer_runtime,
     ensure_exposure_graph,
     read_exposure_graph,
 )
@@ -74,6 +81,24 @@ def test_native_runtime_anchor_rescaling_uses_the_unmodified_runtime_baseline() 
     assert np.all(np.diff(runtime) >= 0)
     assert runtime[1] == pytest.approx(0.25)
     assert runtime[3] == pytest.approx(0.5)
+
+
+def test_observer_runtime_interpolates_controller_event_anchors() -> None:
+    wall_unix_ns = np.asarray(
+        [500_000_000, 1_000_000_000, 1_500_000_000, 2_000_000_000, 2_500_000_000],
+        dtype=np.int64,
+    )
+    events = (
+        SimpleNamespace(producer_unix_ns=1_000_000_000, runtime_seconds=0.25),
+        SimpleNamespace(producer_unix_ns=2_000_000_000, runtime_seconds=0.70),
+        SimpleNamespace(producer_unix_ns=2_000_000_000, runtime_seconds=0.75),
+        SimpleNamespace(producer_unix_ns=3_000_000_000, runtime_seconds=None),
+    )
+
+    runtime, quality = _observer_runtime(wall_unix_ns, events)
+
+    assert quality == "controller_event_interpolated"
+    assert runtime == pytest.approx([0.25, 0.25, 0.5, 0.75, 0.75])
 
 
 def test_native_graph_preserves_terminal_total_across_resolutions_and_rejects_tampering(tmp_path) -> None:
@@ -204,6 +229,7 @@ def test_native_graph_ignores_non_authoritative_hdf5_sessions(tmp_path) -> None:
 
         assert graph.raw_pulse_count == 1
         assert graph.final_sequence == 0
+        assert graph.source_key == SourceKey("red_pitaya", "primary")
         assert graph.full.cumulative_dose_mj_cm2[-1] == pytest.approx(
             profile.dose_for_integral(primary_analysis.integral_volt_seconds)
         )
@@ -245,5 +271,110 @@ def test_legacy_graph_clamps_negative_compensated_snapshot_totals(tmp_path) -> N
         assert graph.thumbnail.cumulative_dose_mj_cm2[-1] == 0.0
         assert any("negative compensated dose total" in issue for issue in graph.issues)
         assert any("Graph dose differs from the active analysis" in issue for issue in graph.issues)
+    finally:
+        library.close()
+
+
+def test_primary_observer_product_becomes_canonical_by_exact_source_key(tmp_path, monkeypatch) -> None:
+    import chamber_ctl.data.exposure_graph as exposure_graph
+    from chamber_ctl.data.observer_analysis import (
+        CAPTURED_ALGORITHM,
+        CAPTURED_ANALYSIS_VERSION,
+        ObserverCompleteness,
+        ObserverDoseAnalysis,
+        ObserverDoseGraph,
+        ObserverDoseGraphLevel,
+        ObserverDoseProduct,
+        observer_analysis_filename,
+        observer_graph_filename,
+    )
+
+    run_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    source_key = SourceKey("siglent", "scope-1")
+    profile = _profile()
+    binding = SourceCalibrationBinding(
+        source_key.source_kind,
+        source_key.source_id,
+        profile.profile_id,
+        profile.revision,
+    )
+    level = ObserverDoseGraphLevel(
+        wall_unix_ns=np.asarray([1_000_000_000, 2_000_000_000], dtype=np.int64),
+        dose_increment_mj_cm2=np.asarray([0.0, 2.5]),
+        cumulative_dose_mj_cm2=np.asarray([0.0, 2.5]),
+        source_sequence=np.asarray([-1, 9], dtype=np.int64),
+        represented_pulse_count=np.asarray([0, 10], dtype=np.int64),
+    )
+    analysis = ObserverDoseAnalysis(
+        run_id,
+        session_id,
+        source_key,
+        CAPTURED_ALGORITHM,
+        CAPTURED_ANALYSIS_VERSION,
+        "siglent-native-test",
+        2.0,
+        "a" * 64,
+        profile,
+        "complete",
+        ObserverCompleteness(1, 1, 0, 0, 0),
+        10,
+        1,
+        2.5,
+        0.25,
+        observer_graph_filename(session_id, CAPTURED_ALGORITHM),
+        (),
+    )
+    product = ObserverDoseProduct(
+        analysis,
+        ObserverDoseGraph(
+            run_id,
+            session_id,
+            source_key,
+            CAPTURED_ALGORITHM,
+            CAPTURED_ANALYSIS_VERSION,
+            analysis.source_fingerprint,
+            profile.content_hash,
+            "complete",
+            10,
+            level,
+            level,
+        ),
+    )
+    records_path = tmp_path / "records"
+    records_path.mkdir()
+    library = Library(records_path)
+    entry = library.create_entry("Exposure", "Primary observer fixture")
+    try:
+        for key, value in source_configuration_run_tags((binding,), source_key).items():
+            entry.set_tag(key, value)
+        entry.set_tag(
+            "active_dose_product",
+            encode_active_dose_product_tag(
+                ActiveDoseProduct(
+                    source_key,
+                    CAPTURED_ALGORITHM,
+                    observer_analysis_filename(session_id, CAPTURED_ALGORITHM),
+                )
+            ),
+        )
+        with entry.resource("end_metadata.json", "metadata", "w") as resource:
+            json.dump({"outcome": "STOPPED"}, resource)
+        monkeypatch.setattr(exposure_graph, "load_observer_dose_products", lambda *_args: ())
+
+        pending = ensure_exposure_graph(run_id, entry, records_path)
+
+        assert pending.status == "waiting_for_completion"
+        monkeypatch.setattr(exposure_graph, "load_observer_dose_products", lambda *_args: (product,))
+        generated = ensure_exposure_graph(run_id, entry, records_path)
+        graph = read_exposure_graph(entry, records_path, run_id)
+
+        assert generated.status == "generated"
+        assert graph.source_key == source_key
+        assert graph.calibration_hash == profile.content_hash
+        assert graph.raw_pulse_count == 10
+        assert graph.full.cumulative_dose_mj_cm2[-1] == 2.5
+        assert graph.full.runtime_seconds[-1] == 0.0
+        assert any("runtime anchors" in issue for issue in graph.issues)
     finally:
         library.close()

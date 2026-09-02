@@ -7,7 +7,7 @@ import numpy as np
 from chamber_ctl.data.acquisition_artifacts import AcquisitionArtifactImporter
 from chamber_ctl.data.acquisition_preview import AcquisitionPreview
 from chamber_ctl.data.acquisition_runtime import LiveDoseAccumulator
-from chamber_ctl.data.calibration import CalibrationProfile
+from chamber_ctl.data.calibration import CalibrationProfile, SourceKey
 from chamber_ctl.data.dose_analysis import DoseAnalysisResult, DoseAnalysisRevision, analyze_hdf5_snapshot, write_analysis_revision
 from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem, write_capture_provenance
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
@@ -151,6 +151,7 @@ def test_orphaned_session_recovery_imports_reconciles_and_releases_spool(tmp_pat
     subsystem._artifact_importer = None
     subsystem._temporary_directory = None
     subsystem._next_capture_connect_monotonic = 0.0
+    subsystem._source_key = SourceKey("simulated", "orphan-fixture")
     try:
         monkeypatch.setenv("EUV_ACQUISITION_HOST", server.control_address[0])
         monkeypatch.setenv("EUV_ACQUISITION_CONTROL_PORT", str(server.control_address[1]))
@@ -229,6 +230,7 @@ def test_one_shot_diagnostic_publishes_preview_and_cleans_both_hosts(tmp_path, m
     subsystem._artifact_importer = None
     subsystem._temporary_directory = None
     subsystem._next_capture_connect_monotonic = 0.0
+    subsystem._source_key = SourceKey("simulated", "diagnostic-pipeline")
     subsystem._board_status = {}
     subsystem._preview_publisher = publisher
     subsystem._log = lambda *_args, **_kwargs: None
