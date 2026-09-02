@@ -4,7 +4,6 @@ import threading
 import time
 import queue
 import math
-import os
 import traceback
 import uuid
 
@@ -27,6 +26,7 @@ LIN_LENGTH = 90.0 / (2.54 / STEPS_PER_ROT) # Length / (pitch / steps per revolut
 
 PI_ADDR = ("10.11.13.225", 11755)
 PORT = 11756
+CONNECTION_TIMEOUT_SECONDS = 15.0
 
 STATE_IDLE = 0
 STATE_HOMING = 1
@@ -73,10 +73,15 @@ class StepperClient:
         self.__last_ack_seq = -1
         self.__next_seq = 0
         self.__enabled = False
+        self.__connection_error = "waiting for sample stage response"
+        self.__connection_lock = threading.Lock()
+        self.__pending_command = None
+        self.__discarded_through_seq = -1
+        self.__discarded_command_error = None
 
-        self.__positions = dict()
-        self.__moving = dict()
-        self.__home = dict()
+        self.__positions = {0: 0, 1: 0}
+        self.__moving = {0: False, 1: False}
+        self.__home = {0: None, 1: None}
 
         self.__command_queue = queue.Queue()
 
@@ -106,46 +111,89 @@ class StepperClient:
             self.__send_data()
             time.sleep(0.01)
 
+    def __mark_offline_locked(self, detail):
+        changed = self.__online or self.__connection_error != detail
+        self.__online = False
+        self.__connection_error = detail
+
+        if self.__last_ack_seq < self.__next_seq - 1:
+            self.__discarded_through_seq = self.__next_seq - 1
+            self.__discarded_command_error = detail
+
+        self.__pending_command = None
+        while True:
+            try:
+                self.__command_queue.get_nowait()
+            except queue.Empty:
+                break
+        return changed
+
+    def __mark_offline(self, detail):
+        with self.__connection_lock:
+            changed = self.__mark_offline_locked(detail)
+
+        if changed and not self.__shutdown:
+            print(f"Sample stage connection error: {detail}")
+
+    def __mark_online(self):
+        with self.__connection_lock:
+            self.__last_reply = time.time()
+            self.__online = True
+            self.__connection_error = None
+
     def __send_data(self):
         try:
-            if not self.__online or time.time() - self.__last_reply > 15:
-                if self.__last_reply != 0:
-                    print("Timed out!")
-                
+            if not self.is_online():
                 self.__sock.sendto(b"REQ_CONN", self.__server_address)
                 time.sleep(1)
 
-            elif not self.__command_queue.empty():
-                self.__sock.sendto(self.__command_queue.get(), self.__server_address)
+            else:
+                with self.__connection_lock:
+                    if not self.__online:
+                        return
+                    if self.__pending_command is None:
+                        try:
+                            self.__pending_command = self.__command_queue.get_nowait()
+                        except queue.Empty:
+                            return
+                    command = self.__pending_command
 
-        except OSError:
-            print("Failed to send data!")
-            raise
+                self.__sock.sendto(command, self.__server_address)
+                with self.__connection_lock:
+                    if self.__pending_command == command:
+                        self.__pending_command = None
+
+        except OSError as exc:
+            if not self.__shutdown:
+                self.__mark_offline(f"send failed: {exc}")
+                time.sleep(0.1)
 
 
     def __receive_thread(self):
         print(f"Binding port {self.__bind_port} for incoming connections")
-        self.__sock.bind(("0.0.0.0", self.__bind_port))
+        try:
+            self.__sock.bind(("0.0.0.0", self.__bind_port))
+        except OSError as exc:
+            self.__mark_offline(f"bind failed: {exc}")
+            return
 
         while not self.__shutdown:
             self.__receive()
 
     def __receive(self):
         try:
-            data, addr = self.__sock.recvfrom(1024)
-            #print(f"Received {data} from {addr}")
+            data, _addr = self.__sock.recvfrom(1024)
             data_str = data.decode("utf-8")
 
             #print(data_str)
             self.__parse(data_str)
-            self.__last_reply = time.time()
-            self.__online = True
-        except ConnectionResetError:
-            if not self.__online:
-                pass
-            else:
-                print("Server appears to be down, failed to connect.")
-                self.__online = False
+            self.__mark_online()
+        except OSError as exc:
+            if not self.__shutdown:
+                self.__mark_offline(f"receive failed: {exc}")
+                time.sleep(0.1)
+        except (UnicodeDecodeError, ValueError, IndexError) as exc:
+            self.__mark_offline(f"invalid response: {exc}")
             time.sleep(0.1)
 
     def __parse(self, data : str):
@@ -161,7 +209,8 @@ class StepperClient:
             #print(b_type)
 
             if b_type == 'S':
-                self.__last_ack_seq = int(tokens[1])
+                with self.__connection_lock:
+                    self.__last_ack_seq = int(tokens[1])
                 continue
             elif b_type == 'E':
                 self.__enabled = tokens[1] == "True"
@@ -178,16 +227,17 @@ class StepperClient:
             
 
     def __queue_command(self, command, args):
-        args_str = ""
-        for arg in args:
-            args_str += str(arg) + ','
+        args_str = ','.join(str(arg) for arg in args)
+        self.is_online()
 
-        args_str = args_str.removesuffix(',')
-        
-        to_send = (f"{self.__next_seq},{command},{args_str}").encode("utf-8")
-        self.__command_queue.put(to_send)
+        with self.__connection_lock:
+            if not self.__online:
+                detail = self.__connection_error or "connection unavailable"
+                raise ConnectionError(f"Sample stage offline: {detail}")
 
-        self.__next_seq += 1
+            to_send = (f"{self.__next_seq},{command},{args_str}").encode("utf-8")
+            self.__command_queue.put(to_send)
+            self.__next_seq += 1
 
     def queue_move(self, stepper, steps):
         self.__queue_command("MOVE", [stepper, int(steps)])
@@ -214,25 +264,78 @@ class StepperClient:
         return self.__moving[stepper]
     
     def wait_flush(self, timeout = 60):
+        with self.__connection_lock:
+            target_sequence = self.__next_seq - 1
+
         start_time = time.time()
-        while not self.__command_queue.empty() and (time.time() - start_time) < timeout:
+        while (
+            self.__pending_command is not None or not self.__command_queue.empty()
+        ):
+            self.__raise_if_command_discarded(target_sequence)
+            self.raise_if_offline()
+            if (time.time() - start_time) >= timeout:
+                raise TimeoutError("Timed out")
             time.sleep(0.01)
 
-        if (time.time() - start_time) > timeout:
-            raise TimeoutError("Timed out")
+        self.__raise_if_command_discarded(target_sequence)
+        self.raise_if_offline()
         
     def wait_ack(self, timeout = 60):
         self.wait_flush(timeout)
 
+        with self.__connection_lock:
+            target_sequence = self.__next_seq - 1
+
         start_time = time.time()
-        while self.__last_ack_seq < (self.__next_seq - 1) and (time.time() - start_time) < timeout:
+        while self.__last_ack_seq < target_sequence:
+            self.__raise_if_command_discarded(target_sequence)
+            self.raise_if_offline()
+            if (time.time() - start_time) >= timeout:
+                raise TimeoutError("Timed out")
             time.sleep(0.01)
 
-        if (time.time() - start_time) > timeout:
-            raise TimeoutError("Timed out")
-        
+    def __raise_if_command_discarded(self, target_sequence):
+        with self.__connection_lock:
+            if (
+                target_sequence < 0
+                or target_sequence > self.__discarded_through_seq
+            ):
+                return
+            detail = self.__discarded_command_error or "connection lost"
+
+        raise ConnectionError(
+            f"Sample stage command discarded after connection loss: {detail}"
+        )
+
     def is_online(self):
-        return self.__online and (time.time() - self.__last_reply < 15)
+        detail = None
+        changed = False
+        with self.__connection_lock:
+            if (
+                self.__online
+                and time.time() - self.__last_reply >= CONNECTION_TIMEOUT_SECONDS
+            ):
+                detail = (
+                    f"connection timed out after {CONNECTION_TIMEOUT_SECONDS:g} s"
+                )
+                changed = self.__mark_offline_locked(detail)
+            online = self.__online
+
+        if changed and not self.__shutdown:
+            print(f"Sample stage connection error: {detail}")
+        return online
+
+    def get_connection_error(self):
+        self.is_online()
+        with self.__connection_lock:
+            return self.__connection_error
+
+    def raise_if_offline(self):
+        if self.is_online():
+            return
+
+        detail = self.get_connection_error() or "connection unavailable"
+        raise ConnectionError(f"Sample stage offline: {detail}")
     
     def is_enabled(self):
         return self.__enabled
@@ -275,6 +378,9 @@ class StageProvider:
 
     def get_state(self):
         return STATE_IDLE
+
+    def get_connection_error(self):
+        return None
     
     def is_enabled(self):
         return False
@@ -366,6 +472,11 @@ class PiStageController(StageProvider):
         while stop_flag.run():
             if not self.__client.is_online():
                 self.__state = STATE_OFFLINE
+                while True:
+                    try:
+                        self.__opqueue.get_nowait()
+                    except queue.Empty:
+                        break
                 time.sleep(1)
                 continue
             elif self.__state == STATE_OFFLINE:
@@ -387,7 +498,12 @@ class PiStageController(StageProvider):
                 self.__state = STATE_IDLE
 
             time.sleep(0.1)
-            
+
+    def __wait_until_stopped(self):
+        while self.__client.is_moving():
+            self.__client.raise_if_offline()
+            time.sleep(0.1)
+        self.__client.raise_if_offline()
 
     def __move_blocking(self, stepper, target, timeout = 1.0):
         target = int(target)
@@ -397,13 +513,14 @@ class PiStageController(StageProvider):
         start_time = time.time()
         self.__client.wait_ack()
         while not self.__client.is_moving() and (time.time() - start_time) < timeout:
+            self.__client.raise_if_offline()
             time.sleep(0.1)
 
-        while self.__client.is_moving():
-            time.sleep(0.1)
+        self.__wait_until_stopped()
 
         start_time = time.time()
         while self.__client.get_position(stepper) != target and (time.time() - start_time) < timeout:
+            self.__client.raise_if_offline()
             time.sleep(0.1)
 
         if (time.time() - start_time) > timeout:
@@ -437,8 +554,7 @@ class PiStageController(StageProvider):
         self.__client.queue_move(0, 0)
         self.__client.wait_ack()
         time.sleep(0.5)
-        while self.__client.is_moving():
-            time.sleep(0.1)
+        self.__wait_until_stopped()
 
         self.__client.queue_set(0, 0)
         self.__client.queue_set(1, 0)
@@ -464,8 +580,7 @@ class PiStageController(StageProvider):
         self.__client.wait_ack()
 
         time.sleep(0.5)
-        while self.__client.is_moving():
-            time.sleep(0.1)
+        self.__wait_until_stopped()
 
         h_pos = self.__client.get_home(0)
         if h_pos is None:
@@ -486,8 +601,7 @@ class PiStageController(StageProvider):
         self.__client.wait_ack()
 
         time.sleep(0.5)
-        while self.__client.is_moving():
-            time.sleep(0.1)
+        self.__wait_until_stopped()
 
         h_pos = self.__client.get_home(0)
         if h_pos is None:
@@ -508,8 +622,7 @@ class PiStageController(StageProvider):
         self.__client.wait_ack()
 
         time.sleep(0.5)
-        while self.__client.is_moving():
-            time.sleep(0.1)
+        self.__wait_until_stopped()
 
         h_pos = self.__client.get_home(0)
         if h_pos is None:
@@ -595,38 +708,35 @@ class PiStageController(StageProvider):
 
         self.__move(th, z)
 
+    def __queue_operation(self, func, args):
+        self.__client.raise_if_offline()
+        self.__opqueue.put((func, args))
+        time.sleep(0.1)
+
     def goto_sample(self, sample, offset = [0, 0]):
         #if self.__state != STATE_IDLE:
         #    return False
-        
-        q_item = (self.__rotate_sample_routine, (sample, offset))
-        self.__opqueue.put(q_item)
-        time.sleep(0.1)
-        
+
+        self.__queue_operation(self.__rotate_sample_routine, (sample, offset))
+
     
     def home(self):
         #if self.__state != STATE_IDLE:
         #    return False
-        
-        q_item = (self.__homing_routine, ())
-        self.__opqueue.put(q_item)
-        time.sleep(0.1)
+
+        self.__queue_operation(self.__homing_routine, ())
 
     def home_rot(self):
         #if self.__state != STATE_IDLE:
         #    return False
-        
-        q_item = (self.__rot_homing_routine, ())
-        self.__opqueue.put(q_item)
-        time.sleep(0.1)
+
+        self.__queue_operation(self.__rot_homing_routine, ())
 
     def move_to(self, th, z):
         #if self.__state != STATE_IDLE:
         #    return False
-        
-        q_item = (self.__move, (th, z))
-        self.__opqueue.put(q_item)
-        time.sleep(0.1)
+
+        self.__queue_operation(self.__move, (th, z))
 
     def get_position(self):
         th = (-self.__client.get_position(0) / STEPS_PER_ROT) * 2 * math.pi
@@ -635,11 +745,22 @@ class PiStageController(StageProvider):
         return (th, z)
     
     def wait_idle(self):
-        while self.__state != STATE_IDLE:
+        while True:
+            state = self.get_state()
+            if state == STATE_IDLE:
+                return
+            if state == STATE_OFFLINE:
+                detail = self.get_connection_error() or "connection unavailable"
+                raise ConnectionError(f"Sample stage offline: {detail}")
             time.sleep(0.1)
 
     def get_state(self):
+        if not self.__client.is_online():
+            return STATE_OFFLINE
         return self.__state
+
+    def get_connection_error(self):
+        return self.__client.get_connection_error()
     
     def is_enabled(self):
         return self.__client.is_enabled()
@@ -969,7 +1090,11 @@ class SampleMotionSubsystem(ExperimentClient):
         self.__put_status_item_if_changed(1, StatusItem.STATE_INFO, current_sample_msg)
 
         if state == STATE_OFFLINE:
-            self.__put_status_item_if_changed(100, StatusItem.STATE_WARN, "Sample stage offline")
+            detail = self.__stage.get_connection_error()
+            message = "Sample stage offline"
+            if detail:
+                message += f": {detail}"
+            self.__put_status_item_if_changed(100, StatusItem.STATE_ALARM, message)
         else:
             self.__clear_status_item_if_exists(100)
 
@@ -985,6 +1110,9 @@ class SampleMotionSubsystem(ExperimentClient):
             self.__clear_status_item_if_exists(200)
 
     def __resolve_current_slot(self):
+        if self.__stage.get_state() == STATE_OFFLINE:
+            return -1
+
         th, z = self.__stage.get_position()
 
         best_slot = -1
@@ -992,7 +1120,7 @@ class SampleMotionSubsystem(ExperimentClient):
         for slot in range(self.__stage.get_slot_count()):
             try:
                 s_th, s_z = self.__stage.calc_target_pose_for_slot(slot, self.__offset)
-            except Exception as e:
+            except Exception:
                 # Slot cannot be reached physically
                 continue
 
@@ -1060,11 +1188,17 @@ class SampleMotionSubsystem(ExperimentClient):
             cur_slot = self.__resolve_current_slot()
             state = self.__stage.get_state()
 
+            if state == STATE_OFFLINE:
+                detail = self.__stage.get_connection_error()
+                message = "Sample stage offline"
+                if detail:
+                    message += f": {detail}"
+                raise ConnectionError(message)
+
             if cur_slot == slot and state == STATE_IDLE:
                 return True
 
             if handle is not None and (time.monotonic() - last_feedback) > 5.0:
-                remaining = max(0.0, timeout - (time.monotonic() - begin))
                 msg = feedback_msg if feedback_msg else f"waiting for sample slot {slot}"
                 handle.feedback(magics.OP_IN_PROGRESS + f": {msg}".encode("utf-8"))
                 last_feedback = time.monotonic()
@@ -1077,11 +1211,18 @@ class SampleMotionSubsystem(ExperimentClient):
         begin = time.monotonic()
         last_feedback = 0.0
         while (time.monotonic() - begin) < timeout:
-            if self.__stage.get_state() == STATE_IDLE:
+            state = self.__stage.get_state()
+            if state == STATE_OFFLINE:
+                detail = self.__stage.get_connection_error()
+                message = "Sample stage offline"
+                if detail:
+                    message += f": {detail}"
+                raise ConnectionError(message)
+
+            if state == STATE_IDLE:
                 return True
 
             if handle is not None and (time.monotonic() - last_feedback) > 5.0:
-                remaining = max(0.0, timeout - (time.monotonic() - begin))
                 msg = feedback_msg if feedback_msg else "waiting for stage idle"
                 handle.feedback(magics.OP_IN_PROGRESS + f": {msg}".encode("utf-8"))
                 last_feedback = time.monotonic()
