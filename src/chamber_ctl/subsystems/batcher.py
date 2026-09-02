@@ -13,9 +13,12 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 from chamber_ctl.data.calibration import (
+    SourceConfiguration,
     SourceCalibrationBinding,
+    SourceKey,
     normalize_source_calibration_bindings,
     source_calibration_run_tags,
+    source_configuration_run_tags,
 )
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 
@@ -71,6 +74,7 @@ class ExposureTemplate:
     calibration_revision: int = 0
     chopper_frequency_hz: float | None = 192.0
     source_calibrations: tuple[SourceCalibrationBinding, ...] = ()
+    primary_source: SourceKey | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("base_pressure", "operating_pressure", "flow_sccm"):
@@ -90,6 +94,8 @@ class ExposureTemplate:
             "source_calibrations",
             normalize_source_calibration_bindings(self.source_calibrations),
         )
+        if self.primary_source is not None:
+            SourceConfiguration(self.source_calibrations, self.primary_source)
 
     def settings_for(self, entry: "BatchPlanEntry", target: float) -> ExposureSettings:
         if not math.isfinite(target) or target <= 0:
@@ -192,7 +198,7 @@ class BatchPlan:
         object.__setattr__(self, "entries", entries)
 
 
-BATCH_PLAN_SCHEMA_VERSION = 4
+BATCH_PLAN_SCHEMA_VERSION = 5
 BATCH_MANIFEST_SCHEMA_VERSION = 1
 
 
@@ -214,6 +220,9 @@ def batch_plan_to_dict(plan: BatchPlan) -> dict[str, Any]:
             "source_calibrations": [
                 binding.to_dict() for binding in plan.template.source_calibrations
             ],
+            "primary_source": (
+                None if plan.template.primary_source is None else plan.template.primary_source.to_dict()
+            ),
         },
         "entries": [
             {
@@ -228,7 +237,7 @@ def batch_plan_to_dict(plan: BatchPlan) -> dict[str, Any]:
 
 
 def batch_plan_from_dict(value: object) -> BatchPlan:
-    if not isinstance(value, dict) or value.get("schema_version") not in (1, 2, 3, BATCH_PLAN_SCHEMA_VERSION):
+    if not isinstance(value, dict) or value.get("schema_version") not in (1, 2, 3, 4, BATCH_PLAN_SCHEMA_VERSION):
         raise ValueError("Unsupported or missing batch plan schema version.")
     if set(value) != {"schema_version", "template", "entries"}:
         raise ValueError("Batch plan contains unknown or missing fields.")
@@ -250,6 +259,8 @@ def batch_plan_from_dict(value: object) -> BatchPlan:
         required_template |= {"calibration_profile_id", "calibration_revision", "chopper_frequency_hz"}
     if value["schema_version"] >= 4:
         required_template.add("source_calibrations")
+    if value["schema_version"] >= 5:
+        required_template.add("primary_source")
     if set(template) != required_template:
         raise ValueError("Batch plan template contains unknown or missing fields.")
     schema_version = value["schema_version"]
@@ -284,6 +295,11 @@ def batch_plan_from_dict(value: object) -> BatchPlan:
             source_calibrations=()
             if schema_version < 4
             else normalize_source_calibration_bindings(template["source_calibrations"]),
+            primary_source=(
+                None
+                if schema_version < 5 or template["primary_source"] is None
+                else SourceKey.from_dict(template["primary_source"])
+            ),
         ),
         tuple(parsed_entries),
     )
@@ -972,7 +988,13 @@ class BatchHistoryStore:
     def _worker(self) -> None:
         from ipi_ecs.subsystems.experiment_controller import ExperimentReader
 
-        from chamber_ctl.data.dose_analysis import analyze_experiment_entry, write_analysis_revision, DoseAnalysisRevision
+        from chamber_ctl.data.dose_analysis import (
+            DoseAnalysisRevision,
+            analyze_experiment_entry,
+            load_capture_source_key,
+            write_analysis_revision,
+            write_capture_analysis_revision,
+        )
 
         experiment_reader = None
         try:
@@ -1000,12 +1022,18 @@ class BatchHistoryStore:
                         runtime = result.runtime_seconds
                         if not _is_finite_number(dose) or not _is_finite_number(runtime):
                             raise ValueError(f"Recalculation for run {run_uuid} returned non-finite metrics.")
-                        write_analysis_revision(
-                            record.get_record(),
-                            DoseAnalysisRevision(uuid.uuid4(), time.time(), result),
-                            promote=True,
+                        entry = record.get_record()
+                        revision = DoseAnalysisRevision(uuid.uuid4(), time.time(), result)
+                        source_key = load_capture_source_key(entry)
+                        if source_key is None:
+                            write_analysis_revision(entry, revision, promote=True)
+                        else:
+                            write_capture_analysis_revision(entry, revision, source_key)
+                        tags = entry.get_tags()
+                        value = (
+                            float(tags.get("dose", dose)),
+                            float(tags.get("runtime", runtime)),
                         )
-                        value = (float(dose), float(runtime))
                     else:
                         raise ValueError(f"Unknown history-store operation {operation!r}.")
                 except Exception as exc:
@@ -1546,7 +1574,14 @@ class BatchCoordinator:
                 return False, message
             try:
                 tags = dict(run_tags or {})
-                source_tags = source_calibration_run_tags(self.plan.template.source_calibrations)
+                source_tags = (
+                    source_configuration_run_tags(
+                        self.plan.template.source_calibrations,
+                        self.plan.template.primary_source,
+                    )
+                    if self.plan.template.primary_source is not None
+                    else source_calibration_run_tags(self.plan.template.source_calibrations)
+                )
                 if set(tags).intersection(source_tags):
                     raise ValueError("Source calibration run tags are owned by the batch plan.")
                 tags.update(source_tags)

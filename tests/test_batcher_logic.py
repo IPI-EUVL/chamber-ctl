@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from chamber_ctl.data.calibration import SourceCalibrationBinding
+from chamber_ctl.data.calibration import (
+    PRIMARY_SOURCE_TAG,
+    SourceCalibrationBinding,
+    decode_primary_source_tag,
+)
 from chamber_ctl.subsystems.batcher import (
     BatchCoordinator,
     BatchCoordinatorConfig,
@@ -144,7 +148,7 @@ def test_sample_overrides_round_trip_merge_into_settings_and_survive_target_rege
         (2,),
     )
 
-    assert encoded["schema_version"] == 4
+    assert encoded["schema_version"] == 5
     assert dict(restored.entries[0].overrides) == {"operator": "Override operator", "flow_sccm": 4.5}
     assert settings.get_operator() == "Override operator"
     assert settings.get_flow_sccm() == pytest.approx(4.5)
@@ -160,6 +164,7 @@ def test_legacy_plan_entries_load_without_overrides() -> None:
     encoded["template"].pop("calibration_revision")
     encoded["template"].pop("chopper_frequency_hz")
     encoded["template"].pop("source_calibrations")
+    encoded["template"].pop("primary_source")
     encoded["entries"][0].pop("overrides")
 
     restored = batch_plan_from_dict(encoded)
@@ -176,6 +181,7 @@ def test_schema_two_plan_entries_preserve_overrides_without_calibration_fields()
     encoded["template"].pop("calibration_revision")
     encoded["template"].pop("chopper_frequency_hz")
     encoded["template"].pop("source_calibrations")
+    encoded["template"].pop("primary_source")
 
     restored = batch_plan_from_dict(encoded)
 
@@ -189,6 +195,7 @@ def test_schema_three_plan_loads_without_source_calibrations() -> None:
     encoded = batch_plan_to_dict(_plan())
     encoded["schema_version"] = 3
     encoded["template"].pop("source_calibrations")
+    encoded["template"].pop("primary_source")
 
     restored = batch_plan_from_dict(encoded)
 
@@ -198,7 +205,11 @@ def test_schema_three_plan_loads_without_source_calibrations() -> None:
 def test_batch_plan_round_trips_source_calibration_bindings() -> None:
     binding = SourceCalibrationBinding("siglent", "scope-1", uuid.uuid4(), 2)
     plan = BatchPlan(
-        ExposureTemplate("Source calibrated", source_calibrations=(binding,)),
+        ExposureTemplate(
+            "Source calibrated",
+            source_calibrations=(binding,),
+            primary_source=binding.source_key,
+        ),
         (BatchPlanEntry(0, TargetMode.DOSE, 10.0),),
     )
 
@@ -206,6 +217,7 @@ def test_batch_plan_round_trips_source_calibration_bindings() -> None:
     settings = restored.template.settings_for(restored.entries[0], 5.0)
 
     assert restored.template.source_calibrations == (binding,)
+    assert restored.template.primary_source == binding.source_key
     assert "source_calibrations" not in settings.get_dict()
 
 
@@ -566,7 +578,11 @@ def test_coordinator_start_command_attaches_source_calibrations_as_scalar_run_ta
     base_plan = _plan()
     plan = replace(
         base_plan,
-        template=replace(base_plan.template, source_calibrations=(binding,)),
+        template=replace(
+            base_plan.template,
+            source_calibrations=(binding,),
+            primary_source=binding.source_key,
+        ),
     )
     controller = _FakeController()
     coordinator = BatchCoordinator(
@@ -584,6 +600,7 @@ def test_coordinator_start_command_attaches_source_calibrations_as_scalar_run_ta
     assert "source_calibrations" not in settings.get_dict()
     assert isinstance(run_tags[SOURCE_CALIBRATIONS_TAG], str)
     assert source_calibration_for_source(run_tags[SOURCE_CALIBRATIONS_TAG], binding.source_key) == binding
+    assert decode_primary_source_tag(run_tags[PRIMARY_SOURCE_TAG]) == binding.source_key
 
 
 def test_coordinator_start_command_refuses_while_paused() -> None:
