@@ -11,6 +11,7 @@ from chamber_ctl.data.calibration import (
     source_calibration_for_source,
 )
 from chamber_ctl.gui.exposure_controller import ExposureControllerGUI
+from chamber_ctl.subsystems.siglent_observer import observer_subsystem_uuid
 
 
 class _Value:
@@ -38,6 +39,28 @@ class _Label:
 
     def config(self, *, text):
         self.text = text
+
+
+class _GridLabel(_Label):
+    def __init__(self, *_args, **kwargs):
+        super().__init__()
+        self.visible = False
+
+    def grid(self, **_kwargs):
+        self.visible = True
+
+    def grid_remove(self):
+        self.visible = False
+
+
+class _RemoteHandle:
+    def __init__(self):
+        self.remotes = []
+
+    def add_remote_kv(self, target, descriptor):
+        value = _Value(None)
+        self.remotes.append((target, descriptor.get_key(), value))
+        return value
 
 
 def test_current_settings_leaves_legacy_calibration_fields_unselected() -> None:
@@ -122,6 +145,14 @@ def test_exposure_live_labels_fall_back_to_acquisition_status_metrics() -> None:
     gui._ExposureControllerGUI__time_kv = _Value(None)
     gui._ExposureControllerGUI__status_dose_value = _Label()
     gui._ExposureControllerGUI__status_time_value = _Label()
+    gui._ExposureControllerGUI__status_control_source_value = _Label()
+    gui._ExposureControllerGUI__live_sources_frame = None
+    gui._ExposureControllerGUI__subsystem = None
+    gui._ExposureControllerGUI__observer_live_kvs = {}
+    gui._ExposureControllerGUI__observer_live_labels = {}
+    gui._ExposureControllerGUI__source_calibrations = ()
+    gui._ExposureControllerGUI__source_options_provider = None
+    gui._ExposureControllerGUI__primary_source = None
     gui._ExposureControllerGUI__status_acquisition_value = None
     gui._ExposureControllerGUI__status_laser_value = None
     gui._ExposureControllerGUI__status_chopper_value = None
@@ -135,3 +166,57 @@ def test_exposure_live_labels_fall_back_to_acquisition_status_metrics() -> None:
 
     assert gui._ExposureControllerGUI__status_dose_value.text == "2.50 mJ/cm²"
     assert gui._ExposureControllerGUI__status_time_value.text == "0.00 s"
+
+
+def test_exposure_subscribes_to_source_qualified_observer_live_values() -> None:
+    source = SourceKey("siglent", "scope-1")
+    handle = _RemoteHandle()
+    gui = object.__new__(ExposureControllerGUI)
+    gui._ExposureControllerGUI__subsystem = handle
+    gui._ExposureControllerGUI__observer_live_kvs = {}
+    gui._ExposureControllerGUI__source_calibrations = ()
+    gui._ExposureControllerGUI__source_options_provider = lambda: (source,)
+    gui._ExposureControllerGUI__acquisition_status_kv = _Value(
+        b'{"source_kind":"red_pitaya","source_id":"red-pitaya"}'
+    )
+
+    gui._ExposureControllerGUI__refresh_observer_live_sources()
+
+    assert [(target, key) for target, key, _value in handle.remotes] == [
+        (observer_subsystem_uuid(source), b"cur_dose"),
+        (observer_subsystem_uuid(source), b"cur_time"),
+    ]
+
+
+def test_exposure_renders_control_and_default_observer_live_rows(monkeypatch) -> None:
+    source = SourceKey("siglent", "scope-1")
+    binding = SourceCalibrationBinding(source.source_kind, source.source_id, uuid.uuid4(), 1)
+    gui = object.__new__(ExposureControllerGUI)
+    gui._ExposureControllerGUI__status_dose_value = _Label()
+    gui._ExposureControllerGUI__status_time_value = _Label()
+    gui._ExposureControllerGUI__status_control_source_value = _Label()
+    gui._ExposureControllerGUI__live_sources_frame = object()
+    gui._ExposureControllerGUI__observer_live_labels = {}
+    gui._ExposureControllerGUI__observer_live_kvs = {source: (_Value(7.5), _Value(1.25))}
+    gui._ExposureControllerGUI__source_calibrations = (binding,)
+    gui._ExposureControllerGUI__source_options_provider = lambda: (source,)
+    gui._ExposureControllerGUI__primary_source = source
+    gui._ExposureControllerGUI__acquisition_status_kv = _Value(
+        b'{"source_kind":"red_pitaya","source_id":"red-pitaya"}'
+    )
+    monkeypatch.setattr(exposure_controller_gui.ttk, "Label", _GridLabel)
+
+    gui._ExposureControllerGUI__update_live_source_rows(2.5, 0.5)
+
+    assert gui._ExposureControllerGUI__status_control_source_value.text == (
+        "red_pitaya/red-pitaya (control)"
+    )
+    assert gui._ExposureControllerGUI__status_dose_value.text == "2.50 mJ/cm²"
+    assert gui._ExposureControllerGUI__status_time_value.text == "0.50 s"
+    observer_labels = gui._ExposureControllerGUI__observer_live_labels[source]
+    assert [label.text for label in observer_labels] == [
+        "siglent/scope-1 (default)",
+        "7.50 mJ/cm²",
+        "1.25 s",
+    ]
+    assert all(label.visible for label in observer_labels)

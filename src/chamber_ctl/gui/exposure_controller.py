@@ -31,6 +31,7 @@ from chamber_ctl.gui.source_calibration_editor import (
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 from chamber_ctl.subsystems.laser import LaserSyncStatus
+from chamber_ctl.subsystems.siglent_observer import observer_subsystem_uuid
 from chamber_ctl.subsystems.settings_presets import SettingsPresets
 from euv_acquisition.health import AcquisitionHealth
 from euv_acquisition.source_identity import RED_PITAYA_SOURCE_ID, RED_PITAYA_SOURCE_KIND
@@ -106,6 +107,8 @@ class ExposureControllerGUI():
 
         self.__did_config = False
         self.__subsystem = None
+        self.__observer_live_kvs: dict[SourceKey, tuple[object, object]] = {}
+        self.__observer_live_labels: dict[SourceKey, tuple[object, object, object]] = {}
 
         self.__position_kv = None
 
@@ -118,6 +121,8 @@ class ExposureControllerGUI():
 
         self.__status_dose_value = None
         self.__status_time_value = None
+        self.__status_control_source_value = None
+        self.__live_sources_frame = None
         self.__status_acquisition_value = None
         self.__status_laser_value = None
         self.__status_chopper_value = None
@@ -211,6 +216,7 @@ class ExposureControllerGUI():
         self.__source_calibration_text.set(
             source_calibration_summary(selected.calibrations, selected.primary_source)
         )
+        self.__refresh_observer_live_sources()
         self.__exp_itf.set_run_tags(
             source_configuration_run_tags(selected.calibrations, selected.primary_source)
         )
@@ -243,6 +249,7 @@ class ExposureControllerGUI():
                 self.__target_type_label.config(text="mj/cm2")
 
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):
+        self.__subsystem = handle
         self.__position_kv = handle.add_remote_kv(
             uuids.UUID_SAMPLE_MOTION_CONTROLLER,
             subsystem.KVDescriptor(types.VectorTypeSpecifier(types.FloatTypeSpecifier(), 2), b"position", True, True, False)
@@ -287,7 +294,111 @@ class ExposureControllerGUI():
             subsystem.KVDescriptor(types.VectorTypeSpecifier(types.ByteTypeSpecifier(), 2), b"status", True, True, False),
         )
 
+        self.__refresh_observer_live_sources()
         self.__refresh_queue_from_remote(update_status=False)
+
+    def __live_source_keys(self) -> tuple[SourceKey, ...]:
+        sources = {binding.source_key for binding in self.__source_calibrations}
+        if self.__source_options_provider is not None:
+            try:
+                sources.update(self.__source_options_provider())
+            except Exception:
+                pass
+        status = self.__get_acquisition_status() or {}
+        source_kind = status.get("configured_source_kind") or status.get("source_kind")
+        source_id = status.get("configured_source_id") or status.get("source_id")
+        if isinstance(source_kind, str) and isinstance(source_id, str):
+            try:
+                sources.add(SourceKey(source_kind, source_id))
+            except ValueError:
+                pass
+        if not sources:
+            sources.add(SourceKey(RED_PITAYA_SOURCE_KIND, RED_PITAYA_SOURCE_ID))
+        return tuple(sorted(sources))
+
+    def __control_source_key(self) -> SourceKey:
+        status = self.__get_acquisition_status() or {}
+        try:
+            return SourceKey(
+                str(status.get("configured_source_kind") or status.get("source_kind") or RED_PITAYA_SOURCE_KIND),
+                str(status.get("configured_source_id") or status.get("source_id") or RED_PITAYA_SOURCE_ID),
+            )
+        except ValueError:
+            return SourceKey(RED_PITAYA_SOURCE_KIND, RED_PITAYA_SOURCE_ID)
+
+    def __refresh_observer_live_sources(self) -> None:
+        handle = getattr(self, "_ExposureControllerGUI__subsystem", None)
+        if handle is None:
+            return
+        control_source = self.__control_source_key()
+        for source in self.__live_source_keys():
+            if source == control_source or source in self.__observer_live_kvs:
+                continue
+            source_uuid = observer_subsystem_uuid(source)
+            dose = handle.add_remote_kv(
+                source_uuid,
+                subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"cur_dose", True, True, False),
+            )
+            runtime = handle.add_remote_kv(
+                source_uuid,
+                subsystem.KVDescriptor(types.FloatTypeSpecifier(), b"cur_time", True, True, False),
+            )
+            self.__observer_live_kvs[source] = (dose, runtime)
+
+    @staticmethod
+    def __format_live_value(value, unit: str) -> str:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if not math.isfinite(numeric):
+            return "N/A"
+        return f"{numeric:.2f} {unit}"
+
+    def __update_live_source_rows(self, control_dose, control_time) -> None:
+        self.__status_dose_value.config(text=self.__format_live_value(control_dose, "mJ/cm²"))
+        self.__status_time_value.config(text=self.__format_live_value(control_time, "s"))
+        frame = self.__live_sources_frame
+        if frame is None:
+            return
+        control_source = self.__control_source_key()
+        control_roles = ["control"]
+        if control_source == self.__primary_source:
+            control_roles.append("default")
+        self.__status_control_source_value.config(
+            text=f"{control_source.source_kind}/{control_source.source_id} ({', '.join(control_roles)})"
+        )
+
+        observer_sources = [source for source in self.__live_source_keys() if source != control_source]
+        active_sources = set(observer_sources)
+        for source, labels in tuple(self.__observer_live_labels.items()):
+            if source not in active_sources:
+                for label in labels:
+                    label.grid_remove()
+        for row, source in enumerate(observer_sources, start=2):
+            labels = self.__observer_live_labels.get(source)
+            if labels is None:
+                labels = (
+                    ttk.Label(frame, wraplength=170),
+                    ttk.Label(frame, width=14),
+                    ttk.Label(frame, width=9),
+                )
+                self.__observer_live_labels[source] = labels
+            roles = ["default"] if source == self.__primary_source else []
+            source_text = f"{source.source_kind}/{source.source_id}"
+            if roles:
+                source_text += f" ({', '.join(roles)})"
+            dose_kv, time_kv = self.__observer_live_kvs.get(source, (None, None))
+            dose_value = None if dose_kv is None else dose_kv.value
+            time_value = None if time_kv is None else time_kv.value
+            values = (
+                source_text,
+                self.__format_live_value(dose_value, "mJ/cm²"),
+                self.__format_live_value(time_value, "s"),
+            )
+            for column, (label, text) in enumerate(zip(labels, values)):
+                label.config(text=text)
+                label.grid(row=row, column=column, sticky=tk.W, padx=(0, 8), pady=1)
 
     @staticmethod
     def __format_active_status(is_active: bool, is_warming: bool, warm_label: str) -> str:
@@ -315,17 +426,14 @@ class ExposureControllerGUI():
     def __update_live_status(self):
         laser_status = None
         acquisition_status = self.__get_acquisition_status()
-        if self.__status_dose_value is not None:
-            dose_value = self.__dose_kv.value if self.__dose_kv is not None else None
-            if dose_value is None and acquisition_status is not None:
-                dose_value = acquisition_status.get("accumulated_dose_mj_cm2")
-            self.__status_dose_value.config(text="N/A" if dose_value is None else f"{float(dose_value):.2f} mJ/cm²")
-
-        if self.__status_time_value is not None:
-            time_value = self.__time_kv.value if self.__time_kv is not None else None
-            if time_value is None and acquisition_status is not None:
-                time_value = acquisition_status.get("transmitting_runtime_seconds")
-            self.__status_time_value.config(text="N/A" if time_value is None else f"{float(time_value):.2f} s")
+        dose_value = self.__dose_kv.value if self.__dose_kv is not None else None
+        if dose_value is None and acquisition_status is not None:
+            dose_value = acquisition_status.get("accumulated_dose_mj_cm2")
+        time_value = self.__time_kv.value if self.__time_kv is not None else None
+        if time_value is None and acquisition_status is not None:
+            time_value = acquisition_status.get("transmitting_runtime_seconds")
+        self.__refresh_observer_live_sources()
+        self.__update_live_source_rows(dose_value, time_value)
 
         if self.__status_acquisition_value is not None:
             self.__status_acquisition_value.config(text=self.__format_acquisition_status())
@@ -963,13 +1071,24 @@ class ExposureControllerGUI():
         status_grid.pack(fill=tk.BOTH, expand=True)
         status_grid.columnconfigure(1, weight=1)
 
-        ttk.Label(status_grid, text="Dose:").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=2)
-        self.__status_dose_value = ttk.Label(status_grid, text="N/A")
-        self.__status_dose_value.grid(row=0, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(status_grid, text="Time:").grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=2)
-        self.__status_time_value = ttk.Label(status_grid, text="N/A")
-        self.__status_time_value.grid(row=1, column=1, sticky=tk.W, pady=2)
+        ttk.Label(status_grid, text="Live Sources", font=("TkDefaultFont", 10, "bold")).grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(0, 4),
+        )
+        self.__live_sources_frame = ttk.Frame(status_grid)
+        self.__live_sources_frame.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
+        ttk.Label(self.__live_sources_frame, text="Source", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        ttk.Label(self.__live_sources_frame, text="Dose", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=1, sticky=tk.W, padx=(0, 8))
+        ttk.Label(self.__live_sources_frame, text="Time", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=2, sticky=tk.W)
+        self.__status_control_source_value = ttk.Label(self.__live_sources_frame, wraplength=170)
+        self.__status_control_source_value.grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=1)
+        self.__status_dose_value = ttk.Label(self.__live_sources_frame, text="N/A", width=14)
+        self.__status_dose_value.grid(row=1, column=1, sticky=tk.W, padx=(0, 8), pady=1)
+        self.__status_time_value = ttk.Label(self.__live_sources_frame, text="N/A", width=9)
+        self.__status_time_value.grid(row=1, column=2, sticky=tk.W, pady=1)
 
         ttk.Label(status_grid, text="Laser:").grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=2)
         self.__status_laser_value = ttk.Label(status_grid, text="Unknown")

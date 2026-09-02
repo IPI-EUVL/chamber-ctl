@@ -19,13 +19,16 @@ from ipi_ecs.subsystems.experiment_controller import RunState
 import segment_bytes
 
 from chamber_ctl.data.observer_artifacts import ObserverArtifactRecorder
+from chamber_ctl.data.acquisition_runtime import LiveDoseAccumulator, LivePulseUpdate
 from chamber_ctl.data.calibration import (
+    CalibrationProfile,
     SourceCalibrationBinding,
     SourceKey,
     normalize_source_calibration_bindings,
 )
 from chamber_ctl.subsystems import uuids
 from euv_acquisition.ecs_logging import open_ecs_logger
+from euv_acquisition.models import PulseReport
 from euv_acquisition.service import AcquisitionClient
 from euv_acquisition.session import (
     CapturePurpose,
@@ -204,6 +207,8 @@ class SiglentObserverCoordinator:
         session_id_factory: Callable[[], uuid.UUID] = uuid.uuid4,
         log: Callable[[str, str], None] | None = None,
         journal: ObserverRecoveryJournal | None = None,
+        calibration_loader: Callable[[SourceCalibrationBinding], CalibrationProfile] | None = None,
+        on_live_update: Callable[[LivePulseUpdate], None] | None = None,
     ) -> None:
         self.source_key = source_key
         self._client_factory = client_factory
@@ -213,10 +218,14 @@ class SiglentObserverCoordinator:
         self._session_id_factory = session_id_factory
         self._log = log or (lambda _message, _level: None)
         self._journal = journal or _NullObserverRecoveryJournal()
+        self._calibration_loader = calibration_loader
+        self._on_live_update = on_live_update or (lambda _update: None)
         self._lock = threading.RLock()
         self._client = None
         self._run: ObserverCaptureRun | None = None
         self._timing_observations: list[ObserverTimingObservation] = []
+        self._live_accumulator: LiveDoseAccumulator | None = None
+        self._transmitting = False
         self._last_error: str | None = None
 
     @property
@@ -255,6 +264,7 @@ class SiglentObserverCoordinator:
             return
         try:
             client.heartbeat_if_due()
+            self._consume_reports(client)
             try:
                 stop_reason = client.get_stop_reason(timeout=0.0)
             except queue.Empty:
@@ -272,6 +282,9 @@ class SiglentObserverCoordinator:
 
     def observe_timing(self, state: LaserTimingState) -> None:
         with self._lock:
+            self._transmitting = state.euv_transmitting()
+            if self._live_accumulator is not None:
+                self._live_accumulator.set_transmitting(self._transmitting)
             if self._run is None or self._run.stopped_observed_unix_ns is not None:
                 return
             sampled_at = state.sampled_at_unix_ns
@@ -315,6 +328,10 @@ class SiglentObserverCoordinator:
             if self._run is not None:
                 return
 
+        live_accumulator = None
+        if self._calibration_loader is not None:
+            live_accumulator = LiveDoseAccumulator(self._calibration_loader(calibration))
+            live_accumulator.set_transmitting(self._transmitting)
         client = self._client_factory()
         session_id = self._session_id_factory()
         provisional_run = ObserverCaptureRun(
@@ -361,13 +378,25 @@ class SiglentObserverCoordinator:
 
         self._client = client
         self._run = run
+        self._live_accumulator = live_accumulator
         self._timing_observations = []
         self._last_error = None
+        if live_accumulator is not None:
+            self._on_live_update(
+                LivePulseUpdate(
+                    accepted=True,
+                    pulse_dose_mj_cm2=0.0,
+                    accumulated_dose_mj_cm2=0.0,
+                    transmitting_runtime_seconds=0.0,
+                )
+            )
         self._log(f"Started passive capture session {session_id} for exposure {run_id}.", "INFO")
 
     def _mark_running(self, run_id: uuid.UUID | None) -> None:
         if self._run is None or self._run.run_id != run_id:
             return
+        if self._live_accumulator is not None:
+            self._live_accumulator.set_running(True)
         if self._run.exposure_started_unix_ns is None:
             self._run = replace(self._run, exposure_started_unix_ns=self._now_ns())
             self._journal.save(self._run)
@@ -386,13 +415,19 @@ class SiglentObserverCoordinator:
             self._run = run
             self._journal.save(run)
 
+        self._consume_reports(client)
         expected_stop_reason = f"Exposure {run.run_id} reached STOPPED."
-        status = client.command("status")
-        if bool(status.get("capture_active")):
-            status = client.command(
-                "stop_capture",
-                {"reason": expected_stop_reason},
-            )
+        try:
+            status = client.command("status")
+            if bool(status.get("capture_active")):
+                status = client.command(
+                    "stop_capture",
+                    {"reason": expected_stop_reason},
+                )
+            self._consume_reports(client)
+        finally:
+            if self._live_accumulator is not None:
+                self._live_accumulator.set_running(False)
         manifest = self._session_from_status(status)
         self._validate_session(manifest, run.session_id, active=False)
         if manifest.stop_reason != expected_stop_reason:
@@ -416,6 +451,10 @@ class SiglentObserverCoordinator:
             return
         if run.source_key != self.source_key:
             raise ValueError("Observer recovery journal belongs to another source.")
+        live_accumulator = None
+        if self._calibration_loader is not None:
+            live_accumulator = LiveDoseAccumulator(self._calibration_loader(run.calibration))
+            live_accumulator.set_transmitting(self._transmitting)
         client = self._client_factory()
         try:
             client.connect()
@@ -442,12 +481,67 @@ class SiglentObserverCoordinator:
             raise
         self._client = client
         self._run = run
+        self._live_accumulator = live_accumulator
         self._timing_observations = []
         self._last_error = None
         if manifest.state is CaptureSessionState.ACTIVE:
             self._log(f"Recovered active passive capture session {run.session_id}.", "INFO")
         else:
             self._finalize()
+
+    def _consume_reports(self, client) -> None:
+        latest_update = None
+        while True:
+            try:
+                report = PulseReport.from_dict(client.get_report(timeout=0.0))
+            except queue.Empty:
+                break
+            with self._lock:
+                if client is not self._client or self._run is None:
+                    return
+                if report.session_id != self._run.session_id:
+                    raise ValueError("Observer pulse report belongs to another capture session.")
+                if self._live_accumulator is None:
+                    continue
+                self._apply_report_timing_state(report)
+                update = self._live_accumulator.ingest(report)
+                if update.accepted:
+                    latest_update = update
+        with self._lock:
+            if client is self._client and self._live_accumulator is not None:
+                self._live_accumulator.set_running(
+                    self._run is not None
+                    and self._run.exposure_started_unix_ns is not None
+                    and self._run.stopped_observed_unix_ns is None
+                )
+                self._live_accumulator.set_transmitting(self._transmitting)
+        if latest_update is not None:
+            self._on_live_update(latest_update)
+
+    def _apply_report_timing_state(self, report: PulseReport) -> None:
+        if self._run is None or self._live_accumulator is None:
+            return
+        started_at = self._run.exposure_started_unix_ns
+        stopped_at = self._run.stopped_observed_unix_ns
+        running = (
+            started_at is not None
+            and report.captured_at_unix_ns >= started_at
+            and (stopped_at is None or report.captured_at_unix_ns <= stopped_at)
+        )
+        observations = (
+            observation
+            for observation in self._timing_observations
+            if observation.sampled_at_unix_ns <= report.captured_at_unix_ns
+        )
+        latest_observation = max(
+            observations,
+            key=lambda observation: observation.sampled_at_unix_ns,
+            default=None,
+        )
+        self._live_accumulator.set_running(running)
+        self._live_accumulator.set_transmitting(
+            latest_observation is not None and latest_observation.transmitting
+        )
 
     def _validate_idle_status(self, status: object) -> None:
         self._validate_status_source(status)
@@ -572,6 +666,9 @@ class SiglentObserverService:
         self._status_lock = threading.Lock()
         self._subsystem_handle: dds_client._RegisteredSubsystemHandle | None = None
         self._published_health: tuple[bool, str | None] | None = None
+        self._dose_publisher = None
+        self._time_publisher = None
+        self._latest_live_values = (0.0, 0.0)
         self._subsystem_uuid = observer_subsystem_uuid(source_key)
         self._logger, self._logger_transport = open_ecs_logger(
             logger_host,
@@ -600,6 +697,8 @@ class SiglentObserverService:
             recorder.finalize_run,
             log=self._log,
             journal=ObserverRecoveryJournal(journal_path),
+            calibration_loader=recorder.load_calibration,
+            on_live_update=self._publish_live_update,
         )
         if fallback_calibration is not None and fallback_calibration.source_key != source_key:
             raise ValueError("Observer fallback calibration belongs to another source.")
@@ -624,6 +723,11 @@ class SiglentObserverService:
         with self._status_lock:
             self._subsystem_handle = handle
             self._published_health = None
+            self._dose_publisher = handle.get_kv_property(b"cur_dose", False, True, True)
+            self._time_publisher = handle.get_kv_property(b"cur_time", False, True, True)
+            self._dose_publisher.set_type(dds_types.FloatTypeSpecifier())
+            self._time_publisher.set_type(dds_types.FloatTypeSpecifier())
+            self._dose_publisher.value, self._time_publisher.value = self._latest_live_values
         handle.put_status_item(
             dds_subsystem.StatusItem(
                 dds_subsystem.StatusItem.STATE_INFO,
@@ -635,6 +739,18 @@ class SiglentObserverService:
         self._adapter.configure(handle)
         self._publish_status()
         self._log("Passive Siglent observer subscribed to exposure and laser state.", "INFO")
+
+    def _publish_live_update(self, update: LivePulseUpdate) -> None:
+        values = (
+            update.accumulated_dose_mj_cm2,
+            update.transmitting_runtime_seconds,
+        )
+        with self._status_lock:
+            self._latest_live_values = values
+            if self._dose_publisher is not None:
+                self._dose_publisher.value = values[0]
+            if self._time_publisher is not None:
+                self._time_publisher.value = values[1]
 
     def _publish_status(self) -> None:
         health = (

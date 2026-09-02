@@ -63,8 +63,11 @@ The Siglent comparison path uses two process-computer sidecars. Start
 `euv-acquisition-siglent` first to own the VISA instrument and ports
 `11762`/`11763`, then start `chamber-siglent-recorder` before exposure PREINIT.
 The recorder subscribes read-only to exposure and laser timing state, attaches
-source-qualified artifacts to the run, and never supplies live runtime,
-interlock, or stop decisions. Those remain owned by the Red Pitaya acquisition
+source-qualified artifacts to the run, and publishes display-only `cur_dose`
+and `cur_time` values from the exact bound calibration revision. The exposure
+GUI shows those values beside the Red Pitaya totals. Siglent sequence-mode
+updates arrive after each completed hardware sequence rather than after every
+trigger. Interlock and stop decisions remain owned by the Red Pitaya acquisition
 controller even when another source supplies the default post-run dose graph.
 
 Configure acquisition sources from the direct exposure or batch editor and mark

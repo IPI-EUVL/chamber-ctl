@@ -8,7 +8,8 @@ from ipi_ecs.subsystems.experiment_controller import RunState
 import pytest
 import segment_bytes
 
-from chamber_ctl.data.calibration import SourceCalibrationBinding, SourceKey
+from chamber_ctl.data.calibration import CalibrationProfile, SourceCalibrationBinding, SourceKey
+from chamber_ctl.data.acquisition_runtime import LivePulseUpdate
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 from chamber_ctl.subsystems.siglent_observer import (
     ObserverCaptureRun,
@@ -22,6 +23,7 @@ from chamber_ctl.subsystems.siglent_observer import (
 )
 from chamber_ctl.subsystems import uuids
 from euv_acquisition.session import CaptureSessionManifest, CaptureSessionState
+from euv_acquisition.models import NativePulseAnalysis, PulseQuality, PulseReport
 from euv_acquisition.timing import LaserTimingState
 
 
@@ -245,6 +247,7 @@ class _Client:
         self.released = False
         self.commands = []
         self.session = None
+        self.reports = queue.Queue()
         self.stop_reasons = queue.Queue()
 
     def connect(self) -> None:
@@ -258,6 +261,9 @@ class _Client:
 
     def get_stop_reason(self, timeout=None) -> str:
         return self.stop_reasons.get(timeout=timeout)
+
+    def get_report(self, timeout=None):
+        return self.reports.get(timeout=timeout)
 
     def command(self, command, payload=None):
         self.commands.append((command, payload))
@@ -428,6 +434,134 @@ def test_observer_reports_and_preserves_an_unexpected_source_stop() -> None:
     assert finalized == []
     assert client.released is False
     assert failure in coordinator.last_error
+
+
+def test_observer_publishes_display_only_live_dose_from_source_reports() -> None:
+    client = _Client()
+    updates = []
+    profile = CalibrationProfile(
+        BINDING.profile_id,
+        BINDING.revision,
+        "Scope",
+        1.0,
+        "dose-v1",
+        1,
+        50.0,
+        0.14,
+        0.05,
+    )
+    coordinator = SiglentObserverCoordinator(
+        SOURCE,
+        lambda: client,
+        lambda _run, _client: None,
+        lambda _run, _manifest, _client: None,
+        now_ns=lambda: 50,
+        session_id_factory=lambda: SESSION_ID,
+        calibration_loader=lambda binding: profile if binding == BINDING else None,
+        on_live_update=updates.append,
+    )
+    coordinator.observe_phase(
+        ExperimentController.RUN_STATE_PREINIT,
+        run_id=RUN_ID,
+        calibration=BINDING,
+    )
+    coordinator.observe_phase(ExperimentController.RUN_STATE_RUNNING, run_id=RUN_ID)
+    coordinator.observe_timing(
+        LaserTimingState(True, False, True, False, 0.5, 0.0, 0.5, 192.0, 100)
+    )
+    client.reports.put(
+        PulseReport(
+            SESSION_ID,
+            0,
+            100,
+            100,
+            NativePulseAnalysis(0.0, 0.14, 0.0, 0.1, 0.1, PulseQuality.OK, "native-v1"),
+        ).to_dict()
+    )
+    client.reports.put(
+        PulseReport(
+            SESSION_ID,
+            1,
+            100_000_100,
+            100_000_100,
+            NativePulseAnalysis(0.0, 0.14, 0.0, 0.1, 0.1, PulseQuality.OK, "native-v1"),
+        ).to_dict()
+    )
+
+    coordinator.heartbeat()
+
+    assert updates[0].accumulated_dose_mj_cm2 == 0.0
+    assert updates[-1].accumulated_dose_mj_cm2 == pytest.approx(800.0)
+    assert updates[-1].transmitting_runtime_seconds == pytest.approx(0.1)
+    assert all(command != "stop_capture" for command, _payload in client.commands)
+
+
+def test_observer_uses_capture_time_for_reports_drained_after_laser_stops() -> None:
+    client = _Client()
+    updates = []
+    profile = CalibrationProfile(
+        BINDING.profile_id,
+        BINDING.revision,
+        "Scope",
+        1.0,
+        "dose-v1",
+        1,
+        50.0,
+        0.14,
+        0.05,
+    )
+    times = iter((50, 300_000_000))
+    coordinator = SiglentObserverCoordinator(
+        SOURCE,
+        lambda: client,
+        lambda _run, _client: None,
+        lambda _run, _manifest, _client: None,
+        now_ns=lambda: next(times),
+        session_id_factory=lambda: SESSION_ID,
+        calibration_loader=lambda _binding: profile,
+        on_live_update=updates.append,
+    )
+    coordinator.observe_phase(
+        ExperimentController.RUN_STATE_PREINIT,
+        run_id=RUN_ID,
+        calibration=BINDING,
+    )
+    coordinator.observe_phase(ExperimentController.RUN_STATE_RUNNING, run_id=RUN_ID)
+    coordinator.observe_timing(
+        LaserTimingState(True, False, True, False, 0.5, 0.0, 0.5, 192.0, 100)
+    )
+    for sequence, timestamp in enumerate((100, 100_000_100)):
+        client.reports.put(
+            PulseReport(
+                SESSION_ID,
+                sequence,
+                timestamp,
+                timestamp,
+                NativePulseAnalysis(0.0, 0.14, 0.0, 0.1, 0.1, PulseQuality.OK, "native-v1"),
+            ).to_dict()
+        )
+    coordinator.observe_timing(
+        LaserTimingState(False, False, False, False, 0.0, 0.0, 0.5, 192.0, 200_000_000)
+    )
+
+    coordinator.observe_phase(ExperimentController.RUN_STATE_STOPPED)
+
+    assert updates[-1].accumulated_dose_mj_cm2 == pytest.approx(800.0)
+    assert updates[-1].transmitting_runtime_seconds == pytest.approx(0.1)
+
+
+def test_observer_service_publishes_live_dose_and_time_kvs() -> None:
+    service = object.__new__(SiglentObserverService)
+    service._status_lock = threading.Lock()
+    service._latest_live_values = (0.0, 0.0)
+    service._dose_publisher = type("Publisher", (), {"value": None})()
+    service._time_publisher = type("Publisher", (), {"value": None})()
+
+    service._publish_live_update(LivePulseUpdate(True, 1.5, 8.25, 0.75))
+
+    assert service._latest_live_values == (8.25, 0.75)
+    assert service._dose_publisher.value == 8.25
+    assert service._time_publisher.value == 0.75
 
 
 class _StatusHandle:

@@ -78,6 +78,21 @@ class ObserverArtifactRecorder:
             return None
         return source_calibration_for_source(value, self.source_key)
 
+    def load_calibration(self, binding: SourceCalibrationBinding) -> CalibrationProfile:
+        if binding.source_key != self.source_key:
+            raise ValueError("Observer calibration belongs to another source.")
+        repository = CalibrationRepository(self.data_path)
+        try:
+            profile = repository.get(binding.profile_id, binding.revision)
+        finally:
+            repository.close()
+        if profile is None:
+            raise ValueError(
+                f"Observer calibration {binding.profile_id} revision "
+                f"{binding.revision} was not found."
+            )
+        return profile
+
     def prepare_run(self, run, _client) -> None:
         profile = self._load_calibration(run)
         reader = ExperimentReader(str(self.data_path), "exposure")
@@ -197,17 +212,7 @@ class ObserverArtifactRecorder:
             reader.close()
 
     def _load_calibration(self, run) -> CalibrationProfile:
-        repository = CalibrationRepository(self.data_path)
-        try:
-            profile = repository.get(run.calibration.profile_id, run.calibration.revision)
-        finally:
-            repository.close()
-        if profile is None:
-            raise ValueError(
-                f"Observer calibration {run.calibration.profile_id} revision "
-                f"{run.calibration.revision} was not found."
-            )
-        return profile
+        return self.load_calibration(run.calibration)
 
     def _descriptor(
         self,
