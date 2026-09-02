@@ -567,6 +567,12 @@ def test_observer_service_publishes_live_dose_and_time_kvs() -> None:
 class _StatusHandle:
     def __init__(self) -> None:
         self.items = {}
+        self.properties = {}
+
+    def get_kv_property(self, key, *_args):
+        publisher = type("Publisher", (), {"value": None, "set_type": lambda self, _type: None})()
+        self.properties[key] = publisher
+        return publisher
 
     def put_status_item(self, item) -> None:
         self.items[item.get_code()] = item
@@ -576,6 +582,44 @@ class _StatusHandle:
 
     def clear_status_item(self, code: int) -> None:
         self.items.pop(code, None)
+
+
+def test_observer_registers_persistent_source_identity() -> None:
+    registrations = []
+    handle = _StatusHandle()
+
+    class _DdsClient:
+        def register_subsystem(self, name, subsystem_uuid, temporary=False):
+            registrations.append((name, subsystem_uuid, temporary))
+            return handle
+
+    class _Adapter:
+        def configure(self, configured_handle):
+            assert configured_handle is handle
+
+    service = object.__new__(SiglentObserverService)
+    service._dds_client = _DdsClient()
+    service._coordinator = type("Coordinator", (), {"source_key": SOURCE})()
+    service._subsystem_uuid = observer_subsystem_uuid(SOURCE)
+    service._status_lock = threading.Lock()
+    service._subsystem_handle = None
+    service._published_health = None
+    service._dose_publisher = None
+    service._time_publisher = None
+    service._latest_live_values = (0.0, 0.0)
+    service._adapter = _Adapter()
+    service._publish_status = lambda: None
+    service._log = lambda _message, _level: None
+
+    service._on_dds_ready()
+
+    assert registrations == [
+        (
+            f"EUV Observer [{SOURCE.source_kind}/{SOURCE.source_id}]",
+            observer_subsystem_uuid(SOURCE),
+            False,
+        )
+    ]
 
 
 def test_observer_publishes_coordinator_errors_as_dds_alarms() -> None:

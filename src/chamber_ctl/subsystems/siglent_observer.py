@@ -718,7 +718,6 @@ class SiglentObserverService:
         handle = self._dds_client.register_subsystem(
             f"EUV Observer [{self._coordinator.source_key.source_kind}/{self._coordinator.source_key.source_id}]",
             self._subsystem_uuid,
-            temporary=True,
         )
         with self._status_lock:
             self._subsystem_handle = handle
