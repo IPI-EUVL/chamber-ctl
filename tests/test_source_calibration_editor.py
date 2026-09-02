@@ -35,14 +35,12 @@ def test_editor_selection_builds_source_keyed_binding() -> None:
     assert binding == SourceCalibrationBinding("siglent", "scope-1", profile_id, 3)
 
 
-def test_editor_summary_is_stable_across_binding_order_and_marks_primary() -> None:
+def test_editor_summary_shows_only_the_default_source() -> None:
     siglent = SourceCalibrationBinding("siglent", "scope-1", uuid.uuid4(), 3)
     integrator = SourceCalibrationBinding("integrator", "pulse-1", uuid.uuid4(), 2)
 
-    assert source_calibration_summary((siglent, integrator), siglent.source_key) == (
-        f"integrator/pulse-1: {integrator.profile_id} r2, "
-        f"Primary: siglent/scope-1: {siglent.profile_id} r3"
-    )
+    assert source_calibration_summary((siglent, integrator), siglent.source_key) == "Default: siglent/scope-1"
+    assert source_calibration_summary((), None) == "Default: None"
 
 
 def test_calibration_profile_form_uses_cli_equivalent_defaults() -> None:

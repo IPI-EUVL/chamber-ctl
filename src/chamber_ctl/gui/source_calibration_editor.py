@@ -67,14 +67,10 @@ def source_calibration_summary(
     bindings: object,
     primary_source: SourceKey | None = None,
 ) -> str:
-    normalized = normalize_source_calibration_bindings(bindings)
-    if not normalized:
-        return "None"
-    return ", ".join(
-        f"{'Primary: ' if binding.source_key == primary_source else ''}"
-        f"{binding.source_kind}/{binding.source_id}: {binding.profile_id} r{binding.revision}"
-        for binding in sorted(normalized, key=lambda item: item.source_key)
-    )
+    normalize_source_calibration_bindings(bindings)
+    if primary_source is None:
+        return "Default: None"
+    return f"Default: {source_option_label(primary_source)}"
 
 
 class SourceCalibrationDialog:
