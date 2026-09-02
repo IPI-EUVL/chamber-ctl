@@ -1,0 +1,25 @@
+[Unit]
+Description=EUV Sample Stage Controller
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=euvl
+Group=euvl
+RuntimeDirectory=sample-stage
+RuntimeDirectoryMode=0750
+WorkingDirectory=/run/sample-stage
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONNOUSERSITE=1"
+Environment="PYTHONPATH=/opt/sample-stage/current/python"
+ExecStart=/usr/bin/python3 -m sample_stage_ctl
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ipi-sample-stage-ctl"
+version = "0.1.0"
+description = "Raspberry Pi sample-stage motion controller"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "Adafruit-Blinka==8.68.1",
+  "adafruit-circuitpython-pcf8574==1.0.15",
+]
+
+[project.scripts]
+sample-stage-ctl = "sample_stage_ctl.main:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
