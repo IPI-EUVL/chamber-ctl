@@ -7,6 +7,7 @@ import math
 import pickle
 import uuid
 import segment_bytes
+from collections.abc import Callable, Iterable
 
 from ipi_ecs.core.tcp import TCPClientSocket
 from ipi_ecs.dds import client, subsystem, types
@@ -18,10 +19,12 @@ from chamber_ctl import ECS_IP
 from chamber_ctl.data.calibration import (
     CalibrationRepository,
     SourceCalibrationBinding,
-    source_calibration_run_tags,
+    SourceKey,
+    source_configuration_run_tags,
 )
 from chamber_ctl.gui.sample_motion_gui import draw_sample_stage, build_sample_data, RING_RADII
 from chamber_ctl.gui.source_calibration_editor import (
+    calibration_option,
     edit_source_calibrations,
     source_calibration_summary,
 )
@@ -30,15 +33,22 @@ from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 from chamber_ctl.subsystems.laser import LaserSyncStatus
 from chamber_ctl.subsystems.settings_presets import SettingsPresets
 from euv_acquisition.health import AcquisitionHealth
+from euv_acquisition.source_identity import RED_PITAYA_SOURCE_ID, RED_PITAYA_SOURCE_KIND
 import chamber_ctl.subsystems.sample_motion as stage_client
 
 
 class ExposureControllerGUI():
-    def __init__(self, root, own_window: bool = True):
+    def __init__(
+        self,
+        root,
+        own_window: bool = True,
+        source_options_provider: Callable[[], Iterable[SourceKey]] | None = None,
+    ):
         self.__own_window = own_window
         self.__exp_itf = ExperimentInterface("exposure", UUID_EXPOSURE_CONTROLLER, exp_settings_type=ExposureSettings)
         self.__exp_ctl = ExperimentControllerGUI(root, self.__exp_itf, own_window=own_window)
         self.__root = root
+        self.__source_options_provider = source_options_provider
 
         self.__samples = build_sample_data()
 
@@ -49,9 +59,9 @@ class ExposureControllerGUI():
         
         self.__data_path = os.path.join(os.environ["EUVL_PATH"], "datasets")
         self.__presets = SettingsPresets(self.__data_path)
-        self.__calibration_options = {}
         self.__source_calibration_options = {}
         self.__source_calibrations: tuple[SourceCalibrationBinding, ...] = ()
+        self.__primary_source: SourceKey | None = None
         self.__source_calibration_text = tk.StringVar(value="None")
 
         self.__reload_presets()
@@ -70,7 +80,6 @@ class ExposureControllerGUI():
         self.__zr_filter_combo = None
         self.__sample_combo = None
         self.__sample_type_combo = None
-        self.__calibration_combo = None
         self.__source_calibration_button = None
         self.__base_pressure_input = None
         self.__operating_pressure_input = None
@@ -154,14 +163,9 @@ class ExposureControllerGUI():
             self.__operator_options = self.__presets.read_operators()
             repository = CalibrationRepository(self.__data_path)
             try:
-                profiles = repository.list_latest()
                 source_profiles = repository.list_all()
             finally:
                 repository.close()
-            self.__calibration_options = {
-                f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
-                for profile in profiles
-            }
             self.__source_calibration_options = {
                 f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
                 for profile in source_profiles
@@ -188,9 +192,6 @@ class ExposureControllerGUI():
         if self.__sample_type_combo is not None:
             self.__sample_type_combo.config(values=self.__sample_type_options)
 
-        if self.__calibration_combo is not None:
-            self.__calibration_combo.config(values=tuple(self.__calibration_options))
-
     def __edit_source_calibrations(self):
         if self.__settings_locked:
             return
@@ -198,12 +199,39 @@ class ExposureControllerGUI():
             self.__root,
             self.__source_calibrations,
             self.__source_calibration_options,
+            self.__primary_source,
+            data_path=self.__data_path,
+            source_options=self.__available_sources(),
+            on_calibration_created=self.__on_calibration_created,
         )
         if selected is None:
             return
-        self.__source_calibrations = selected
-        self.__source_calibration_text.set(source_calibration_summary(selected))
-        self.__exp_itf.set_run_tags(source_calibration_run_tags(selected))
+        self.__source_calibrations = selected.calibrations
+        self.__primary_source = selected.primary_source
+        self.__source_calibration_text.set(
+            source_calibration_summary(selected.calibrations, selected.primary_source)
+        )
+        self.__exp_itf.set_run_tags(
+            source_configuration_run_tags(selected.calibrations, selected.primary_source)
+        )
+
+    def __available_sources(self) -> tuple[SourceKey, ...]:
+        sources = {SourceKey(RED_PITAYA_SOURCE_KIND, RED_PITAYA_SOURCE_ID)}
+        status = self.__get_acquisition_status() or {}
+        source_kind = status.get("configured_source_kind")
+        source_id = status.get("configured_source_id")
+        if isinstance(source_kind, str) and isinstance(source_id, str):
+            try:
+                sources.add(SourceKey(source_kind, source_id))
+            except ValueError:
+                pass
+        if self.__source_options_provider is not None:
+            sources.update(self.__source_options_provider())
+        return tuple(sorted(sources))
+
+    def __on_calibration_created(self, profile) -> None:
+        label, value = calibration_option(profile)
+        self.__source_calibration_options[label] = value
 
     def __update_target_unit_label(self, *args):
         """Update the unit label based on target type selection."""
@@ -494,14 +522,8 @@ class ExposureControllerGUI():
         settings["flow_sccm"] = self.__flowrate_input.get()
         settings["chopper_frequency_hz"] = self.__chopper_frequency_input.get()
 
-        calibration = self.__calibration_options.get(self.__calibration_combo.get())
-        if calibration is None:
-            settings["calibration_profile_id"] = ""
-            settings["calibration_revision"] = "0"
-        else:
-            profile_id, revision = calibration
-            settings["calibration_profile_id"] = str(profile_id)
-            settings["calibration_revision"] = str(revision)
+        settings["calibration_profile_id"] = ""
+        settings["calibration_revision"] = "0"
 
         return settings
 
@@ -540,25 +562,35 @@ class ExposureControllerGUI():
             combobox.config(values=values)
         combobox.set(value)
 
-    def __set_calibration_selection(self, profile_id, revision) -> None:
-        if self.__calibration_combo is None:
+    def __migrate_legacy_calibration(self, profile_id, revision) -> None:
+        if self.__source_calibrations:
             return
-        profile_id = "" if profile_id is None else str(profile_id)
         try:
+            normalized_profile_id = uuid.UUID(str(profile_id))
             revision = int(revision)
-        except (TypeError, ValueError):
-            revision = 0
-        if not profile_id or revision < 1:
-            self.__calibration_combo.set("")
+        except (TypeError, ValueError, AttributeError):
             return
-        for label, value in self.__calibration_options.items():
-            if value == (profile_id, revision):
-                self.__calibration_combo.set(label)
-                return
-        label = f"Unavailable calibration r{revision} | {profile_id}"
-        self.__calibration_options[label] = (profile_id, revision)
-        self.__calibration_combo.config(values=tuple(self.__calibration_options))
-        self.__calibration_combo.set(label)
+        if revision < 1:
+            return
+        status = self.__get_acquisition_status() or {}
+        source_key = SourceKey(
+            str(status.get("configured_source_kind") or RED_PITAYA_SOURCE_KIND),
+            str(status.get("configured_source_id") or RED_PITAYA_SOURCE_ID),
+        )
+        binding = SourceCalibrationBinding(
+            source_key.source_kind,
+            source_key.source_id,
+            normalized_profile_id,
+            revision,
+        )
+        self.__source_calibrations = (binding,)
+        self.__primary_source = source_key
+        self.__source_calibration_text.set(
+            source_calibration_summary(self.__source_calibrations, self.__primary_source)
+        )
+        self.__exp_itf.set_run_tags(
+            source_configuration_run_tags(self.__source_calibrations, self.__primary_source)
+        )
 
     def __sync_settings_from_experiment(self):
         exp = self.__exp_itf.get_experiment()
@@ -609,7 +641,10 @@ class ExposureControllerGUI():
         self.__set_entry_text(self.__operating_pressure_input, settings.get("operating_pressure", ""))
         self.__set_entry_text(self.__flowrate_input, settings.get("flow_sccm", ""))
         self.__set_entry_text(self.__chopper_frequency_input, settings.get("chopper_frequency_hz", ""))
-        self.__set_calibration_selection(settings.get("calibration_profile_id"), settings.get("calibration_revision"))
+        self.__migrate_legacy_calibration(
+            settings.get("calibration_profile_id"),
+            settings.get("calibration_revision"),
+        )
 
     @staticmethod
     def __summarize_queue_item(index: int, b_item: bytes) -> str:
@@ -838,7 +873,6 @@ class ExposureControllerGUI():
             self.__zr_filter_combo,
             self.__sample_combo,
             self.__sample_type_combo,
-            self.__calibration_combo,
         ]:
             if widget is not None:
                 widget.config(state=combo_state)
@@ -1045,17 +1079,7 @@ class ExposureControllerGUI():
         self.__zr_filter_combo.grid(row=row, column=1, sticky=tk.EW, pady=2)
         row += 1
 
-        ttk.Label(settings_frame, text="Calibration:").grid(row=row, column=0, sticky=tk.W, pady=2)
-        self.__calibration_combo = ttk.Combobox(
-            settings_frame,
-            values=tuple(self.__calibration_options),
-            state="readonly",
-            width=20,
-        )
-        self.__calibration_combo.grid(row=row, column=1, sticky=tk.EW, pady=2)
-        row += 1
-
-        ttk.Label(settings_frame, text="Source Calibrations:").grid(row=row, column=0, sticky=tk.NW, pady=2)
+        ttk.Label(settings_frame, text="Acquisition Sources:").grid(row=row, column=0, sticky=tk.NW, pady=2)
         source_calibration_frame = ttk.Frame(settings_frame)
         source_calibration_frame.grid(row=row, column=1, sticky=tk.EW, pady=2)
         source_calibration_frame.columnconfigure(0, weight=1)

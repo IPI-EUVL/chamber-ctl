@@ -7,15 +7,17 @@ import threading
 import time
 import uuid
 import tkinter as tk
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from tkinter import messagebox, ttk
 
 from ipi_ecs.dds import client, subsystem, types
 
 from chamber_ctl import ECS_IP
-from chamber_ctl.data.calibration import CalibrationRepository
+from chamber_ctl.data.calibration import CalibrationRepository, SourceKey
 from chamber_ctl.gui.sample_motion_gui import RING_RADII, build_sample_data
 from chamber_ctl.gui.source_calibration_editor import (
+    calibration_option,
     edit_source_calibrations,
     source_calibration_summary,
 )
@@ -131,13 +133,19 @@ class BatchControllerClient:
 
 
 class BatchControllerGUI:
-    def __init__(self, root, data_path: str, own_window: bool = True) -> None:
+    def __init__(
+        self,
+        root,
+        data_path: str,
+        own_window: bool = True,
+        source_options_provider: Callable[[], Iterable[SourceKey]] | None = None,
+    ) -> None:
         self._root = root
         self._own_window = own_window
         self._client = BatchControllerClient()
         self._presets = SettingsPresets(data_path)
         self._data_path = data_path
-        self._calibration_options: dict[str, tuple[str, int]] = {}
+        self._source_options_provider = source_options_provider
         self._source_calibration_options: dict[str, tuple[str, int]] = {}
         self._state = None
         self._manifest_uuid: str | None = None
@@ -186,19 +194,13 @@ class BatchControllerGUI:
         self._sample_type["values"] = self._presets.read_sample_types()
         repository = CalibrationRepository(self._data_path)
         try:
-            profiles = repository.list_latest()
             source_profiles = repository.list_all()
         finally:
             repository.close()
-        self._calibration_options = {
-            f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
-            for profile in profiles
-        }
         self._source_calibration_options = {
             f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
             for profile in source_profiles
         }
-        self._calibration["values"] = tuple(self._calibration_options)
 
     def _build(self) -> None:
         if self._own_window and hasattr(self._root, "title"):
@@ -315,21 +317,19 @@ class BatchControllerGUI:
         self._base_pressure = self._entry(shared, "Base pressure", 1, 2, "0")
         self._operating_pressure = self._entry(shared, "Operating pressure", 1, 4, "0")
         self._flow = self._entry(shared, "Flow SCCM", 1, 6, "0")
-        self._calibration = self._combo(shared, "Calibration", 2, 0)
-        self._calibration.config(state="readonly")
-        self._chopper_frequency = self._entry(shared, "Chopper Hz", 2, 2, "192")
-        ttk.Label(shared, text="Source calibrations").grid(row=2, column=4, sticky=tk.W, padx=(0, 3))
+        self._chopper_frequency = self._entry(shared, "Chopper Hz", 2, 0, "192")
+        ttk.Label(shared, text="Acquisition sources").grid(row=2, column=2, sticky=tk.W, padx=(0, 3))
         self._source_calibration_button = ttk.Button(
             shared,
             text="Configure...",
             command=self._edit_source_calibrations,
         )
-        self._source_calibration_button.grid(row=2, column=5, sticky=tk.W, padx=(0, 8), pady=2)
+        self._source_calibration_button.grid(row=2, column=3, sticky=tk.W, padx=(0, 8), pady=2)
         ttk.Label(
             shared,
             textvariable=self._source_calibration_text,
             wraplength=310,
-        ).grid(row=2, column=6, columnspan=2, sticky=tk.W)
+        ).grid(row=2, column=4, columnspan=4, sticky=tk.W)
         self._detail_widgets = {
             "name": self._name,
             "description": self._description,
@@ -494,10 +494,12 @@ class BatchControllerGUI:
         return self._template_value
 
     def _plan(self) -> BatchPlan:
-        return BatchPlan(self._template(), tuple(self._entries))
+        template = self._template()
+        if template.primary_source is None:
+            raise ValueError("Configure one acquisition source as Primary before saving the batch.")
+        return BatchPlan(template, tuple(self._entries))
 
     def _capture_template_from_form(self) -> None:
-        calibration = self._calibration_options.get(self._calibration.get(), ("", 0))
         self._template_value = ExposureTemplate(
             name=self._name.get().strip(),
             description=self._description.get().strip(),
@@ -507,29 +509,42 @@ class BatchControllerGUI:
             base_pressure=float(self._base_pressure.get()),
             operating_pressure=float(self._operating_pressure.get()),
             flow_sccm=float(self._flow.get()),
-            calibration_profile_id=calibration[0],
-            calibration_revision=calibration[1],
+            calibration_profile_id=self._template_value.calibration_profile_id,
+            calibration_revision=self._template_value.calibration_revision,
             chopper_frequency_hz=float(self._chopper_frequency.get()),
             source_calibrations=self._template_value.source_calibrations,
+            primary_source=self._template_value.primary_source,
         )
-
-    def _set_template_calibration(self, profile_id: str, revision: int) -> None:
-        for label, value in self._calibration_options.items():
-            if value == (profile_id, revision):
-                self._calibration.set(label)
-                return
-        self._calibration.set("")
 
     def _edit_source_calibrations(self) -> None:
         selected = edit_source_calibrations(
             self._root,
             self._template_value.source_calibrations,
             self._source_calibration_options,
+            self._template_value.primary_source,
+            data_path=self._data_path,
+            source_options=self._available_sources(),
+            on_calibration_created=self._on_calibration_created,
         )
         if selected is None:
             return
-        self._template_value = replace(self._template_value, source_calibrations=selected)
-        self._source_calibration_text.set(source_calibration_summary(selected))
+        self._template_value = replace(
+            self._template_value,
+            source_calibrations=selected.calibrations,
+            primary_source=selected.primary_source,
+        )
+        self._source_calibration_text.set(
+            source_calibration_summary(selected.calibrations, selected.primary_source)
+        )
+
+    def _available_sources(self) -> tuple[SourceKey, ...]:
+        if self._source_options_provider is None:
+            return ()
+        return tuple(sorted(set(self._source_options_provider())))
+
+    def _on_calibration_created(self, profile) -> None:
+        label, value = calibration_option(profile)
+        self._source_calibration_options[label] = value
 
     def _set_detail_value(self, key: str, value) -> None:
         widget = self._detail_widgets[key]
@@ -555,12 +570,11 @@ class BatchControllerGUI:
             }
             for key, value in values.items():
                 self._set_detail_value(key, value)
-            self._set_template_calibration(
-                self._template_value.calibration_profile_id,
-                self._template_value.calibration_revision,
-            )
             self._source_calibration_text.set(
-                source_calibration_summary(self._template_value.source_calibrations)
+                source_calibration_summary(
+                    self._template_value.source_calibrations,
+                    self._template_value.primary_source,
+                )
             )
             self._set_detail_value("flow_sccm", self._template_value.flow_sccm)
             self._chopper_frequency.delete(0, tk.END)
@@ -573,7 +587,6 @@ class BatchControllerGUI:
         self._details_mode.set("Batch default exposure details")
         self._details_hint.set("Select planned samples on the stage to edit their overrides.")
         self._set_detail_widgets_enabled(True)
-        self._calibration.config(state="readonly")
         self._chopper_frequency.config(state=tk.NORMAL)
         self._apply_overrides_button.config(state=tk.DISABLED)
         self._clear_overrides_button.config(state=tk.DISABLED)
@@ -615,7 +628,6 @@ class BatchControllerGUI:
             self._details_hint.set("Blank fields inherit the batch default. Changes apply when selection changes, on save, or with Apply selected overrides.")
         enabled = bool(entries) and not unplanned
         self._set_detail_widgets_enabled(enabled)
-        self._calibration.config(state=tk.DISABLED)
         self._chopper_frequency.config(state=tk.DISABLED)
         self._apply_overrides_button.config(state=tk.NORMAL if enabled else tk.DISABLED)
         self._clear_overrides_button.config(

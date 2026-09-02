@@ -3,10 +3,12 @@ from tkinter import ttk
 import os
 import traceback
 import uuid
+from collections.abc import Iterable
 from queue import Empty, Queue
 import time
 
 from chamber_ctl import ECS_IP
+from chamber_ctl.data.calibration import SourceKey
 from chamber_ctl.gui.experiments_gui import ExperimentsGUI
 from chamber_ctl.gui.exposure_controller import ExposureControllerGUI
 from chamber_ctl.gui.acquisition import AcquisitionGUI
@@ -26,6 +28,28 @@ DEFAULT_DATA_PATH = os.path.join(os.environ["EUVL_PATH"], "datasets")
 DEFAULT_EXPERIMENT_NAME = "exposure"
 DEFAULT_LIFECYCLE_UUID = uuid.uuid3(uuid.NAMESPACE_OID, "Lifecycle Manager")
 ACQUISITION_WORKSPACE_TABS = ("Exposure", "Capture Diagnostics")
+CONFIGURED_SOURCE_STATUS_PREFIX = "Configured source: "
+
+
+def configured_sources_from_status_rows(rows: Iterable[dict]) -> tuple[SourceKey, ...]:
+	sources: set[SourceKey] = set()
+	for row in rows:
+		if not isinstance(row, dict) or row.get("connected") is not True:
+			continue
+		for item in row.get("status_items", ()):
+			if item.get_code() != 10:
+				continue
+			message = item.get_message()
+			if not isinstance(message, str) or not message.startswith(CONFIGURED_SOURCE_STATUS_PREFIX):
+				continue
+			kind, separator, source_id = message.removeprefix(CONFIGURED_SOURCE_STATUS_PREFIX).partition("/")
+			if not separator:
+				continue
+			try:
+				sources.add(SourceKey(kind.strip(), source_id.strip()))
+			except ValueError:
+				continue
+	return tuple(sorted(sources))
 
 
 def _known_subsystems_from_uuids() -> list[tuple[str, uuid.UUID]]:
@@ -177,7 +201,9 @@ class SubsystemStatusMonitor:
 				}
 
 		rows: list[dict] = []
+		known_uuids: set[uuid.UUID] = set()
 		for default_name, s_uuid in self.__known_subsystems:
+			known_uuids.add(s_uuid)
 			live = by_uuid.get(s_uuid)
 			if live is None:
 				status_items = []
@@ -200,6 +226,33 @@ class SubsystemStatusMonitor:
 					"has_warn": has_warn,
 					"has_error": has_error,
 					"status_text": self.__status_summary(connected, status_items),
+				}
+			)
+
+		for s_uuid, live in sorted(
+			(
+				(key, value)
+				for key, value in by_uuid.items()
+				if key not in known_uuids and configured_sources_from_status_rows((value,))
+			),
+			key=lambda item: (str(item[1]["name"]).casefold(), str(item[0])),
+		):
+			status_items = live["status_items"]
+			rows.append(
+				{
+					"uuid": s_uuid,
+					"name": live["name"],
+					"connected": bool(live["connected"]),
+					"status_items": status_items,
+					"has_warn": any(
+						item.get_severity() == dds_subsystem.StatusItem.STATE_WARN
+						for item in status_items
+					),
+					"has_error": any(
+						item.get_severity() == dds_subsystem.StatusItem.STATE_ALARM
+						for item in status_items
+					),
+					"status_text": self.__status_summary(bool(live["connected"]), status_items),
 				}
 			)
 
@@ -671,7 +724,11 @@ class CentralGUI:
 		exposure_tab = ttk.Frame(workspace)
 		workspace.add(exposure_tab, text=ACQUISITION_WORKSPACE_TABS[0])
 		try:
-			comp = ExposureControllerGUI(exposure_tab, own_window=False)
+			comp = ExposureControllerGUI(
+				exposure_tab,
+				own_window=False,
+				source_options_provider=self.__configured_sources,
+			)
 			self.__register_component("Acquisition / Exposure", comp, "close")
 		except Exception as exc:
 			self.__add_error_content(exposure_tab, "Exposure", exc)
@@ -688,10 +745,18 @@ class CentralGUI:
 		tab = ttk.Frame(self.__notebook)
 		self.__notebook.add(tab, text="Batch Controller")
 		try:
-			comp = BatchControllerGUI(tab, DEFAULT_DATA_PATH, own_window=False)
+			comp = BatchControllerGUI(
+				tab,
+				DEFAULT_DATA_PATH,
+				own_window=False,
+				source_options_provider=self.__configured_sources,
+			)
 			self.__register_component("Batch Controller", comp, "close")
 		except Exception as exc:
 			self.__add_error_content(tab, "Batch Controller", exc)
+
+	def __configured_sources(self) -> tuple[SourceKey, ...]:
+		return configured_sources_from_status_rows(self.__status_rows)
 
 	def __build_settings_presets_tab(self):
 		tab = ttk.Frame(self.__notebook)

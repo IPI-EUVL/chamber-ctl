@@ -63,14 +63,35 @@ The Siglent comparison path uses two process-computer sidecars. Start
 `euv-acquisition-siglent` first to own the VISA instrument and ports
 `11762`/`11763`, then start `chamber-siglent-recorder` before exposure PREINIT.
 The recorder subscribes read-only to exposure and laser timing state, attaches
-source-qualified artifacts to the run, and never supplies canonical dose,
-runtime, interlock, or stop decisions.
+source-qualified artifacts to the run, and never supplies live runtime,
+interlock, or stop decisions. Those remain owned by the Red Pitaya acquisition
+controller even when another source supplies the default post-run dose graph.
 
-Configure optional source calibrations from the direct exposure or batch editor.
+Configure acquisition sources from the direct exposure or batch editor and mark
+exactly one as **Primary**. New runs store the bindings and primary key in the
+scalar, versioned JSON tags `source_calibrations` and `primary_source`.
 Each binding selects an immutable profile revision for one exact `(source kind,
-source ID)` pair. The editor stores all bindings in the scalar, versioned JSON
-run tag `source_calibrations`; they are not exposure settings, and list order has
-no meaning.
+source ID)` pair. They are not exposure settings, and list order, process start
+order, and DDS discovery order have no meaning.
+
+The source editor lists connected acquisition sources advertised through DDS,
+along with the deployed Red Pitaya and any source already bound in the current
+plan. Use **Other source...** only for offline commissioning. Its calibration
+dropdown includes every stored immutable revision; **New...** creates revision
+one in the same dataset and selects it immediately.
+
+The deployed Red Pitaya key is `red_pitaya/red-pitaya`. A Siglent recorder uses
+`siglent/<--source-id value>`. Both publish `Configured source: kind/id` as an
+informational subsystem status item; Siglent observer subsystem UUIDs are also
+derived deterministically from that exact key. Two processes claiming the same
+logical observer key therefore cannot become separate sources accidentally.
+
+Every completed source keeps its own analysis products. The primary Red Pitaya
+uses its native HDF5 analysis. A primary Siglent uses its source-qualified
+`captured` product for default dose and graph tags while retaining the exact
+`legacy_compensated` product for comparison. The scalar `active_dose_product`
+tag records the exact source, algorithm, and analysis resource selected. Old
+runs without these tags retain their historical Red Pitaya/default behavior.
 
 The recorder uses a binding only when both its source kind and source ID match
 the recorder's configured identity exactly, then loads the exact profile UUID

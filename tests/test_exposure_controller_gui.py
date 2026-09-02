@@ -3,7 +3,11 @@ import uuid
 import chamber_ctl.gui.exposure_controller as exposure_controller_gui
 from chamber_ctl.data.calibration import (
     SOURCE_CALIBRATIONS_TAG,
+    PRIMARY_SOURCE_TAG,
+    SourceConfiguration,
     SourceCalibrationBinding,
+    SourceKey,
+    decode_primary_source_tag,
     source_calibration_for_source,
 )
 from chamber_ctl.gui.exposure_controller import ExposureControllerGUI
@@ -36,7 +40,7 @@ class _Label:
         self.text = text
 
 
-def test_current_settings_serializes_calibration_revision_as_text() -> None:
+def test_current_settings_leaves_legacy_calibration_fields_unselected() -> None:
     gui = object.__new__(ExposureControllerGUI)
     gui._ExposureControllerGUI__name_input = _Value("Exposure")
     gui._ExposureControllerGUI__description_input = _Value("Fixture")
@@ -50,13 +54,11 @@ def test_current_settings_serializes_calibration_revision_as_text() -> None:
     gui._ExposureControllerGUI__operating_pressure_input = _Value("0")
     gui._ExposureControllerGUI__flowrate_input = _Value("0")
     gui._ExposureControllerGUI__chopper_frequency_input = _Value("192")
-    gui._ExposureControllerGUI__calibration_options = {"Simulator": ("profile-id", 1)}
-    gui._ExposureControllerGUI__calibration_combo = _Value("Simulator")
 
     settings = gui._ExposureControllerGUI__get_current_settings()
 
-    assert settings["calibration_profile_id"] == "profile-id"
-    assert settings["calibration_revision"] == "1"
+    assert settings["calibration_profile_id"] == ""
+    assert settings["calibration_revision"] == "0"
     assert all(isinstance(value, str) for value in settings.values())
 
 
@@ -66,15 +68,23 @@ def test_source_calibration_editor_updates_direct_run_tags(monkeypatch) -> None:
     gui = object.__new__(ExposureControllerGUI)
     gui._ExposureControllerGUI__settings_locked = False
     gui._ExposureControllerGUI__root = object()
+    gui._ExposureControllerGUI__data_path = "datasets"
+    gui._ExposureControllerGUI__source_options_provider = lambda: (SourceKey("siglent", "scope-1"),)
+    gui._ExposureControllerGUI__acquisition_status_kv = _Value(
+        b'{"configured_source_kind":"red_pitaya","configured_source_id":"board-1"}'
+    )
     gui._ExposureControllerGUI__source_calibrations = ()
+    gui._ExposureControllerGUI__primary_source = None
     gui._ExposureControllerGUI__source_calibration_options = {}
     gui._ExposureControllerGUI__source_calibration_text = _Value("None")
     gui._ExposureControllerGUI__exp_itf = interface
-    monkeypatch.setattr(
-        exposure_controller_gui,
-        "edit_source_calibrations",
-        lambda *_args: (binding,),
-    )
+    call = {}
+
+    def edit(*_args, **kwargs):
+        call.update(kwargs)
+        return SourceConfiguration((binding,), binding.source_key)
+
+    monkeypatch.setattr(exposure_controller_gui, "edit_source_calibrations", edit)
 
     gui._ExposureControllerGUI__edit_source_calibrations()
 
@@ -83,6 +93,13 @@ def test_source_calibration_editor_updates_direct_run_tags(monkeypatch) -> None:
         interface.tags[SOURCE_CALIBRATIONS_TAG],
         binding.source_key,
     ) == binding
+    assert decode_primary_source_tag(interface.tags[PRIMARY_SOURCE_TAG]) == binding.source_key
+    assert set(call["source_options"]) == {
+        SourceKey("red_pitaya", "red-pitaya"),
+        SourceKey("red_pitaya", "board-1"),
+        SourceKey("siglent", "scope-1"),
+    }
+    assert call["data_path"] == "datasets"
 
 
 def test_exposure_status_preserves_zero_runtime_from_acquisition_status() -> None:
