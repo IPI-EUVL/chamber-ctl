@@ -8,7 +8,14 @@ from pathlib import Path
 from ipi_ecs.subsystems.experiment_controller import ExperimentReader
 
 from chamber_ctl.data.acquisition_artifacts import AcquisitionArtifactImporter
-from chamber_ctl.data.calibration import CalibrationProfile, CalibrationRepository, SourceKey
+from chamber_ctl.data.calibration import (
+    SOURCE_CALIBRATIONS_TAG,
+    CalibrationProfile,
+    CalibrationRepository,
+    SourceCalibrationBinding,
+    SourceKey,
+    source_calibration_for_source,
+)
 from chamber_ctl.data.observer_analysis import write_observer_dose_products
 from euv_acquisition.models import SnapshotCloseReason
 from euv_acquisition.snapshot import SnapshotContents, read_snapshot
@@ -47,6 +54,17 @@ class ObserverArtifactRecorder:
         self.temporary_directory = None if temporary_directory is None else Path(temporary_directory)
         self.expected_native_analysis_version = expected_native_analysis_version
         self.expected_batch_kind = expected_batch_kind
+
+    def resolve_calibration(self, run_id: uuid.UUID) -> SourceCalibrationBinding | None:
+        reader = ExperimentReader(str(self.data_path), "exposure")
+        try:
+            tags = reader.get_run(run_id).get_record().get_tags()
+        finally:
+            reader.close()
+        value = tags.get(SOURCE_CALIBRATIONS_TAG)
+        if value is None:
+            return None
+        return source_calibration_for_source(value, self.source_key)
 
     def prepare_run(self, run, _client) -> None:
         profile = self._load_calibration(run)

@@ -583,6 +583,7 @@ class SiglentObserverService:
         if fallback_calibration is not None and fallback_calibration.source_key != source_key:
             raise ValueError("Observer fallback calibration belongs to another source.")
         self._fallback_calibration = fallback_calibration
+        self._resolve_run_calibration = recorder.resolve_calibration
         self._adapter = SiglentObserverDdsAdapter(
             lambda payload: self._events.put(("exposure", payload)),
             lambda payload: self._events.put(("timing", payload)),
@@ -615,12 +616,18 @@ class SiglentObserverService:
                     state = decode_observer_exposure_state(
                         payload,
                         self._coordinator.source_key,
-                        self._fallback_calibration,
                     )
+                    calibration = state.calibration
+                    if state.phase == ExperimentController.RUN_STATE_PREINIT and state.run_id is not None:
+                        tagged_calibration = self._resolve_run_calibration(state.run_id)
+                        if tagged_calibration is not None:
+                            calibration = tagged_calibration
+                        elif calibration is None:
+                            calibration = self._fallback_calibration
                     if (
                         state.phase == ExperimentController.RUN_STATE_PREINIT
                         and state.run_id is not None
-                        and state.calibration is None
+                        and calibration is None
                     ):
                         self._log(
                             f"Skipping exposure {state.run_id}: no calibration is bound to "
@@ -630,7 +637,7 @@ class SiglentObserverService:
                     self._coordinator.observe_phase(
                         state.phase,
                         run_id=state.run_id,
-                        calibration=state.calibration,
+                        calibration=calibration,
                     )
                 elif event_type == "timing":
                     self._coordinator.observe_timing(LaserTimingState.decode(payload))

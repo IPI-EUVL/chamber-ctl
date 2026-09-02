@@ -4,14 +4,10 @@ import os
 import time
 
 from ipi_ecs.subsystems.experiment_controller import ExperimentController, RunSettings
-from chamber_ctl.data.calibration import (
-    SourceCalibrationBinding,
-    normalize_source_calibration_bindings,
-)
 from chamber_ctl.subsystems import uuids
 
 class ExposureSettings(RunSettings):
-    def __init__(self, target_time: float = 0.0, target_dose: float = 0.0, operator: str = "", zr_filter: str = "", sample: str = "", sample_type: str = "", base_pressure: float = 0.0, operating_pressure: float = 0.0, flow_sccm: float = 0.0, calibration_profile_id: str = "", calibration_revision: int = 0, chopper_frequency_hz: float | None = 192.0, source_calibrations: tuple[SourceCalibrationBinding, ...] = ()):
+    def __init__(self, target_time: float = 0.0, target_dose: float = 0.0, operator: str = "", zr_filter: str = "", sample: str = "", sample_type: str = "", base_pressure: float = 0.0, operating_pressure: float = 0.0, flow_sccm: float = 0.0, calibration_profile_id: str = "", calibration_revision: int = 0, chopper_frequency_hz: float | None = 192.0):
         super().__init__()
         self.data = {
             "name": "",
@@ -29,9 +25,6 @@ class ExposureSettings(RunSettings):
         self.data["calibration_profile_id"] = calibration_profile_id
         self.data["calibration_revision"] = calibration_revision
         self.data["chopper_frequency_hz"] = chopper_frequency_hz
-        self.data["source_calibrations"] = [
-            binding.to_dict() for binding in normalize_source_calibration_bindings(source_calibrations)
-        ]
 
     def set_attr(self, key, value):
         if (self.data["target_time"] is not None and key == "target_dose" and float(value) > 0.1) and self.data["target_time"] >= 0.1:
@@ -41,8 +34,6 @@ class ExposureSettings(RunSettings):
         assert key in self.data, f"Invalid key '{key}' for ExposureSettings"
 
         #assert type(value) == self.data.get(key).__class__, f"Type mismatch for {key}: expected {self.data.get(key).__class__}, got {type(value)}"
-        if key == "source_calibrations":
-            value = [binding.to_dict() for binding in normalize_source_calibration_bindings(value)]
         return super().set_attr(key, value)
 
     def get_target_time(self) -> float:
@@ -81,9 +72,6 @@ class ExposureSettings(RunSettings):
     def get_chopper_frequency_hz(self) -> float | None:
         return self.data.get("chopper_frequency_hz")
 
-    def get_source_calibrations(self) -> tuple[SourceCalibrationBinding, ...]:
-        return normalize_source_calibration_bindings(self.data.get("source_calibrations", []))
-    
     @staticmethod
     def decode(data: str) -> "ExposureSettings":
         data_dict = json.loads(data)
@@ -93,10 +81,7 @@ class ExposureSettings(RunSettings):
         obj.data.setdefault("calibration_profile_id", "")
         obj.data.setdefault("calibration_revision", 0)
         obj.data.setdefault("chopper_frequency_hz", None)
-        obj.data["source_calibrations"] = [
-            binding.to_dict()
-            for binding in normalize_source_calibration_bindings(obj.data.get("source_calibrations", []))
-        ]
+        obj.data.pop("source_calibrations", None)
 
         assert obj.data.get("target_time") is not None, "Decoded ExposureSettings missing target_time"
         assert obj.data.get("target_dose") is not None, "Decoded ExposureSettings missing target_dose"

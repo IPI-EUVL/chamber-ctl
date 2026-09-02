@@ -16,6 +16,8 @@ CALIBRATION_SCHEMA_VERSION = 1
 CALIBRATION_RESOURCE = "calibration_profile.json"
 CALIBRATION_RESOURCE_TYPE = "calibration_profile"
 CALIBRATION_TAG = "euv_calibration_profile"
+SOURCE_CALIBRATIONS_TAG = "source_calibrations"
+SOURCE_CALIBRATIONS_TAG_SCHEMA_VERSION = 1
 
 
 def _finite(name: str, value: float, *, positive: bool = False) -> float:
@@ -96,6 +98,57 @@ def normalize_source_calibration_bindings(values: object) -> tuple[SourceCalibra
     if len(set(keys)) != len(keys):
         raise ValueError("Source calibration bindings must have unique source identities.")
     return bindings
+
+
+def encode_source_calibrations_tag(values: object) -> str:
+    bindings = sorted(
+        normalize_source_calibration_bindings(values),
+        key=lambda binding: binding.source_key,
+    )
+    return json.dumps(
+        {
+            "schema_version": SOURCE_CALIBRATIONS_TAG_SCHEMA_VERSION,
+            "bindings": [binding.to_dict() for binding in bindings],
+        },
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def decode_source_calibrations_tag(value: object) -> tuple[SourceCalibrationBinding, ...]:
+    if not isinstance(value, str) or not value:
+        raise ValueError("Source calibrations tag must be non-empty JSON text.")
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Source calibrations tag is not valid JSON.") from exc
+    if not isinstance(payload, dict) or set(payload) != {"schema_version", "bindings"}:
+        raise ValueError("Source calibrations tag contains unknown or missing fields.")
+    if payload["schema_version"] != SOURCE_CALIBRATIONS_TAG_SCHEMA_VERSION:
+        raise ValueError("Source calibrations tag has an unsupported schema version.")
+    return normalize_source_calibration_bindings(payload["bindings"])
+
+
+def source_calibration_run_tags(values: object) -> dict[str, str]:
+    bindings = normalize_source_calibration_bindings(values)
+    if not bindings:
+        return {}
+    return {SOURCE_CALIBRATIONS_TAG: encode_source_calibrations_tag(bindings)}
+
+
+def source_calibration_for_source(
+    tag_value: object,
+    source_key: SourceKey,
+) -> SourceCalibrationBinding | None:
+    return next(
+        (
+            binding
+            for binding in decode_source_calibrations_tag(tag_value)
+            if binding.source_key == source_key
+        ),
+        None,
+    )
 
 
 @dataclass(frozen=True)
@@ -265,16 +318,26 @@ class CalibrationRepository:
             return CalibrationProfile.from_dict(json.load(resource))
 
     def list_latest(self) -> tuple[CalibrationProfile, ...]:
-        self._require_owner()
-        entries = self._library.query({"tags": {CALIBRATION_TAG: "1"}}, limit=None)
         latest: dict[uuid.UUID, CalibrationProfile] = {}
-        for entry in entries:
-            with entry.resource(CALIBRATION_RESOURCE, CALIBRATION_RESOURCE_TYPE, "r") as resource:
-                profile = CalibrationProfile.from_dict(json.load(resource))
+        for profile in self.list_all():
             current = latest.get(profile.profile_id)
             if current is None or profile.revision > current.revision:
                 latest[profile.profile_id] = profile
         return tuple(sorted(latest.values(), key=lambda profile: (profile.name.casefold(), str(profile.profile_id))))
+
+    def list_all(self) -> tuple[CalibrationProfile, ...]:
+        self._require_owner()
+        entries = self._library.query({"tags": {CALIBRATION_TAG: "1"}}, limit=None)
+        profiles = []
+        for entry in entries:
+            with entry.resource(CALIBRATION_RESOURCE, CALIBRATION_RESOURCE_TYPE, "r") as resource:
+                profiles.append(CalibrationProfile.from_dict(json.load(resource)))
+        return tuple(
+            sorted(
+                profiles,
+                key=lambda profile: (profile.name.casefold(), str(profile.profile_id), profile.revision),
+            )
+        )
 
     def close(self) -> None:
         self._require_owner()

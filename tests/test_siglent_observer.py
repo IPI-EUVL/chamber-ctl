@@ -35,10 +35,12 @@ def _state_payload(phase: int, settings: ExposureSettings | None = None) -> byte
 
 
 def test_observer_state_decoder_selects_only_its_source_binding() -> None:
+    legacy_settings = ExposureSettings()
+    legacy_settings.data["source_calibrations"] = [BINDING.to_dict()]
     state = decode_observer_exposure_state(
         _state_payload(
             ExperimentController.RUN_STATE_PREINIT,
-            ExposureSettings(source_calibrations=(BINDING,)),
+            legacy_settings,
         ),
         SOURCE,
     )
@@ -62,6 +64,8 @@ def test_observer_state_decoder_selects_only_its_source_binding() -> None:
 
 def test_observer_state_decoder_uses_fallback_only_when_run_binding_is_absent() -> None:
     run_binding = replace(BINDING, revision=4)
+    legacy_settings = ExposureSettings()
+    legacy_settings.data["source_calibrations"] = [run_binding.to_dict()]
     fallback_state = decode_observer_exposure_state(
         _state_payload(ExperimentController.RUN_STATE_PREINIT, ExposureSettings()),
         SOURCE,
@@ -70,7 +74,7 @@ def test_observer_state_decoder_uses_fallback_only_when_run_binding_is_absent() 
     explicit_state = decode_observer_exposure_state(
         _state_payload(
             ExperimentController.RUN_STATE_PREINIT,
-            ExposureSettings(source_calibrations=(run_binding,)),
+            legacy_settings,
         ),
         SOURCE,
         BINDING,

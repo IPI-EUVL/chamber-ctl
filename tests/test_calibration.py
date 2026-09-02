@@ -56,6 +56,7 @@ def test_calibration_repository_persists_immutable_revisions(tmp_path) -> None:
 
         assert repository.get(first.profile_id, 1) == first
         assert repository.get(first.profile_id, 2) == second
+        assert repository.list_all() == (first, second)
         assert repository.list_latest() == (second,)
         with pytest.raises(ValueError, match="already exists"):
             repository.save_revision(second)

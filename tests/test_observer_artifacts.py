@@ -7,7 +7,13 @@ import numpy as np
 import pytest
 
 from chamber_ctl.data.acquisition_artifacts import ArtifactImportError
-from chamber_ctl.data.calibration import CalibrationProfile, CalibrationRepository, SourceCalibrationBinding, SourceKey
+from chamber_ctl.data.calibration import (
+    CalibrationProfile,
+    CalibrationRepository,
+    SourceCalibrationBinding,
+    SourceKey,
+    source_calibration_run_tags,
+)
 from chamber_ctl.data.observer_artifacts import (
     OBSERVER_CAPTURE_RESOURCE_TYPE,
     OBSERVER_CONTEXT_RESOURCE_TYPE,
@@ -77,12 +83,14 @@ def _profile() -> CalibrationProfile:
     )
 
 
-def _run_record(data_path, run_id, settings) -> None:
+def _run_record(data_path, run_id, settings, *, source_calibrations=()) -> None:
     library = Library(data_path)
     try:
         entry = library.create_entry("Exposure", "Observer fixture")
         entry.set_tag("experiment", "exposure")
         entry.set_tag("run", run_id.hex)
+        for key, value in source_calibration_run_tags(source_calibrations).items():
+            entry.set_tag(key, value)
         with entry.resource("run.json", "run_state", "w") as resource:
             resource.write(RunState("exposure", settings, run_id).encode())
         with entry.resource("metadata.json", "metadata", "w") as resource:
@@ -129,7 +137,7 @@ def _fixture(tmp_path, *, analysis_version=SIGLENT_NATIVE_ANALYSIS_VERSION, timi
     binding = SourceCalibrationBinding(SOURCE.source_kind, SOURCE.source_id, profile.profile_id, profile.revision)
     run_id = uuid.uuid4()
     session_id = uuid.uuid4()
-    _run_record(data_path, run_id, ExposureSettings(source_calibrations=(binding,)))
+    _run_record(data_path, run_id, ExposureSettings(), source_calibrations=(binding,))
     store, manifest = _snapshot(tmp_path, session_id, analysis_version=analysis_version)
     session = CaptureSessionManifest(
         server_boot_id=uuid.uuid4(),
@@ -159,6 +167,8 @@ def test_observer_recorder_persists_descriptor_and_context_before_acknowledgemen
     data_path, run, store, manifest, session = _fixture(tmp_path)
     client = _Client(store, manifest)
     recorder = ObserverArtifactRecorder(data_path, SOURCE, temporary_directory=tmp_path / "received")
+
+    assert recorder.resolve_calibration(run.run_id) == run.calibration
 
     recorder.prepare_run(run, client)
     recorder.finalize_run(run, session, client)

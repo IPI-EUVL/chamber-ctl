@@ -2,6 +2,7 @@ import json
 import threading
 import uuid
 import runpy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -120,7 +121,6 @@ def test_empty_history_starts_first_sample_with_independent_full_settings() -> N
         "calibration_profile_id": "",
         "calibration_revision": 0,
         "chopper_frequency_hz": 192.0,
-        "source_calibrations": [],
     }
     assert second.decision.settings is not first.decision.settings
 
@@ -206,7 +206,7 @@ def test_batch_plan_round_trips_source_calibration_bindings() -> None:
     settings = restored.template.settings_for(restored.entries[0], 5.0)
 
     assert restored.template.source_calibrations == (binding,)
-    assert settings.get_source_calibrations() == (binding,)
+    assert "source_calibrations" not in settings.get_dict()
 
 
 def test_finalization_and_metric_repair_precede_tallying() -> None:
@@ -554,6 +554,36 @@ def test_coordinator_start_command_uses_fresh_plan_settings_and_exact_batch_uuid
     assert settings.get_target_dose() == 10.0
     assert settings.get_target_time() == 0.0
     assert run_tags is None
+
+
+def test_coordinator_start_command_attaches_source_calibrations_as_scalar_run_tag() -> None:
+    from chamber_ctl.data.calibration import (
+        SOURCE_CALIBRATIONS_TAG,
+        source_calibration_for_source,
+    )
+
+    binding = SourceCalibrationBinding("siglent", "scope-1", uuid.uuid4(), 2)
+    base_plan = _plan()
+    plan = replace(
+        base_plan,
+        template=replace(base_plan.template, source_calibrations=(binding,)),
+    )
+    controller = _FakeController()
+    coordinator = BatchCoordinator(
+        plan,
+        uuid.uuid4(),
+        _FakeHistory(),
+        controller,
+        wall_clock=lambda: 100.0,
+    )
+
+    ok, _message = coordinator.start_next()
+
+    assert ok is True
+    settings, _batch_uuid, run_tags = controller.starts[0]
+    assert "source_calibrations" not in settings.get_dict()
+    assert isinstance(run_tags[SOURCE_CALIBRATIONS_TAG], str)
+    assert source_calibration_for_source(run_tags[SOURCE_CALIBRATIONS_TAG], binding.source_key) == binding
 
 
 def test_coordinator_start_command_refuses_while_paused() -> None:

@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from chamber_ctl.data.calibration import (
     SourceCalibrationBinding,
     normalize_source_calibration_bindings,
+    source_calibration_run_tags,
 )
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 
@@ -106,7 +107,6 @@ class ExposureTemplate:
             "calibration_profile_id": self.calibration_profile_id,
             "calibration_revision": self.calibration_revision,
             "chopper_frequency_hz": self.chopper_frequency_hz,
-            "source_calibrations": self.source_calibrations,
         }
         values.update(entry.overrides)
         settings = ExposureSettings(
@@ -122,7 +122,6 @@ class ExposureTemplate:
             calibration_profile_id=values["calibration_profile_id"],
             calibration_revision=values["calibration_revision"],
             chopper_frequency_hz=values["chopper_frequency_hz"],
-            source_calibrations=values["source_calibrations"],
         )
         settings.set_attr("name", values["name"])
         settings.set_attr("description", values["description"])
@@ -1546,10 +1545,15 @@ class BatchCoordinator:
                 self._output(f"Batch {self.batch_uuid}: {message}")
                 return False, message
             try:
+                tags = dict(run_tags or {})
+                source_tags = source_calibration_run_tags(self.plan.template.source_calibrations)
+                if set(tags).intersection(source_tags):
+                    raise ValueError("Source calibration run tags are owned by the batch plan.")
+                tags.update(source_tags)
                 result = self.controller.start_exposure(
                     decision.settings,
                     self.batch_uuid,
-                    run_tags=run_tags,
+                    run_tags=tags or None,
                 )
             except Exception as exc:
                 message = f"Tagged exposure start failed: {type(exc).__name__}: {exc}"
