@@ -15,8 +15,16 @@ from ipi_ecs.gui.experiment_controller_gui import ExperimentInterface, Experimen
 from ipi_ecs.cli.captive_cli import wait_for
 
 from chamber_ctl import ECS_IP
-from chamber_ctl.data.calibration import CalibrationRepository
+from chamber_ctl.data.calibration import (
+    CalibrationRepository,
+    SourceCalibrationBinding,
+    source_calibration_run_tags,
+)
 from chamber_ctl.gui.sample_motion_gui import draw_sample_stage, build_sample_data, RING_RADII
+from chamber_ctl.gui.source_calibration_editor import (
+    edit_source_calibrations,
+    source_calibration_summary,
+)
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.exposure_controller import ExposureSettings
 from chamber_ctl.subsystems.laser import LaserSyncStatus
@@ -42,6 +50,9 @@ class ExposureControllerGUI():
         self.__data_path = os.path.join(os.environ["EUVL_PATH"], "datasets")
         self.__presets = SettingsPresets(self.__data_path)
         self.__calibration_options = {}
+        self.__source_calibration_options = {}
+        self.__source_calibrations: tuple[SourceCalibrationBinding, ...] = ()
+        self.__source_calibration_text = tk.StringVar(value="None")
 
         self.__reload_presets()
 
@@ -60,6 +71,7 @@ class ExposureControllerGUI():
         self.__sample_combo = None
         self.__sample_type_combo = None
         self.__calibration_combo = None
+        self.__source_calibration_button = None
         self.__base_pressure_input = None
         self.__operating_pressure_input = None
         self.__flowrate_input = None
@@ -143,11 +155,16 @@ class ExposureControllerGUI():
             repository = CalibrationRepository(self.__data_path)
             try:
                 profiles = repository.list_latest()
+                source_profiles = repository.list_all()
             finally:
                 repository.close()
             self.__calibration_options = {
                 f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
                 for profile in profiles
+            }
+            self.__source_calibration_options = {
+                f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
+                for profile in source_profiles
             }
         except Exception as e:
             messagebox.showerror("Exposure Controller", f"Failed to load settings presets:\n{e}")
@@ -173,6 +190,20 @@ class ExposureControllerGUI():
 
         if self.__calibration_combo is not None:
             self.__calibration_combo.config(values=tuple(self.__calibration_options))
+
+    def __edit_source_calibrations(self):
+        if self.__settings_locked:
+            return
+        selected = edit_source_calibrations(
+            self.__root,
+            self.__source_calibrations,
+            self.__source_calibration_options,
+        )
+        if selected is None:
+            return
+        self.__source_calibrations = selected
+        self.__source_calibration_text.set(source_calibration_summary(selected))
+        self.__exp_itf.set_run_tags(source_calibration_run_tags(selected))
 
     def __update_target_unit_label(self, *args):
         """Update the unit label based on target type selection."""
@@ -815,6 +846,8 @@ class ExposureControllerGUI():
         for widget in [self.__time_radio, self.__dose_radio, self.__refresh_button, self.__apply_button]:
             if widget is not None:
                 widget.config(state=button_state)
+        if self.__source_calibration_button is not None:
+            self.__source_calibration_button.config(state=button_state)
 
     def __sync_settings_from_run_state(self):
         has_experiment = self.__exp_itf.get_experiment() is not None
@@ -1020,6 +1053,23 @@ class ExposureControllerGUI():
             width=20,
         )
         self.__calibration_combo.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 1
+
+        ttk.Label(settings_frame, text="Source Calibrations:").grid(row=row, column=0, sticky=tk.NW, pady=2)
+        source_calibration_frame = ttk.Frame(settings_frame)
+        source_calibration_frame.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        source_calibration_frame.columnconfigure(0, weight=1)
+        self.__source_calibration_button = ttk.Button(
+            source_calibration_frame,
+            text="Configure...",
+            command=self.__edit_source_calibrations,
+        )
+        self.__source_calibration_button.grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(
+            source_calibration_frame,
+            textvariable=self.__source_calibration_text,
+            wraplength=260,
+        ).grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
         row += 1
 
         row += 1  # Spacing

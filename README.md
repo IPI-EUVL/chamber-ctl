@@ -66,9 +66,17 @@ The recorder subscribes read-only to exposure and laser timing state, attaches
 source-qualified artifacts to the run, and never supplies canonical dose,
 runtime, interlock, or stop decisions.
 
-The source ID must match the acquisition service exactly. A calibration bound
-in the exposure settings takes precedence. Until every exposure editor exposes
-source bindings, configure an explicit fallback profile on the recorder:
+Configure optional source calibrations from the direct exposure or batch editor.
+Each binding selects an immutable profile revision for one exact `(source kind,
+source ID)` pair. The editor stores all bindings in the scalar, versioned JSON
+run tag `source_calibrations`; they are not exposure settings, and list order has
+no meaning.
+
+The recorder uses a binding only when both its source kind and source ID match
+the recorder's configured identity exactly, then loads the exact profile UUID
+and revision from the calibration repository. A run tag takes precedence over
+a historical embedded-settings binding and the recorder CLI fallback. Configure
+the fallback for runs that omit a binding for this recorder:
 
 ```powershell
 chamber-siglent-recorder `
@@ -80,9 +88,8 @@ chamber-siglent-recorder `
 ```
 
 The profile revision must already exist in the same experiment dataset used by
-the chamber controller. Run-level source bindings override the fallback. If
-neither is present, the recorder logs a warning and deliberately skips the
-exposure.
+the chamber controller. If no matching run or historical binding and no fallback
+are present, the recorder logs a warning and deliberately skips the exposure.
 
 The legacy `DummyOscilloscope` and `euv-acquisition-sim` do not implement the
 Siglent sequence-batch protocol. For a local observer rehearsal, run the

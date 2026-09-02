@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 import tkinter as tk
+from dataclasses import replace
 from tkinter import messagebox, ttk
 
 from ipi_ecs.dds import client, subsystem, types
@@ -14,6 +15,10 @@ from ipi_ecs.dds import client, subsystem, types
 from chamber_ctl import ECS_IP
 from chamber_ctl.data.calibration import CalibrationRepository
 from chamber_ctl.gui.sample_motion_gui import RING_RADII, build_sample_data
+from chamber_ctl.gui.source_calibration_editor import (
+    edit_source_calibrations,
+    source_calibration_summary,
+)
 from chamber_ctl.subsystems import uuids
 from chamber_ctl.subsystems.batch_controller import decode_batch_state, encode_batch_command
 from chamber_ctl.subsystems.batcher import (
@@ -133,6 +138,7 @@ class BatchControllerGUI:
         self._presets = SettingsPresets(data_path)
         self._data_path = data_path
         self._calibration_options: dict[str, tuple[str, int]] = {}
+        self._source_calibration_options: dict[str, tuple[str, int]] = {}
         self._state = None
         self._manifest_uuid: str | None = None
         self._manifest_revision: int | None = None
@@ -159,6 +165,7 @@ class BatchControllerGUI:
         self._manifest_filter = tk.StringVar(value="All batches")
         self._details_mode = tk.StringVar(value="Batch default exposure details")
         self._details_hint = tk.StringVar(value="Select planned samples on the stage to edit their overrides.")
+        self._source_calibration_text = tk.StringVar(value="None")
         self._samples = build_sample_data()
         self._styles = ttk.Style()
         self._styles.configure("BatchStatus.Good.TLabel", foreground="#217a3b")
@@ -180,11 +187,16 @@ class BatchControllerGUI:
         repository = CalibrationRepository(self._data_path)
         try:
             profiles = repository.list_latest()
+            source_profiles = repository.list_all()
         finally:
             repository.close()
         self._calibration_options = {
             f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
             for profile in profiles
+        }
+        self._source_calibration_options = {
+            f"{profile.name} r{profile.revision} | {profile.profile_id}": (str(profile.profile_id), profile.revision)
+            for profile in source_profiles
         }
         self._calibration["values"] = tuple(self._calibration_options)
 
@@ -306,6 +318,18 @@ class BatchControllerGUI:
         self._calibration = self._combo(shared, "Calibration", 2, 0)
         self._calibration.config(state="readonly")
         self._chopper_frequency = self._entry(shared, "Chopper Hz", 2, 2, "192")
+        ttk.Label(shared, text="Source calibrations").grid(row=2, column=4, sticky=tk.W, padx=(0, 3))
+        self._source_calibration_button = ttk.Button(
+            shared,
+            text="Configure...",
+            command=self._edit_source_calibrations,
+        )
+        self._source_calibration_button.grid(row=2, column=5, sticky=tk.W, padx=(0, 8), pady=2)
+        ttk.Label(
+            shared,
+            textvariable=self._source_calibration_text,
+            wraplength=310,
+        ).grid(row=2, column=6, columnspan=2, sticky=tk.W)
         self._detail_widgets = {
             "name": self._name,
             "description": self._description,
@@ -496,6 +520,17 @@ class BatchControllerGUI:
                 return
         self._calibration.set("")
 
+    def _edit_source_calibrations(self) -> None:
+        selected = edit_source_calibrations(
+            self._root,
+            self._template_value.source_calibrations,
+            self._source_calibration_options,
+        )
+        if selected is None:
+            return
+        self._template_value = replace(self._template_value, source_calibrations=selected)
+        self._source_calibration_text.set(source_calibration_summary(selected))
+
     def _set_detail_value(self, key: str, value) -> None:
         widget = self._detail_widgets[key]
         widget.delete(0, tk.END)
@@ -523,6 +558,9 @@ class BatchControllerGUI:
             self._set_template_calibration(
                 self._template_value.calibration_profile_id,
                 self._template_value.calibration_revision,
+            )
+            self._source_calibration_text.set(
+                source_calibration_summary(self._template_value.source_calibrations)
             )
             self._set_detail_value("flow_sccm", self._template_value.flow_sccm)
             self._chopper_frequency.delete(0, tk.END)

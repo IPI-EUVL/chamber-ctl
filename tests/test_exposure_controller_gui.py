@@ -1,3 +1,11 @@
+import uuid
+
+import chamber_ctl.gui.exposure_controller as exposure_controller_gui
+from chamber_ctl.data.calibration import (
+    SOURCE_CALIBRATIONS_TAG,
+    SourceCalibrationBinding,
+    source_calibration_for_source,
+)
 from chamber_ctl.gui.exposure_controller import ExposureControllerGUI
 
 
@@ -7,6 +15,17 @@ class _Value:
 
     def get(self, *_args):
         return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class _RunTagInterface:
+    def __init__(self):
+        self.tags = None
+
+    def set_run_tags(self, tags):
+        self.tags = tags
 
 
 class _Label:
@@ -39,6 +58,31 @@ def test_current_settings_serializes_calibration_revision_as_text() -> None:
     assert settings["calibration_profile_id"] == "profile-id"
     assert settings["calibration_revision"] == "1"
     assert all(isinstance(value, str) for value in settings.values())
+
+
+def test_source_calibration_editor_updates_direct_run_tags(monkeypatch) -> None:
+    binding = SourceCalibrationBinding("siglent", "scope-1", uuid.uuid4(), 2)
+    interface = _RunTagInterface()
+    gui = object.__new__(ExposureControllerGUI)
+    gui._ExposureControllerGUI__settings_locked = False
+    gui._ExposureControllerGUI__root = object()
+    gui._ExposureControllerGUI__source_calibrations = ()
+    gui._ExposureControllerGUI__source_calibration_options = {}
+    gui._ExposureControllerGUI__source_calibration_text = _Value("None")
+    gui._ExposureControllerGUI__exp_itf = interface
+    monkeypatch.setattr(
+        exposure_controller_gui,
+        "edit_source_calibrations",
+        lambda *_args: (binding,),
+    )
+
+    gui._ExposureControllerGUI__edit_source_calibrations()
+
+    assert gui._ExposureControllerGUI__source_calibrations == (binding,)
+    assert source_calibration_for_source(
+        interface.tags[SOURCE_CALIBRATIONS_TAG],
+        binding.source_key,
+    ) == binding
 
 
 def test_exposure_status_preserves_zero_runtime_from_acquisition_status() -> None:
