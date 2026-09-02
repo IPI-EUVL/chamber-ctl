@@ -436,6 +436,61 @@ def test_observer_reports_and_preserves_an_unexpected_source_stop() -> None:
     assert failure in coordinator.last_error
 
 
+def test_observer_preserves_failed_snapshots_and_clears_terminal_recovery(tmp_path) -> None:
+    journal = ObserverRecoveryJournal(tmp_path / "observer.json")
+    journal.save(ObserverCaptureRun(RUN_ID, SESSION_ID, SOURCE, BINDING, 10, stopped_observed_unix_ns=20))
+    failure = "Pulse source close failure: capture worker required SIGTERM"
+    client = _Client()
+    client.session = CaptureSessionManifest(
+        server_boot_id=uuid.uuid4(),
+        session_id=SESSION_ID,
+        state=CaptureSessionState.STOPPED,
+        source_kind=SOURCE.source_kind,
+        source_id=SOURCE.source_id,
+        started_at_unix_ns=10,
+        stop_reason=failure,
+    )
+    failed_finalizations = []
+    logs = []
+    coordinator = SiglentObserverCoordinator(
+        SOURCE,
+        lambda: client,
+        lambda _run, _client: None,
+        lambda _run, _manifest, _client: None,
+        journal=journal,
+        finalize_failed_run=lambda run, manifest, _client: failed_finalizations.append((run, manifest)),
+        log=lambda message, level: logs.append((message, level)),
+    )
+
+    coordinator.recover()
+    coordinator.observe_phase(ExperimentController.RUN_STATE_STOPPED)
+
+    assert len(failed_finalizations) == 1
+    assert failed_finalizations[0][1].stop_reason == failure
+    assert client.released is True
+    assert client.closed is True
+    assert journal.load() is None
+    assert coordinator.current_run is None
+    assert failure in coordinator.last_error
+    assert [level for _message, level in logs] == ["ERROR"]
+
+
+def test_observer_logs_identical_errors_only_once() -> None:
+    logs = []
+    coordinator = SiglentObserverCoordinator(
+        SOURCE,
+        lambda: None,
+        lambda _run, _client: None,
+        lambda _run, _manifest, _client: None,
+        log=lambda message, level: logs.append((message, level)),
+    )
+
+    coordinator._record_error("scope failed")
+    coordinator._record_error("scope failed")
+
+    assert logs == [("scope failed", "ERROR")]
+
+
 def test_observer_publishes_display_only_live_dose_from_source_reports() -> None:
     client = _Client()
     updates = []

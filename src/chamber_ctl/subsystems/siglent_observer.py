@@ -209,6 +209,7 @@ class SiglentObserverCoordinator:
         journal: ObserverRecoveryJournal | None = None,
         calibration_loader: Callable[[SourceCalibrationBinding], CalibrationProfile] | None = None,
         on_live_update: Callable[[LivePulseUpdate], None] | None = None,
+        finalize_failed_run: Callable[[ObserverCaptureRun, CaptureSessionManifest, object], None] | None = None,
     ) -> None:
         self.source_key = source_key
         self._client_factory = client_factory
@@ -220,6 +221,7 @@ class SiglentObserverCoordinator:
         self._journal = journal or _NullObserverRecoveryJournal()
         self._calibration_loader = calibration_loader
         self._on_live_update = on_live_update or (lambda _update: None)
+        self._finalize_failed_run = finalize_failed_run
         self._lock = threading.RLock()
         self._client = None
         self._run: ObserverCaptureRun | None = None
@@ -430,17 +432,26 @@ class SiglentObserverCoordinator:
                 self._live_accumulator.set_running(False)
         manifest = self._session_from_status(status)
         self._validate_session(manifest, run.session_id, active=False)
-        if manifest.stop_reason != expected_stop_reason:
+        unexpected_stop = manifest.stop_reason != expected_stop_reason
+        if unexpected_stop and self._finalize_failed_run is None:
             raise RuntimeError(
                 f"Observer acquisition stopped unexpectedly: {manifest.stop_reason}"
             )
-        self._finalize_run(run, manifest, client)
+        if unexpected_stop:
+            self._finalize_failed_run(run, manifest, client)
+        else:
+            self._finalize_run(run, manifest, client)
         client.command("release_snapshots", {})
         self._journal.clear()
         self._close_client()
         self._run = None
         self._timing_observations = []
+        self._live_accumulator = None
         self._last_error = None
+        if unexpected_stop:
+            raise RuntimeError(
+                f"Observer acquisition stopped unexpectedly: {manifest.stop_reason}"
+            )
         self._log(f"Finalized passive capture session {run.session_id}.", "INFO")
 
     def _recover(self) -> None:
@@ -587,6 +598,8 @@ class SiglentObserverCoordinator:
 
     def _record_error(self, message: str) -> None:
         with self._lock:
+            if message == self._last_error:
+                return
             self._last_error = message
         self._log(message, "ERROR")
 
@@ -699,6 +712,7 @@ class SiglentObserverService:
             journal=ObserverRecoveryJournal(journal_path),
             calibration_loader=recorder.load_calibration,
             on_live_update=self._publish_live_update,
+            finalize_failed_run=recorder.finalize_failed_run,
         )
         if fallback_calibration is not None and fallback_calibration.source_key != source_key:
             raise ValueError("Observer fallback calibration belongs to another source.")

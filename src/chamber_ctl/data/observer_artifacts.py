@@ -120,33 +120,7 @@ class ObserverArtifactRecorder:
         try:
             entry = reader.get_run(run.run_id).get_record()
             self._require_descriptor(entry, run, profile, session)
-            importer = AcquisitionArtifactImporter(client, self.temporary_directory)
-            for stored in session.snapshots:
-                manifest = stored.manifest
-                if stored.acknowledged:
-                    self._require_persisted_snapshot(entry, run, manifest.snapshot_id, manifest.filename)
-                    continue
-                validated: dict[str, SnapshotContents] = {}
-
-                def validate(_manifest, local_path: Path) -> None:
-                    contents = read_snapshot(local_path)
-                    self._validate_snapshot(run, manifest, contents)
-                    validated["contents"] = contents
-
-                def persist_context(persisted_entry) -> None:
-                    contents = validated.get("contents")
-                    if contents is None:
-                        raise RuntimeError("Observer snapshot validation did not produce context.")
-                    self._append_snapshot_context(persisted_entry, run, contents)
-
-                importer.import_snapshot(
-                    entry,
-                    manifest,
-                    validate=validate,
-                    before_ack=persist_context,
-                )
-
-            snapshot_ids = [stored.manifest.snapshot_id for stored in session.snapshots]
+            snapshot_ids = self._import_snapshots(entry, run, session, client)
             context = self._read_json_resource(
                 entry,
                 observer_context_filename(run.session_id),
@@ -210,6 +184,57 @@ class ObserverArtifactRecorder:
             )
         finally:
             reader.close()
+
+    def finalize_failed_run(self, run, session, client) -> None:
+        self._validate_session(run, session)
+        profile = self._load_calibration(run)
+        reader = ExperimentReader(str(self.data_path), "exposure")
+        try:
+            entry = reader.get_run(run.run_id).get_record()
+            self._require_descriptor(entry, run, profile, session)
+            snapshot_ids = self._import_snapshots(entry, run, session, client)
+            descriptor = self._descriptor(
+                run,
+                profile,
+                status="incomplete",
+                snapshot_ids=[str(snapshot_id) for snapshot_id in snapshot_ids],
+            )
+            self._write_json_resource(
+                entry,
+                observer_capture_filename(run.session_id),
+                OBSERVER_CAPTURE_RESOURCE_TYPE,
+                descriptor,
+            )
+        finally:
+            reader.close()
+
+    def _import_snapshots(self, entry, run, session, client) -> list[uuid.UUID]:
+        importer = AcquisitionArtifactImporter(client, self.temporary_directory)
+        for stored in session.snapshots:
+            manifest = stored.manifest
+            if stored.acknowledged:
+                self._require_persisted_snapshot(entry, run, manifest.snapshot_id, manifest.filename)
+                continue
+            validated: dict[str, SnapshotContents] = {}
+
+            def validate(_manifest, local_path: Path) -> None:
+                contents = read_snapshot(local_path)
+                self._validate_snapshot(run, manifest, contents)
+                validated["contents"] = contents
+
+            def persist_context(persisted_entry) -> None:
+                contents = validated.get("contents")
+                if contents is None:
+                    raise RuntimeError("Observer snapshot validation did not produce context.")
+                self._append_snapshot_context(persisted_entry, run, contents)
+
+            importer.import_snapshot(
+                entry,
+                manifest,
+                validate=validate,
+                before_ack=persist_context,
+            )
+        return [stored.manifest.snapshot_id for stored in session.snapshots]
 
     def _load_calibration(self, run) -> CalibrationProfile:
         return self.load_calibration(run.calibration)
@@ -342,9 +367,9 @@ class ObserverArtifactRecorder:
         expected_snapshot_ids = [str(stored.manifest.snapshot_id) for stored in session.snapshots]
         if status == "capturing" and snapshot_ids != []:
             raise ValueError("Capturing observer descriptor already lists finalized snapshots.")
-        if status == "complete" and snapshot_ids != expected_snapshot_ids:
-            raise ValueError("Complete observer descriptor lists different snapshots.")
-        if status not in {"capturing", "complete"}:
+        if status in {"complete", "incomplete"} and snapshot_ids != expected_snapshot_ids:
+            raise ValueError("Finalized observer descriptor lists different snapshots.")
+        if status not in {"capturing", "complete", "incomplete"}:
             raise ValueError("Observer capture descriptor has an invalid status.")
 
     def _require_descriptor_identity(self, entry, run, profile: CalibrationProfile) -> dict:

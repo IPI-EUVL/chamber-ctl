@@ -234,6 +234,31 @@ def test_observer_recorder_persists_descriptor_and_context_before_acknowledgemen
         library.close()
 
 
+def test_failed_observer_capture_preserves_snapshots_without_dose_products(tmp_path) -> None:
+    data_path, run, store, manifest, session = _fixture(tmp_path, primary=True)
+    client = _Client(store, manifest)
+    recorder = ObserverArtifactRecorder(data_path, SOURCE, temporary_directory=tmp_path / "received")
+
+    recorder.prepare_run(run, client)
+    recorder.finalize_failed_run(run, session, client)
+
+    library = Library(data_path)
+    try:
+        entry = library.query({"tags": {"run": run.run_id.hex}}, limit=1)[0]
+        resources = dict(entry.list_resources())
+        with entry.resource(observer_capture_filename(run.session_id), OBSERVER_CAPTURE_RESOURCE_TYPE, "r") as resource:
+            descriptor = json.load(resource)
+        assert descriptor["status"] == "incomplete"
+        assert descriptor["snapshot_ids"] == [str(manifest.snapshot_id)]
+        assert resources[manifest.filename] == "euv_snapshot"
+        assert not any(resource_type == OBSERVER_ANALYSIS_RESOURCE_TYPE for resource_type in resources.values())
+        assert not any(resource_type == OBSERVER_GRAPH_RESOURCE_TYPE for resource_type in resources.values())
+        assert active_dose_product_from_tags(entry.get_tags()) is None
+        assert client.acknowledged == [str(manifest.snapshot_id)]
+    finally:
+        library.close()
+
+
 def test_observer_recorder_recovers_after_acknowledgement_before_product_finalization(
     tmp_path,
     monkeypatch,
