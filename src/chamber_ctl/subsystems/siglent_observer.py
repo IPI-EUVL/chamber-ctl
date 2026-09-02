@@ -255,6 +255,11 @@ class SiglentObserverCoordinator:
             return
         try:
             client.heartbeat_if_due()
+            try:
+                stop_reason = client.get_stop_reason(timeout=0.0)
+            except queue.Empty:
+                return
+            self._record_error(f"Observer acquisition stopped unexpectedly: {stop_reason}")
         except Exception as exc:
             self._record_error(f"Observer heartbeat failed: {type(exc).__name__}: {exc}")
 
@@ -381,14 +386,19 @@ class SiglentObserverCoordinator:
             self._run = run
             self._journal.save(run)
 
+        expected_stop_reason = f"Exposure {run.run_id} reached STOPPED."
         status = client.command("status")
         if bool(status.get("capture_active")):
             status = client.command(
                 "stop_capture",
-                {"reason": f"Exposure {run.run_id} reached STOPPED."},
+                {"reason": expected_stop_reason},
             )
         manifest = self._session_from_status(status)
         self._validate_session(manifest, run.session_id, active=False)
+        if manifest.stop_reason != expected_stop_reason:
+            raise RuntimeError(
+                f"Observer acquisition stopped unexpectedly: {manifest.stop_reason}"
+            )
         self._finalize_run(run, manifest, client)
         client.command("release_snapshots", {})
         self._journal.clear()
@@ -559,6 +569,9 @@ class SiglentObserverService:
     ) -> None:
         self._events: queue.Queue[tuple[str, bytes]] = queue.Queue()
         self._stop = threading.Event()
+        self._status_lock = threading.Lock()
+        self._subsystem_handle: dds_client._RegisteredSubsystemHandle | None = None
+        self._published_health: tuple[bool, str | None] | None = None
         self._subsystem_uuid = observer_subsystem_uuid(source_key)
         self._logger, self._logger_transport = open_ecs_logger(
             logger_host,
@@ -608,6 +621,9 @@ class SiglentObserverService:
             self._subsystem_uuid,
             temporary=True,
         )
+        with self._status_lock:
+            self._subsystem_handle = handle
+            self._published_health = None
         handle.put_status_item(
             dds_subsystem.StatusItem(
                 dds_subsystem.StatusItem.STATE_INFO,
@@ -617,15 +633,48 @@ class SiglentObserverService:
             )
         )
         self._adapter.configure(handle)
+        self._publish_status()
         self._log("Passive Siglent observer subscribed to exposure and laser state.", "INFO")
+
+    def _publish_status(self) -> None:
+        health = (
+            self._coordinator.current_run is not None,
+            self._coordinator.last_error,
+        )
+        with self._status_lock:
+            handle = self._subsystem_handle
+            if handle is None or health == self._published_health:
+                return
+            capturing, error = health
+            handle.put_status_item(
+                dds_subsystem.StatusItem(
+                    dds_subsystem.StatusItem.STATE_INFO,
+                    0,
+                    "Capturing" if capturing else "Idle",
+                )
+            )
+            if error is None:
+                if handle.get_status_item_exists(100):
+                    handle.clear_status_item(100)
+            else:
+                handle.put_status_item(
+                    dds_subsystem.StatusItem(
+                        dds_subsystem.StatusItem.STATE_ALARM,
+                        100,
+                        error,
+                    )
+                )
+            self._published_health = health
 
     def _run(self) -> None:
         self._coordinator.recover()
+        self._publish_status()
         while not self._stop.is_set():
             try:
                 event_type, payload = self._events.get(timeout=0.1)
             except queue.Empty:
                 self._coordinator.heartbeat()
+                self._publish_status()
                 continue
             try:
                 if event_type == "exposure":
@@ -660,6 +709,7 @@ class SiglentObserverService:
             except Exception as exc:
                 self._log(f"Ignored invalid observer {event_type} state: {type(exc).__name__}: {exc}", "ERROR")
             self._coordinator.heartbeat()
+            self._publish_status()
 
     def _log(self, message: str, level: str) -> None:
         print(f"[Siglent Observer] {level}: {message}", flush=True)

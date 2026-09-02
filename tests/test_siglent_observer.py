@@ -1,3 +1,5 @@
+import queue
+import threading
 import uuid
 from dataclasses import replace
 
@@ -13,6 +15,7 @@ from chamber_ctl.subsystems.siglent_observer import (
     ObserverRecoveryJournal,
     SiglentObserverDdsAdapter,
     SiglentObserverCoordinator,
+    SiglentObserverService,
     _parse_args,
     decode_observer_exposure_state,
     observer_subsystem_uuid,
@@ -242,6 +245,7 @@ class _Client:
         self.released = False
         self.commands = []
         self.session = None
+        self.stop_reasons = queue.Queue()
 
     def connect(self) -> None:
         self.connected = True
@@ -251,6 +255,9 @@ class _Client:
 
     def heartbeat_if_due(self) -> bool:
         return True
+
+    def get_stop_reason(self, timeout=None) -> str:
+        return self.stop_reasons.get(timeout=timeout)
 
     def command(self, command, payload=None):
         self.commands.append((command, payload))
@@ -389,3 +396,71 @@ def test_observer_does_not_release_spool_when_record_finalization_fails() -> Non
     assert client.released is False
     assert client.closed is False
     assert "database unavailable" in coordinator.last_error
+
+
+def test_observer_reports_and_preserves_an_unexpected_source_stop() -> None:
+    client = _Client()
+    finalized = []
+    coordinator = SiglentObserverCoordinator(
+        SOURCE,
+        lambda: client,
+        lambda _run, _client: None,
+        lambda run, manifest, _client: finalized.append((run, manifest)),
+        session_id_factory=lambda: SESSION_ID,
+    )
+    coordinator.observe_phase(
+        ExperimentController.RUN_STATE_PREINIT,
+        run_id=RUN_ID,
+        calibration=BINDING,
+    )
+    failure = "Pulse source failure: ValueError: invalid preamble"
+    client.session = replace(
+        client.session,
+        state=CaptureSessionState.STOPPED,
+        stop_reason=failure,
+    )
+    client.stop_reasons.put(failure)
+
+    coordinator.heartbeat()
+    coordinator.observe_phase(ExperimentController.RUN_STATE_STOPPED)
+
+    assert coordinator.current_run is not None
+    assert finalized == []
+    assert client.released is False
+    assert failure in coordinator.last_error
+
+
+class _StatusHandle:
+    def __init__(self) -> None:
+        self.items = {}
+
+    def put_status_item(self, item) -> None:
+        self.items[item.get_code()] = item
+
+    def get_status_item_exists(self, code: int) -> bool:
+        return code in self.items
+
+    def clear_status_item(self, code: int) -> None:
+        self.items.pop(code, None)
+
+
+def test_observer_publishes_coordinator_errors_as_dds_alarms() -> None:
+    coordinator = SiglentObserverCoordinator(
+        SOURCE,
+        lambda: None,
+        lambda _run, _client: None,
+        lambda _run, _manifest, _client: None,
+    )
+    coordinator._record_error("scope capture failed")
+    handle = _StatusHandle()
+    service = object.__new__(SiglentObserverService)
+    service._coordinator = coordinator
+    service._status_lock = threading.Lock()
+    service._subsystem_handle = handle
+    service._published_health = None
+
+    service._publish_status()
+
+    assert handle.items[0].get_message() == "Idle"
+    assert handle.items[100].get_severity() == handle.items[100].STATE_ALARM
+    assert handle.items[100].get_message() == "scope capture failed"
