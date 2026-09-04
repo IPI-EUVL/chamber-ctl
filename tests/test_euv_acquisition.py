@@ -138,7 +138,9 @@ def test_acquisition_status_publishes_live_dose_and_zero_runtime() -> None:
     accumulator = LiveDoseAccumulator(_profile())
     accumulator.accumulated_dose_mj_cm2 = 2.5
     accumulator.transmitting_runtime_seconds = 0.0
+    accumulator.dose_rate_mj_cm2_s = 1.25
     run = _AcquisitionRun(uuid.uuid4(), _profile(), None, None, 192.0, accumulator)
+    run.last_pulse_monotonic = __import__("time").monotonic()
     subsystem = object.__new__(EuvAcquisitionSubsystem)
     subsystem._last_publish = float("-inf")
     subsystem._run_lock = threading.RLock()
@@ -171,11 +173,19 @@ def test_acquisition_status_publishes_live_dose_and_zero_runtime() -> None:
     cadence = decode_live_cadence(subsystem._cadence_publisher.value)
     assert status["accumulated_dose_mj_cm2"] == 2.5
     assert status["transmitting_runtime_seconds"] == 0.0
+    assert status["dose_rate_mj_cm2_s"] == 1.25
+    assert status["dose_rate_window_seconds"] == 0.5
     assert status["pipeline_metrics"]["counters"]["accepted"] == 12
     assert status["configured_source_kind"] == "red_pitaya"
     assert status["configured_source_id"] == "red-pitaya"
     assert cadence.context == "exposure"
     assert cadence.run_id == run.run_id
+
+    run.last_pulse_monotonic = __import__("time").monotonic() - 0.51
+    subsystem._last_publish = float("-inf")
+    subsystem._publish_values()
+
+    assert json.loads(subsystem._status_publisher.value)["dose_rate_mj_cm2_s"] is None
 
 
 def test_completed_diagnostic_retains_transferred_snapshot_summary() -> None:
@@ -1139,6 +1149,150 @@ def test_worker_finalization_error_defers_recovery_without_terminating_the_worke
 
     assert failures and isinstance(failures[0], ValueError)
     assert deferred == [(run, "ValueError: timeline dose regressed")]
+
+
+def test_status_publisher_runs_while_control_worker_is_blocked(monkeypatch, tmp_path) -> None:
+    import threading
+
+    import chamber_ctl.subsystems.euv_acquisition_controller as acquisition_controller
+
+    class _Reader:
+        def close(self) -> None:
+            pass
+
+    class _StopFlag:
+        def __init__(self) -> None:
+            self._stopped = threading.Event()
+
+        def run(self) -> bool:
+            return not self._stopped.is_set()
+
+        def stop(self) -> None:
+            self._stopped.set()
+
+    monkeypatch.setattr(acquisition_controller, "ExperimentReader", lambda *_args: _Reader())
+    subsystem = object.__new__(acquisition_controller.EuvAcquisitionSubsystem)
+    subsystem._data_path = tmp_path
+    control_blocked = threading.Event()
+    release_control = threading.Event()
+    published = threading.Event()
+
+    def block_control_worker() -> None:
+        control_blocked.set()
+        release_control.wait(timeout=2.0)
+
+    subsystem._maintain_capture_connection = block_control_worker
+    subsystem._complete_pending_lifecycle_events = lambda: None
+    subsystem._process_recovery_requests = lambda: None
+    subsystem._process_control_requests = lambda: None
+    subsystem._consume_capture_events = lambda: None
+    subsystem._advance_diagnostic = lambda: None
+    subsystem._advance_finalization = lambda: None
+    subsystem._release_after_stopped = lambda: None
+    subsystem._publish_values = published.set
+    subsystem._handle_worker_failure = pytest.fail
+    stop_flag = _StopFlag()
+    control_thread = threading.Thread(target=subsystem._worker, args=(stop_flag,), daemon=True)
+
+    control_thread.start()
+    assert control_blocked.wait(timeout=1.0)
+    publisher_thread = threading.Thread(target=subsystem._publisher_worker, args=(stop_flag,), daemon=True)
+    publisher_thread.start()
+
+    try:
+        assert published.wait(timeout=0.5)
+    finally:
+        stop_flag.stop()
+        release_control.set()
+        control_thread.join(timeout=1.0)
+        publisher_thread.join(timeout=1.0)
+
+
+def test_status_publisher_uses_cached_health_while_run_state_is_locked() -> None:
+    import threading
+
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem
+
+    class _HealthPublisher:
+        def __init__(self) -> None:
+            self.published = threading.Event()
+            self.payload = None
+
+        @property
+        def value(self):
+            return self.payload
+
+        @value.setter
+        def value(self, payload) -> None:
+            self.payload = payload
+            self.published.set()
+
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._last_publish = float("-inf")
+    subsystem._last_health_payload = b"cached-health"
+    subsystem._run_lock = threading.RLock()
+    subsystem._run = None
+    subsystem._diagnostic = None
+    subsystem._board_status = {}
+    subsystem._deferred_finalization_detail = None
+    subsystem._last_run_id = None
+    subsystem._capture_client = None
+    subsystem._diagnostic_error = None
+    subsystem._last_diagnostic_summary = None
+    subsystem._dose_publisher = None
+    subsystem._cadence_publisher = None
+    subsystem._health_publisher = _HealthPublisher()
+    publisher_thread = threading.Thread(target=subsystem._publish_values, daemon=True)
+
+    subsystem._run_lock.acquire()
+    publisher_thread.start()
+    try:
+        assert subsystem._health_publisher.published.wait(timeout=0.5)
+        assert subsystem._health_publisher.payload == b"cached-health"
+    finally:
+        subsystem._run_lock.release()
+        publisher_thread.join(timeout=1.0)
+
+
+def test_health_publishes_before_auxiliary_telemetry_failure() -> None:
+    import threading
+
+    from chamber_ctl.subsystems.euv_acquisition_controller import EuvAcquisitionSubsystem
+
+    class _FailingPublisher:
+        @property
+        def value(self):
+            return None
+
+        @value.setter
+        def value(self, _payload) -> None:
+            raise RuntimeError("telemetry unavailable")
+
+    class _Publisher:
+        def __init__(self) -> None:
+            self.value = None
+
+    subsystem = object.__new__(EuvAcquisitionSubsystem)
+    subsystem._last_publish = float("-inf")
+    subsystem._run_lock = threading.RLock()
+    subsystem._run = None
+    subsystem._diagnostic = None
+    subsystem._board_status = {}
+    subsystem._deferred_finalization_detail = None
+    subsystem._last_run_id = None
+    subsystem._capture_client = None
+    subsystem._diagnostic_error = None
+    subsystem._last_diagnostic_summary = None
+    subsystem._dose_publisher = _FailingPublisher()
+    subsystem._time_publisher = _Publisher()
+    subsystem._status_publisher = _Publisher()
+    subsystem._health_publisher = _Publisher()
+    subsystem._cadence_publisher = None
+
+    with pytest.raises(RuntimeError, match="telemetry unavailable"):
+        subsystem._publish_values()
+
+    assert subsystem._health_publisher.value == subsystem._last_health_payload
 
 
 def test_deferred_finalization_stops_an_active_capture_before_recovery() -> None:

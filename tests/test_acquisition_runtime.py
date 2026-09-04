@@ -48,6 +48,39 @@ def test_live_accumulator_counts_all_measured_dose_but_only_transmitting_runtime
     assert next_running.accumulated_dose_mj_cm2 == pytest.approx(preinit.pulse_dose_mj_cm2 * 3)
 
 
+def test_live_accumulator_reports_a_500_ms_rolling_dose_rate() -> None:
+    accumulator = LiveDoseAccumulator(_profile())
+    session_id = uuid.uuid4()
+
+    first = accumulator.ingest(_report(session_id, 0, 0))
+    pulse_dose = first.pulse_dose_mj_cm2
+    accumulator.ingest(_report(session_id, 1, 250_000_000))
+    initial_rate = accumulator.ingest(_report(session_id, 2, 500_000_000))
+    responsive_rate = accumulator.ingest(
+        _report(session_id, 3, 750_000_000, integral=0.28)
+    )
+
+    assert first.dose_rate_mj_cm2_s is None
+    assert initial_rate.dose_rate_mj_cm2_s == pytest.approx(4 * pulse_dose)
+    assert responsive_rate.dose_rate_mj_cm2_s == pytest.approx(6 * pulse_dose)
+
+
+def test_live_accumulator_rate_converges_over_a_96_hz_pulse_window() -> None:
+    accumulator = LiveDoseAccumulator(_profile())
+    session_id = uuid.uuid4()
+    updates = [
+        accumulator.ingest(
+            _report(session_id, sequence, round(sequence * 1_000_000_000 / 96))
+        )
+        for sequence in range(49)
+    ]
+
+    assert updates[-1].dose_rate_mj_cm2_s == pytest.approx(
+        updates[0].pulse_dose_mj_cm2 * 96,
+        rel=1e-8,
+    )
+
+
 def test_live_accumulator_pauses_runtime_for_silence_but_preserves_pulse_dose() -> None:
     accumulator = LiveDoseAccumulator(_profile(), maximum_runtime_gap_seconds=0.25)
     session_id = uuid.uuid4()

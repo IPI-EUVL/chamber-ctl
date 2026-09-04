@@ -22,6 +22,7 @@ from chamber_ctl.data.calibration import (
     SourceKey,
     source_configuration_run_tags,
 )
+from chamber_ctl.gui.acquisition import acquisition_dose_rate_metric, acquisition_status_metrics
 from chamber_ctl.gui.sample_motion_gui import draw_sample_stage, build_sample_data, RING_RADII
 from chamber_ctl.gui.source_calibration_editor import (
     calibration_option,
@@ -39,6 +40,8 @@ import chamber_ctl.subsystems.sample_motion as stage_client
 
 
 class ExposureControllerGUI():
+    LIVE_STATUS_UPDATE_MS = 100
+
     def __init__(
         self,
         root,
@@ -121,6 +124,10 @@ class ExposureControllerGUI():
 
         self.__status_dose_value = None
         self.__status_time_value = None
+        self.__live_dose_text = tk.StringVar(value="N/A")
+        self.__live_dose_rate_text = tk.StringVar(value="N/A")
+        self.__live_dose_rate_window_text = tk.StringVar(value="500 ms rolling")
+        self.__live_runtime_text = tk.StringVar(value="Transmitting time: N/A")
         self.__status_control_source_value = None
         self.__live_sources_frame = None
         self.__status_acquisition_value = None
@@ -434,6 +441,17 @@ class ExposureControllerGUI():
             time_value = acquisition_status.get("transmitting_runtime_seconds")
         self.__refresh_observer_live_sources()
         self.__update_live_source_rows(dose_value, time_value)
+        live_status = dict(acquisition_status or {})
+        if dose_value is not None:
+            live_status["accumulated_dose_mj_cm2"] = dose_value
+        if time_value is not None:
+            live_status["transmitting_runtime_seconds"] = time_value
+        dose, runtime = acquisition_status_metrics(live_status)
+        dose_rate, dose_rate_window = acquisition_dose_rate_metric(live_status)
+        self.__live_dose_text.set(dose)
+        self.__live_dose_rate_text.set(dose_rate)
+        self.__live_dose_rate_window_text.set(dose_rate_window)
+        self.__live_runtime_text.set(f"Transmitting time: {runtime}")
 
         if self.__status_acquisition_value is not None:
             self.__status_acquisition_value.config(text=self.__format_acquisition_status())
@@ -511,7 +529,7 @@ class ExposureControllerGUI():
             self.__update_laser_canvas(laser_status)
 
         if self.__root is not None:
-            self.__root.after(250, self.__update_live_status)
+            self.__root.after(self.LIVE_STATUS_UPDATE_MS, self.__update_live_status)
 
     def __get_acquisition_status(self) -> dict | None:
         status_value = self.__acquisition_status_kv.value if self.__acquisition_status_kv is not None else None
@@ -1011,6 +1029,25 @@ class ExposureControllerGUI():
             self.__set_settings_controls_enabled(not should_lock)
 
     def initialize_component(self):
+        live_metrics = ttk.Frame(self.__root, padding=(18, 8))
+        live_metrics.pack(fill=tk.X, padx=10, pady=(0, 2))
+        live_metrics.columnconfigure(0, weight=1, uniform="exposure-live-dose")
+        live_metrics.columnconfigure(2, weight=1, uniform="exposure-live-dose")
+
+        dose_metric = ttk.Frame(live_metrics)
+        dose_metric.grid(row=0, column=0, sticky=tk.EW, padx=(8, 24))
+        ttk.Label(dose_metric, text="LIVE DOSE", font=("TkDefaultFont", 9, "bold")).pack(anchor=tk.W)
+        ttk.Label(dose_metric, textvariable=self.__live_dose_text, font=("TkDefaultFont", 30, "bold")).pack(anchor=tk.W)
+        ttk.Label(dose_metric, textvariable=self.__live_runtime_text).pack(anchor=tk.W, pady=(2, 0))
+
+        ttk.Separator(live_metrics, orient=tk.VERTICAL).grid(row=0, column=1, sticky=tk.NS)
+
+        rate_metric = ttk.Frame(live_metrics)
+        rate_metric.grid(row=0, column=2, sticky=tk.EW, padx=(24, 8))
+        ttk.Label(rate_metric, text="LIVE DOSE RATE", font=("TkDefaultFont", 9, "bold")).pack(anchor=tk.W)
+        ttk.Label(rate_metric, textvariable=self.__live_dose_rate_text, font=("TkDefaultFont", 30, "bold")).pack(anchor=tk.W)
+        ttk.Label(rate_metric, textvariable=self.__live_dose_rate_window_text).pack(anchor=tk.W, pady=(2, 0))
+
         # Main container with two sections: canvas and settings
         main_container = ttk.Frame(self.__root)
         main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
