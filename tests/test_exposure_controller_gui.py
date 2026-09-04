@@ -139,12 +139,17 @@ def test_exposure_status_preserves_zero_runtime_from_acquisition_status() -> Non
 def test_exposure_live_labels_fall_back_to_acquisition_status_metrics() -> None:
     gui = object.__new__(ExposureControllerGUI)
     gui._ExposureControllerGUI__acquisition_status_kv = _Value(
-        b'{"state":"running","accumulated_dose_mj_cm2":2.5,"transmitting_runtime_seconds":0.0}'
+        b'{"state":"running","accumulated_dose_mj_cm2":2.5,"transmitting_runtime_seconds":0.0,'
+        b'"dose_rate_mj_cm2_s":1.25,"dose_rate_window_seconds":0.5}'
     )
     gui._ExposureControllerGUI__dose_kv = _Value(None)
     gui._ExposureControllerGUI__time_kv = _Value(None)
     gui._ExposureControllerGUI__status_dose_value = _Label()
     gui._ExposureControllerGUI__status_time_value = _Label()
+    gui._ExposureControllerGUI__live_dose_text = _Value(None)
+    gui._ExposureControllerGUI__live_dose_rate_text = _Value(None)
+    gui._ExposureControllerGUI__live_dose_rate_window_text = _Value(None)
+    gui._ExposureControllerGUI__live_runtime_text = _Value(None)
     gui._ExposureControllerGUI__status_control_source_value = _Label()
     gui._ExposureControllerGUI__live_sources_frame = None
     gui._ExposureControllerGUI__subsystem = None
@@ -166,6 +171,10 @@ def test_exposure_live_labels_fall_back_to_acquisition_status_metrics() -> None:
 
     assert gui._ExposureControllerGUI__status_dose_value.text == "2.50 mJ/cm²"
     assert gui._ExposureControllerGUI__status_time_value.text == "0.00 s"
+    assert gui._ExposureControllerGUI__live_dose_text.value == "2.50 mJ/cm2"
+    assert gui._ExposureControllerGUI__live_dose_rate_text.value == "1.250 mJ/cm2/s"
+    assert gui._ExposureControllerGUI__live_dose_rate_window_text.value == "500 ms rolling"
+    assert gui._ExposureControllerGUI__live_runtime_text.value == "Transmitting time: 0.00 s"
 
 
 def test_exposure_subscribes_to_source_qualified_observer_live_values() -> None:

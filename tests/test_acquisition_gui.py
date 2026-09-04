@@ -5,6 +5,7 @@ from chamber_ctl.data.acquisition_preview import AcquisitionPreview
 from chamber_ctl.gui.acquisition import (
     AcquisitionPreviewHistory,
     acquisition_control_state,
+    acquisition_dose_rate_metric,
     acquisition_pipeline_status,
     acquisition_status_detail,
     acquisition_status_metrics,
@@ -88,11 +89,22 @@ def test_acquisition_status_formats_live_metrics_and_transferred_snapshots() -> 
         "pending_snapshot_count": 0,
         "accumulated_dose_mj_cm2": 2.5,
         "transmitting_runtime_seconds": 0.0,
+        "dose_rate_mj_cm2_s": 1.23456,
+        "dose_rate_window_seconds": 0.5,
     }
 
     assert acquisition_status_metrics(status) == ("2.50 mJ/cm2", "0.00 s")
+    assert acquisition_dose_rate_metric(status) == ("1.235 mJ/cm2/s", "500 ms rolling")
     assert acquisition_status_detail(status) == (
         "one-shot; 1 pulse report(s); 1 snapshot(s) transferred; 0 pending"
+    )
+
+
+def test_acquisition_dose_rate_rejects_missing_or_invalid_values() -> None:
+    assert acquisition_dose_rate_metric(None) == ("N/A", "500 ms rolling")
+    assert acquisition_dose_rate_metric({"dose_rate_mj_cm2_s": float("nan")}) == (
+        "N/A",
+        "500 ms rolling",
     )
 
 

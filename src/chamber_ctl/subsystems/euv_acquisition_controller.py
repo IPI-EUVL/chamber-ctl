@@ -285,6 +285,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._recovery_requests: queue.Queue = queue.Queue()
         self._deferred_finalization_detail: str | None = None
         self._last_publish = 0.0
+        self._last_health_payload = AcquisitionHealth(False, None, None, None, False, False, False).encode()
         self._last_stop_feedback_monotonic = 0.0
         self._stop_requested = False
         self._timing_status = None
@@ -316,6 +317,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self.register_experiment_settings_type(ExposureSettings)
         self._daemon = Daemon(exception_handler=self._handle_exception)
         self._daemon.add(self._worker)
+        self._daemon.add(self._publisher_worker)
         self._daemon.start()
 
     def _handle_exception(self, exc: Exception) -> None:
@@ -834,7 +836,6 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     self._advance_diagnostic()
                     self._advance_finalization()
                     self._release_after_stopped()
-                    self._publish_values()
                 except Exception as exc:
                     self._handle_worker_failure(exc)
                 time.sleep(0.01)
@@ -842,6 +843,14 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             if self._reader is not None:
                 self._reader.close()
                 self._reader = None
+
+    def _publisher_worker(self, stop_flag: StopFlag) -> None:
+        while stop_flag.run():
+            try:
+                self._publish_values()
+            except Exception as exc:
+                self._handle_worker_failure(exc)
+            time.sleep(0.01)
 
     def _handle_worker_failure(self, exc: Exception) -> None:
         self._handle_exception(exc)
@@ -1824,6 +1833,12 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 dose = run.accumulator.accumulated_dose_mj_cm2
                 runtime = run.accumulator.transmitting_runtime_seconds
                 pulse_age = None if run.last_pulse_monotonic is None else time.monotonic() - run.last_pulse_monotonic
+                dose_rate = (
+                    run.accumulator.dose_rate_mj_cm2_s
+                    if pulse_age is not None
+                    and pulse_age <= run.accumulator.dose_rate_window_ns / 1e9
+                    else None
+                )
                 with self._timing_status_lock:
                     timing = self._timing_status
                 waiting_for_initial_pulse = run.last_pulse_monotonic is None and run.running_started_monotonic is not None and time.monotonic() - run.running_started_monotonic <= 5.0
@@ -1920,20 +1935,33 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             status["configured_source_id"] = source_key.source_id
             status["accumulated_dose_mj_cm2"] = dose
             status["transmitting_runtime_seconds"] = runtime
+            status["dose_rate_mj_cm2_s"] = dose_rate if run is not None else None
+            status["dose_rate_window_seconds"] = (
+                run.accumulator.dose_rate_window_ns / 1e9 if run is not None else 0.5
+            )
             if run is not None:
                 cadence_payload = run.cadence.snapshot().encode(context="exposure", run_id=run.run_id)
             elif diagnostic is not None:
                 cadence_payload = diagnostic.cadence.snapshot().encode(context="diagnostic")
             else:
                 cadence_payload = getattr(self, "_last_cadence_payload", None)
+            health_payload = health.encode()
+            self._last_health_payload = health_payload
+        finally:
+            self._run_lock.release()
+        self._publish_health_payload(health_payload)
         if self._dose_publisher is not None:
             self._dose_publisher.value = dose
             self._time_publisher.value = runtime
             self._status_publisher.value = __import__("json").dumps(status, allow_nan=False, separators=(",", ":")).encode("utf-8")
-            self._health_publisher.value = health.encode()
         cadence_publisher = getattr(self, "_cadence_publisher", None)
         if cadence_publisher is not None and cadence_payload is not None:
             self._publish_cadence_payload(cadence_payload)
+
+    def _publish_health_payload(self, payload: bytes) -> None:
+        health_publisher = self._health_publisher
+        if health_publisher is not None:
+            health_publisher.value = payload
 
     def _publish_cadence_payload(self, payload: bytes) -> None:
         cadence_publisher = getattr(self, "_cadence_publisher", None)
@@ -2114,10 +2142,13 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             return
         if "source_kind" in result and "capabilities" in result:
             self._validate_capture_source(result)
-            self._board_status = dict(result)
+            board_status = dict(result)
         elif "simulator" in result:
-            self._board_status = dict(getattr(self, "_board_status", {}))
-            self._board_status["simulator"] = result["simulator"]
+            board_status = dict(getattr(self, "_board_status", {}))
+            board_status["simulator"] = result["simulator"]
+        else:
+            return
+        self._board_status = board_status
 
     def _validate_capture_source(self, status: object) -> None:
         if not isinstance(status, dict):

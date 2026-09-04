@@ -135,6 +135,31 @@ def acquisition_status_metrics(status: dict | None) -> tuple[str, str]:
     )
 
 
+def acquisition_dose_rate_metric(status: dict | None) -> tuple[str, str]:
+    if not isinstance(status, dict):
+        return "N/A", "500 ms rolling"
+    value = status.get("dose_rate_mj_cm2_s")
+    if isinstance(value, bool):
+        rate = "N/A"
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            rate = "N/A"
+        else:
+            rate = f"{number:.3f} mJ/cm2/s" if math.isfinite(number) and number >= 0 else "N/A"
+    window = status.get("dose_rate_window_seconds")
+    if isinstance(window, bool):
+        return rate, "500 ms rolling"
+    try:
+        window_ms = round(float(window) * 1000)
+    except (TypeError, ValueError):
+        return rate, "500 ms rolling"
+    if not math.isfinite(float(window)) or window_ms <= 0:
+        return rate, "500 ms rolling"
+    return rate, f"{window_ms} ms rolling"
+
+
 def acquisition_pipeline_status(status: dict | None) -> AcquisitionPipelineStatus:
     unavailable = AcquisitionPipelineStatus("N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A")
     if not isinstance(status, dict):
@@ -347,7 +372,9 @@ class AcquisitionGUI:
         self.__state_text = tk.StringVar(value="Acquisition: unavailable")
         self.__source_text = tk.StringVar(value="Source: unavailable")
         self.__detail_text = tk.StringVar(value="Waiting for acquisition status.")
-        self.__dose_text = tk.StringVar(value="Dose: N/A")
+        self.__dose_text = tk.StringVar(value="N/A")
+        self.__dose_rate_text = tk.StringVar(value="N/A")
+        self.__dose_rate_window_text = tk.StringVar(value="500 ms rolling")
         self.__runtime_text = tk.StringVar(value="Transmitting time: N/A")
         self.__pipeline_mode_text = tk.StringVar(value="Mode: N/A")
         self.__pipeline_worker_text = tk.StringVar(value="Worker: N/A")
@@ -397,13 +424,27 @@ class AcquisitionGUI:
         ttk.Label(status, textvariable=self.__detail_text).grid(row=1, column=1, sticky="w")
         ttk.Label(status, textvariable=self.__connection_text).grid(row=0, column=2, sticky="e")
         ttk.Label(status, textvariable=self.__source_text).grid(row=1, column=2, sticky="e")
-        metrics = ttk.Frame(status)
-        metrics.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(3, 0))
-        ttk.Label(metrics, textvariable=self.__dose_text).pack(side=tk.LEFT, padx=(0, 18))
-        ttk.Label(metrics, textvariable=self.__runtime_text).pack(side=tk.LEFT)
+        metrics = ttk.Frame(status, padding=(0, 8))
+        metrics.grid(row=2, column=0, columnspan=3, sticky="ew")
+        metrics.columnconfigure(0, weight=1, uniform="live-dose")
+        metrics.columnconfigure(2, weight=1, uniform="live-dose")
+
+        dose_metric = ttk.Frame(metrics)
+        dose_metric.grid(row=0, column=0, sticky="ew", padx=(8, 24))
+        ttk.Label(dose_metric, text="LIVE DOSE", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W)
+        ttk.Label(dose_metric, textvariable=self.__dose_text, font=("Segoe UI", 30, "bold")).pack(anchor=tk.W)
+        ttk.Label(dose_metric, textvariable=self.__runtime_text).pack(anchor=tk.W, pady=(2, 0))
+
+        ttk.Separator(metrics, orient=tk.VERTICAL).grid(row=0, column=1, sticky="ns")
+
+        rate_metric = ttk.Frame(metrics)
+        rate_metric.grid(row=0, column=2, sticky="ew", padx=(24, 8))
+        ttk.Label(rate_metric, text="LIVE DOSE RATE", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W)
+        ttk.Label(rate_metric, textvariable=self.__dose_rate_text, font=("Segoe UI", 30, "bold")).pack(anchor=tk.W)
+        ttk.Label(rate_metric, textvariable=self.__dose_rate_window_text).pack(anchor=tk.W, pady=(2, 0))
 
         pipeline = ttk.LabelFrame(status, text="Pipeline", padding=(6, 3))
-        pipeline.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(4, 0))
+        pipeline.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         pipeline.columnconfigure(2, weight=1)
         ttk.Label(pipeline, textvariable=self.__pipeline_mode_text).grid(row=0, column=0, sticky="w", padx=(0, 16))
         ttk.Label(pipeline, textvariable=self.__pipeline_worker_text).grid(row=0, column=1, sticky="w", padx=(0, 16))
@@ -869,7 +910,10 @@ class AcquisitionGUI:
         self.__source_text.set(f"Source: {source_kind}" + (f" / {source_id}" if source_id else ""))
         self.__detail_text.set(acquisition_status_detail(status))
         dose, runtime = acquisition_status_metrics(status)
-        self.__dose_text.set(f"Dose: {dose}")
+        dose_rate, dose_rate_window = acquisition_dose_rate_metric(status)
+        self.__dose_text.set(dose)
+        self.__dose_rate_text.set(dose_rate)
+        self.__dose_rate_window_text.set(dose_rate_window)
         self.__runtime_text.set(f"Transmitting time: {runtime}")
         pipeline = acquisition_pipeline_status(status)
         self.__pipeline_mode_text.set(f"Mode: {pipeline.mode}")
