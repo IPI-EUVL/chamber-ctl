@@ -273,6 +273,6 @@ def test_timing_queue_rejects_old_session_and_reports_overflow(monkeypatch):
     assert observed == []
     owner._timing_observations = queue.Queue(maxsize=1)
     owner._on_timing_status(owner._timing_status.encode())
-    owner._on_timing_status(owner._timing_status.encode())
+    owner._on_timing_status(LaserTimingState(False, False, True, False, 10.0, 0.0, 10.0, 190.0).encode())
     with pytest.raises(RuntimeError, match="timing observation queue overflowed"):
         owner._consume_timing_observations()

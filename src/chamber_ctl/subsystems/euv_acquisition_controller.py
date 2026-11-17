@@ -214,6 +214,8 @@ class _AcquisitionRun:
     timing_initial_emitted: bool = False
     timing_stream_closed: bool = False
     last_timing_status: LaserTimingState | None = None
+    timing_observation_fault: tuple[uuid.UUID | None, str] | None = None
+    timing_observations_frozen: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,6 +242,7 @@ class _DiagnosticCapture:
     stop_reason: str | None = None
     terminal_error: str | None = None
     completion_handles: list[object] = field(default_factory=list)
+    timing_observation_fault: tuple[uuid.UUID | None, str] | None = None
     next_cleanup_attempt_monotonic: float = 0.0
 
 
@@ -511,29 +514,75 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             status = LaserTimingState.decode(payload)
         except ValueError:
             return
+        # Never acquire _run_lock here: DDS also carries outgoing health and
+        # stop requests while the worker is importing or finalizing artifacts.
         with self._timing_status_lock:
             self._timing_status = status
             self._timing_status_received_at = time.monotonic()
-        # DDS callbacks also pump outgoing health messages. Never wait here for
-        # snapshot I/O holding _run_lock; preserve observations for the worker.
-        run = getattr(self, "_run", None)
-        diagnostic = getattr(self, "_diagnostic", None)
-        if run is None and diagnostic is None:
-            return
-        observations = getattr(self, "_timing_observations", None)
-        if observations is None:
-            observations = self._timing_observations = queue.Queue(maxsize=1024)
-        try:
-            observations.put_nowait((run, getattr(run, "session_id", None), diagnostic, status))
-        except queue.Full:
-            self._timing_observation_error = "Laser timing observation queue overflowed."
+            run = getattr(self, "_run", None)
+            diagnostic = getattr(self, "_diagnostic", None)
+            if run is not None and (
+                getattr(run, "timing_observations_frozen", False)
+                or getattr(run, "timing_stream_closed", False)
+                or getattr(run, "release_pending", False)
+            ):
+                run = None
+            if run is None and diagnostic is None:
+                self._last_timing_observation_key = None
+                return
+            session_id = getattr(run, "session_id", None)
+            key = (
+                id(run), session_id, id(diagnostic), getattr(diagnostic, "session_id", None),
+                status.triggers_enabled, status.euv_transmitting(),
+                status.trigger_rate_hz if diagnostic is not None else None,
+                status.sampled_at_unix_ns is not None and status.sampled_at_monotonic_ns is not None,
+            )
+            if key == getattr(self, "_last_timing_observation_key", None):
+                return
+            observations = getattr(self, "_timing_observations", None)
+            if observations is None:
+                observations = self._timing_observations = queue.Queue(maxsize=1024)
+            try:
+                observations.put_nowait((run, session_id, diagnostic, status))
+            except queue.Full:
+                error = "Laser timing observation queue overflowed; timing history is incomplete."
+                self._timing_observation_error = error
+                if run is not None:
+                    run.timing_observation_fault = (session_id, error)
+                if diagnostic is not None:
+                    diagnostic.timing_observation_fault = (diagnostic.session_id, error)
+            self._last_timing_observation_key = key
 
-    def _consume_timing_observations(self) -> None:
-        error = getattr(self, "_timing_observation_error", None)
+    @staticmethod
+    def _raise_timing_observation_fault(owner) -> None:
+        fault = getattr(owner, "timing_observation_fault", None)
+        if fault is not None and fault[0] == owner.session_id:
+            raise RuntimeError(fault[1])
+
+    def _consume_timing_observations(self, *, raise_on_error: bool = True) -> None:
+        if not hasattr(self, "_timing_status_lock"):
+            self._timing_status_lock = threading.Lock()
+        with self._timing_status_lock:
+            error = getattr(self, "_timing_observation_error", None)
+            observations = getattr(self, "_timing_observations", None)
+            if error is not None:
+                # Detach before reporting failure. The callback must never keep
+                # filling the failed queue while deferred-stop RPCs are running.
+                self._timing_observations = queue.Queue(
+                    maxsize=1024 if observations is None else observations.maxsize,
+                )
+                self._timing_observation_error = None
+                self._last_timing_observation_key = None
+                observations = None
         if error is not None:
-            self._timing_observation_error = None
-            raise RuntimeError(error)
-        observations = getattr(self, "_timing_observations", None)
+            self._log(error, level="ERROR", event="timing_observation_overflow")
+        if raise_on_error:
+            run = getattr(self, "_run", None)
+            diagnostic = getattr(self, "_diagnostic", None)
+            if run is not None:
+                self._raise_timing_observation_fault(run)
+            if diagnostic is not None and diagnostic.state != "error":
+                self._raise_timing_observation_fault(diagnostic)
         if observations is None:
             return
         # Bound each drain even if another producer is continuously publishing.
@@ -647,8 +696,16 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             self._record_timing_state(run, status)
 
     def _close_timing_event_stream(self, run: _AcquisitionRun, *, outcome: str) -> bool:
-        self._consume_timing_observations()
+        if not hasattr(self, "_timing_status_lock"):
+            self._timing_status_lock = threading.Lock()
+        with self._timing_status_lock:
+            # Freeze input while still recording all queued state transitions.
+            run.timing_observations_frozen = True
+        self._consume_timing_observations(raise_on_error=outcome != "ABORTED")
+        if outcome != "ABORTED":
+            self._raise_timing_observation_fault(run)
         if run.timing_stream is None or run.timing_stream_closed:
+            run.timing_stream_closed = True
             return True
         timestamp_ns = time.time_ns()
         self._run_event_emitter.emit(
@@ -1736,6 +1793,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     self._set_finalization_status(run, "reconciling snapshots", "Waiting for transferred artifacts to become available.")
                     return
                 self._set_finalization_status(run, "preparing dose analysis", "Recalculating the final dose analysis before exposure finalization.")
+                self._raise_timing_observation_fault(run)
+                timing_stream_delivered = self._close_timing_event_stream(run, outcome="STOPPED")
                 record = self._get_record(run.run_id)
                 result = analyze_experiment_entry(
                     run.run_id,
@@ -1743,13 +1802,14 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     runtime_seconds=run.accumulator.transmitting_runtime_seconds,
                 )
                 self._set_finalization_status(run, "promoting dose analysis", "Writing final dose and runtime tags.")
+                self._raise_timing_observation_fault(run)
                 self._promote_final_analysis(run, result)
             except Exception as exc:
                 self._defer_finalization(run, f"{type(exc).__name__}: {exc}")
                 return
             run.finalizing = False
             run.release_pending = True
-            if self._close_timing_event_stream(run, outcome="STOPPED"):
+            if timing_stream_delivered:
                 self._ensure_persisted_exposure_graph(run.run_id, record.get_record(), context="final dose promotion")
             self._on_did_stop(b"EUV pulse reports and snapshots reconciled; final dose tags were promoted.")
 
@@ -1792,7 +1852,13 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     run_id=str(run.run_id),
                 )
         self._run = None
-        self._close_timing_event_stream(run, outcome="ABORTED")
+        try:
+            self._close_timing_event_stream(run, outcome="ABORTED")
+        except Exception as close_exc:
+            self._log(
+                f"Timing stream cleanup failed after {detail}: {type(close_exc).__name__}: {close_exc}",
+                level="ERROR", event="acquisition_deferred_timing_close_failed", run_id=str(run.run_id),
+            )
         self._on_did_stop(
             b"Acquisition finalization deferred; digitizer artifacts remain retained for explicit recovery."
         )

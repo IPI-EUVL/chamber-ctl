@@ -161,3 +161,19 @@ bounded indexed cadence calculations. Full recovery inventories and final dose
 analysis remain available. Validate with a long 95 Hz diagnostic/exposure after
 updating both the board package and process-computer code; local regression and
 benchmark results do not replace hardware validation.
+
+### Timing observation queue recovery
+
+The timing archive queue retains trigger/transmission changes rather than every
+periodic status heartbeat; latest timing health still refreshes on every message.
+Exposure frequency readback jitter does not create redundant archive entries.
+The first producer timestamp of each retained transition is preserved.
+
+A real overflow marks that run's timing history incomplete, detaches the failed
+queue, and requests a stop. Deferred finalization retains the digitizer spool and
+acknowledges the stop even if best-effort stream cleanup also fails. Timing intake
+is sealed and checked before final dose promotion or permission to release data.
+This addresses the 2026-11-17 incident in which 31 consecutive snapshot imports
+occupied the worker for 131 seconds and overflowed its 1,024-entry timing queue.
+All 174,452 accepted pulse records were persisted in that incident, but the run
+required explicit recovery rather than being treated as successfully finalized.
