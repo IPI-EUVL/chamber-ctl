@@ -92,6 +92,12 @@ def test_laser_enqueues_close_for_pulse_loss_and_stale_health() -> None:
     subsystem._LaserSyncSubsystem__interlock_closed = False
     subsystem._LaserSyncSubsystem__interlock_close_pending = False
     subsystem._LaserSyncSubsystem__interlock_reopen_pending = False
+    subsystem._LaserSyncSubsystem__interlock_alarm_context = None
+    subsystem._LaserSyncSubsystem__interlock_alarm_state = None
+    subsystem._LaserSyncSubsystem__interlock_alarm_error = None
+    subsystem._LaserSyncSubsystem__subsystem = None
+    subsystem._LaserSyncSubsystem__status_item_cache = {}
+    subsystem._LaserSyncSubsystem__logger = _Logger()
     subsystem._LaserSyncSubsystem__enqueue_setter_job = lambda name: jobs.append(name)
 
     subsystem._LaserSyncSubsystem__update_acquisition_interlock()

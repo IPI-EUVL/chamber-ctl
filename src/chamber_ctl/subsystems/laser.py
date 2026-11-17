@@ -303,6 +303,9 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__interlock_closed = False
         self.__interlock_close_pending = False
         self.__interlock_reopen_pending = False
+        self.__interlock_alarm_context = None
+        self.__interlock_alarm_state = None
+        self.__interlock_alarm_error = None
 
         self.__setter_queue = queue.Queue()
 
@@ -603,7 +606,10 @@ class LaserSyncSubsystem(ExperimentClient):
         laser_warming = self.__sync.get_laser_warming_up()
         chopper_starting = provider_status.chopper_starting_up if provider_status is not None else self.__sync.get_chopper_starting_up()
 
-        if laser_warming:
+        self.__update_interlock_alarm_status()
+        if self.__interlock_alarm_context is not None:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Acquisition interlock active")
+        elif laser_warming:
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Warming up")
         elif chopper_starting:
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Starting")
@@ -1044,49 +1050,107 @@ class LaserSyncSubsystem(ExperimentClient):
 
         handle.ret(OP_OK + b": " + status)
 
+    def __update_interlock_alarm_status(self):
+        context = self.__interlock_alarm_context
+        if context is None:
+            self.__clear_status_item_if_exists(105)
+            return
+        state = self.__interlock_alarm_state
+        action = {
+            "close_pending": "sample closure pending",
+            "closed": "sample closed; operator recovery required",
+            "close_failed": "sample closure FAILED",
+            "reopen_pending": "authorized sample reopening pending",
+            "reopen_failed": "sample reopening FAILED; sample remains interlocked",
+        }.get(state, "active")
+        message = f"Acquisition interlock: {action}. {context['reason']}"
+        details = []
+        if context["last_pulse_age_seconds"] is not None:
+            details.append(f"last pulse {context['last_pulse_age_seconds']:.3f} s ago")
+        if context["last_sequence"] is not None:
+            details.append(f"sequence {context['last_sequence']}")
+        if context["session_id"] is not None:
+            details.append(f"session {context['session_id'][:8]}")
+        if details:
+            message += " (" + "; ".join(details) + ")"
+        if self.__interlock_alarm_error is not None:
+            message += f" Provider error: {self.__interlock_alarm_error}"
+        self.__put_status_item_if_changed(105, StatusItem.STATE_ALARM, message)
+
+    def __reset_interlock_alarm(self):
+        self.__interlock_alarm_context = None
+        self.__interlock_alarm_state = None
+        self.__interlock_alarm_error = None
+        self.__clear_status_item_if_exists(105)
+
+    def __interlock_log(self, message: str, *, event: str, level: str, context=None, **data):
+        # Keep the triggering observation, even if newer healthy data has arrived.
+        context = self.__interlock_alarm_context if context is None else context
+        self.__logger.log(
+            message, level=level, l_type="CTRL", subsystem="Laser Sync Controller",
+            event=event, **(context or {}), **data,
+        )
+
     def __execute_interlock_close(self):
         try:
             ok, status = self.__sync.set_target_phase(self.__preinit_phase)
             if ok:
                 self.__interlock_closed = True
-                self.__logger.log(
+                self.__interlock_alarm_state = "closed"
+                self.__interlock_alarm_error = None
+                self.__interlock_log(
                     "Acquisition interlock closed the sample.",
-                    level="WARNING",
-                    l_type="CTRL",
-                    subsystem="Laser Sync Controller",
-                    event="acquisition_interlock_close",
+                    level="ERROR", event="acquisition_interlock_close",
                 )
             else:
-                self.__logger.log(
-                    f"Acquisition interlock could not close the sample: {status}",
-                    level="ERROR",
-                    l_type="CTRL",
-                    subsystem="Laser Sync Controller",
+                self.__interlock_alarm_state = "close_failed"
+                self.__interlock_alarm_error = self.__to_bytes(status).decode("utf-8", errors="replace")
+                self.__interlock_log(
+                    f"Acquisition interlock could not close the sample: {self.__interlock_alarm_error}",
+                    level="ERROR", event="acquisition_interlock_close_failed",
+                    provider_error=self.__interlock_alarm_error,
                 )
+        except Exception as exc:
+            self.__interlock_alarm_state = "close_failed"
+            self.__interlock_alarm_error = f"{type(exc).__name__}: {exc}"
+            self.__interlock_log(
+                f"Acquisition interlock could not close the sample: {self.__interlock_alarm_error}",
+                level="ERROR", event="acquisition_interlock_close_failed",
+                provider_error=self.__interlock_alarm_error,
+            )
         finally:
             self.__interlock_close_pending = False
+            self.__update_interlock_alarm_status()
 
     def __execute_interlock_reopen(self):
         try:
             ok, status = self.__sync.set_target_phase(self.__target_phase)
             if ok:
                 self.__interlock_closed = False
-                self.__logger.log(
+                self.__interlock_log(
                     "Acquisition interlock reopened the sample after target motion resumed.",
-                    level="INFO",
-                    l_type="CTRL",
-                    subsystem="Laser Sync Controller",
-                    event="acquisition_interlock_reopen",
+                    level="INFO", event="acquisition_interlock_reopen",
                 )
+                self.__reset_interlock_alarm()
             else:
-                self.__logger.log(
-                    f"Acquisition interlock could not reopen the sample: {status}",
-                    level="ERROR",
-                    l_type="CTRL",
-                    subsystem="Laser Sync Controller",
+                self.__interlock_alarm_state = "reopen_failed"
+                self.__interlock_alarm_error = self.__to_bytes(status).decode("utf-8", errors="replace")
+                self.__interlock_log(
+                    f"Acquisition interlock could not reopen the sample: {self.__interlock_alarm_error}",
+                    level="ERROR", event="acquisition_interlock_reopen_failed",
+                    provider_error=self.__interlock_alarm_error,
                 )
+        except Exception as exc:
+            self.__interlock_alarm_state = "reopen_failed"
+            self.__interlock_alarm_error = f"{type(exc).__name__}: {exc}"
+            self.__interlock_log(
+                f"Acquisition interlock could not reopen the sample: {self.__interlock_alarm_error}",
+                level="ERROR", event="acquisition_interlock_reopen_failed",
+                provider_error=self.__interlock_alarm_error,
+            )
         finally:
             self.__interlock_reopen_pending = False
+            self.__update_interlock_alarm_status()
 
     def __phase_at(self, phase: float) -> bool:
         return abs(self.__sync.get_current_phase() - phase) <= self.PHASE_EPSILON
@@ -1125,6 +1189,7 @@ class LaserSyncSubsystem(ExperimentClient):
                     self._on_did_stop(b"Laser disabled.")
                     self.__stop_handle = None
                     self.__experiment_active = False
+                    self.__reset_interlock_alarm()
 
             if self.__test_preinit_handle is not None and not self.__test_preinit_setup_pending:
                 if not self.__sync.get_laser_on() and self.__sync.get_chopper_on():
@@ -1226,8 +1291,29 @@ class LaserSyncSubsystem(ExperimentClient):
         )
         if stale or (health is not None and health.pulse_loss):
             if not self.__interlock_closed and not self.__interlock_close_pending:
+                if self.__interlock_alarm_context is None:
+                    health_age = time.monotonic() - self.__acquisition_health_received_at
+                    self.__interlock_alarm_context = {
+                        "reason_code": "stale_health" if stale else "pulse_loss",
+                        "reason": (
+                            f"Acquisition health is stale ({health_age:.3f} s without an update)."
+                            if stale else (health.reason or "Pulse reports stopped while triggers were expected.")
+                        ),
+                        "health_age_seconds": health_age,
+                        "last_pulse_age_seconds": None if health is None else health.last_pulse_age_seconds,
+                        "last_sequence": None if health is None else health.last_sequence,
+                        "session_id": None if health is None or health.session_id is None else str(health.session_id),
+                        "capture_active": None if health is None else health.capture_active,
+                    }
+                if self.__interlock_alarm_state != "close_failed":
+                    self.__interlock_alarm_state = "close_pending"
                 self.__interlock_close_pending = True
                 self.__enqueue_setter_job("interlock_close")
+                self.__update_interlock_alarm_status()
+                self.__interlock_log(
+                    "Acquisition interlock requested sample closure.",
+                    event="acquisition_interlock_close_requested", level="ERROR",
+                )
             return
         if (
             health is not None
@@ -1237,8 +1323,15 @@ class LaserSyncSubsystem(ExperimentClient):
             and self.__target_motion_is_running()
             and not self.__interlock_reopen_pending
         ):
+            if self.__interlock_alarm_state != "reopen_failed":
+                self.__interlock_alarm_state = "reopen_pending"
             self.__interlock_reopen_pending = True
             self.__enqueue_setter_job("interlock_reopen")
+            self.__update_interlock_alarm_status()
+            self.__interlock_log(
+                "Acquisition interlock requested reopening after authorized recovery.",
+                event="acquisition_interlock_reopen_requested", level="INFO",
+            )
 
     def _on_preinit(self, handle):
         self.__experiment_active = True
@@ -1246,6 +1339,7 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__interlock_closed = False
         self.__interlock_close_pending = False
         self.__interlock_reopen_pending = False
+        self.__reset_interlock_alarm()
         self.__preinit_handle = handle
         self.__preinit_setup_pending = True
         self.__enqueue_setter_job("exp_preinit")

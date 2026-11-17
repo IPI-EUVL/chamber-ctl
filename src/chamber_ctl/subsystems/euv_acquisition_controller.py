@@ -201,6 +201,7 @@ class _AcquisitionRun:
     last_sequence: int | None = None
     consecutive_timed_pulses: int = 0
     pulse_loss_active: bool = False
+    receipt_loss_active: bool = False
     recovery_ready: bool = False
     resume_authorized: bool = False
     report_totals: dict[int, tuple[float, float]] = field(default_factory=dict)
@@ -240,6 +241,16 @@ class _DiagnosticCapture:
     terminal_error: str | None = None
     completion_handles: list[object] = field(default_factory=list)
     next_cleanup_attempt_monotonic: float = 0.0
+
+
+@dataclass(frozen=True)
+class _ReportHealthContext:
+    run: _AcquisitionRun
+    session_id: uuid.UUID | None
+    pulse_expected: bool
+    startup_grace_deadline: float | None
+    health: AcquisitionHealth
+    requires_transmission: bool = False
 
 
 class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
@@ -286,11 +297,15 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._deferred_finalization_detail: str | None = None
         self._last_publish = 0.0
         self._last_health_payload = AcquisitionHealth(False, None, None, None, False, False, False).encode()
+        self._last_health_context: _ReportHealthContext | None = None
+        self._pending_health_loss: tuple[_AcquisitionRun, uuid.UUID | None] | None = None
         self._last_stop_feedback_monotonic = 0.0
         self._stop_requested = False
         self._timing_status = None
         self._timing_status_received_at = 0.0
         self._timing_status_lock = threading.Lock()
+        self._timing_observations: queue.Queue = queue.Queue(maxsize=1024)
+        self._timing_observation_error: str | None = None
         self._subsystem = None
         self._dose_publisher = None
         self._time_publisher = None
@@ -498,24 +513,49 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         with self._timing_status_lock:
             self._timing_status = status
             self._timing_status_received_at = time.monotonic()
-        run_lock = getattr(self, "_run_lock", None)
-        if run_lock is None:
+        # DDS callbacks also pump outgoing health messages. Never wait here for
+        # snapshot I/O holding _run_lock; preserve observations for the worker.
+        run = getattr(self, "_run", None)
+        diagnostic = getattr(self, "_diagnostic", None)
+        if run is None and diagnostic is None:
             return
-        with run_lock:
-            run = getattr(self, "_run", None)
-            diagnostic = getattr(self, "_diagnostic", None)
-            if run is not None:
-                run.cadence.set_expected_rate(
-                    run.chopper_frequency_hz / 2.0
-                    if status.triggers_enabled and not run.finalizing and not run.release_pending
-                    else None
-                )
-            if diagnostic is not None:
-                diagnostic.cadence.set_expected_rate(
-                    status.trigger_rate_hz if diagnostic.state == "running" else None
-                )
-            if run is not None and run.timing_stream is not None and not run.timing_stream_closed:
-                self._record_timing_state(run, status)
+        observations = getattr(self, "_timing_observations", None)
+        if observations is None:
+            observations = self._timing_observations = queue.Queue(maxsize=1024)
+        try:
+            observations.put_nowait((run, getattr(run, "session_id", None), diagnostic, status))
+        except queue.Full:
+            self._timing_observation_error = "Laser timing observation queue overflowed."
+
+    def _consume_timing_observations(self) -> None:
+        error = getattr(self, "_timing_observation_error", None)
+        if error is not None:
+            self._timing_observation_error = None
+            raise RuntimeError(error)
+        observations = getattr(self, "_timing_observations", None)
+        if observations is None:
+            return
+        # Bound each drain even if another producer is continuously publishing.
+        for _ in range(1024):
+            try:
+                observed_run, observed_session, observed_diagnostic, status = observations.get_nowait()
+            except queue.Empty:
+                break
+            with self._run_lock:
+                run = self._run
+                diagnostic = getattr(self, "_diagnostic", None)
+                if run is not None and run is observed_run and run.session_id == observed_session:
+                    run.cadence.set_expected_rate(
+                        run.chopper_frequency_hz / 2.0
+                        if status.triggers_enabled and not run.finalizing and not run.release_pending
+                        else None
+                    )
+                    if getattr(run, "timing_stream", None) is not None and not run.timing_stream_closed:
+                        self._record_timing_state(run, status)
+                if diagnostic is not None and diagnostic is observed_diagnostic:
+                    diagnostic.cadence.set_expected_rate(
+                        status.trigger_rate_hz if diagnostic.state == "running" else None
+                    )
 
     def _emit_timing_event(
         self,
@@ -606,6 +646,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             self._record_timing_state(run, status)
 
     def _close_timing_event_stream(self, run: _AcquisitionRun, *, outcome: str) -> bool:
+        self._consume_timing_observations()
         if run.timing_stream is None or run.timing_stream_closed:
             return True
         timestamp_ns = time.time_ns()
@@ -832,6 +873,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     self._complete_pending_lifecycle_events()
                     self._process_recovery_requests()
                     self._process_control_requests()
+                    self._consume_timing_observations()
                     self._consume_capture_events()
                     self._advance_diagnostic()
                     self._advance_finalization()
@@ -1792,15 +1834,87 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             runtime_seconds=result.runtime_seconds,
         )
 
+    def _report_receipt(self, session_id: uuid.UUID | None, now: float):
+        capture_client = self._capture_client
+        getter = getattr(capture_client, "get_report_activity", None)
+        activity = None if session_id is None or getter is None else getter(session_id)
+        if activity is None or activity.session_id != session_id:
+            return None, None
+        return activity, max(0.0, now - activity.received_at_monotonic)
+
+    @staticmethod
+    def _receipt_is_missing(context: _ReportHealthContext, receipt_age: float | None, now: float) -> bool:
+        return (
+            context.pulse_expected
+            and (context.startup_grace_deadline is None or now > context.startup_grace_deadline)
+            and (receipt_age is None or receipt_age > 0.25)
+        )
+
+    @staticmethod
+    def _latch_report_loss(run: _AcquisitionRun) -> None:
+        if not run.receipt_loss_active:
+            run.consecutive_timed_pulses = 0
+        run.receipt_loss_active = True
+        run.pulse_loss_active = True
+        run.recovery_ready = False
+        run.resume_authorized = False
+
+    def _publish_cached_health(self) -> None:
+        context = getattr(self, "_last_health_context", None)
+        if context is None:
+            self._publish_health_payload(self._last_health_payload)
+            return
+        if self._run is not context.run or context.run.session_id != context.session_id:
+            # Never carry a previous exposure's alarm or recovery authorization
+            # into another run while its state lock is temporarily unavailable.
+            self._publish_health_payload(AcquisitionHealth(False, None, None, None, False, False, False).encode())
+            return
+        now = time.monotonic()
+        _activity, receipt_age = self._report_receipt(context.session_id, now)
+        with self._timing_status_lock:
+            timing = self._timing_status
+        timing_expected = timing is not None and (
+            timing.euv_transmitting() if context.requires_transmission else timing.triggers_enabled
+        )
+        still_expected = (
+            timing_expected
+            and context.run.accumulator.running
+            and not context.run.finalizing
+            and not context.run.release_pending
+        )
+        missing = still_expected and self._receipt_is_missing(context, receipt_age, now)
+        if missing:
+            self._pending_health_loss = (context.run, context.session_id)
+        pending_loss = getattr(self, "_pending_health_loss", None)
+        pending = (
+            pending_loss is not None
+            and pending_loss[0] is context.run
+            and pending_loss[1] == context.session_id
+        )
+        health = context.health
+        self._publish_health_payload(AcquisitionHealth(
+            capture_active=health.capture_active,
+            session_id=health.session_id,
+            last_sequence=health.last_sequence,
+            last_pulse_age_seconds=receipt_age,
+            pulse_loss=missing or pending,
+            recovery_ready=health.recovery_ready and not pending,
+            resume_authorized=health.resume_authorized and not pending,
+            reason="Pulse reports stopped arriving while laser timing expected triggers." if missing or pending else None,
+        ).encode())
+
     def _publish_values(self) -> None:
         if time.monotonic() - self._last_publish < self.STATUS_UPDATE_SECONDS:
             return
         self._last_publish = time.monotonic()
         if not self._run_lock.acquire(blocking=False):
-            self._publish_health_payload(self._last_health_payload)
+            self._publish_cached_health()
             return
         try:
             run = self._run
+            health_context = None
+            if run is None:
+                self._pending_health_loss = None
             diagnostic = self._diagnostic
             board_status = dict(self._board_status)
             capabilities = board_status.get("capabilities")
@@ -1845,18 +1959,29 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 )
                 with self._timing_status_lock:
                     timing = self._timing_status
-                waiting_for_initial_pulse = run.last_pulse_monotonic is None and run.running_started_monotonic is not None and time.monotonic() - run.running_started_monotonic <= 5.0
-                pulse_loss = (
-                    run.accumulator.running
-                    and timing is not None
-                    and timing.triggers_enabled
-                    and not waiting_for_initial_pulse
-                    and (pulse_age is None or pulse_age > 0.25)
+                startup_grace_deadline = (
+                    run.running_started_monotonic + 5.0
+                    if run.last_pulse_monotonic is None and run.running_started_monotonic is not None
+                    else None
                 )
-                if pulse_loss:
-                    run.pulse_loss_active = True
-                    run.recovery_ready = False
-                    run.resume_authorized = False
+                pulse_expected = run.accumulator.running and timing is not None and timing.triggers_enabled
+                activity, receipt_age = self._report_receipt(run.session_id, time.monotonic())
+                pulse_loss = (
+                    pulse_expected
+                    and (startup_grace_deadline is None or time.monotonic() > startup_grace_deadline)
+                    and (receipt_age is None or receipt_age > 0.25)
+                )
+                pending_loss = getattr(self, "_pending_health_loss", None)
+                pending_for_session = (
+                    pending_loss is not None
+                    and pending_loss[0] is run
+                    and pending_loss[1] == run.session_id
+                )
+                if pulse_loss or pending_for_session:
+                    self._latch_report_loss(run)
+                self._pending_health_loss = None
+                if not pulse_loss:
+                    run.receipt_loss_active = False
                 status = {
                     "state": "finalizing" if run.finalizing or run.release_pending else "running",
                     "run_id": str(run.run_id),
@@ -1872,6 +1997,9 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     "clipped_pulse_count": run.clipped_pulse_count,
                     "last_pulse_clipped": run.last_pulse_clipped,
                     "last_pulse_age_seconds": pulse_age,
+                    "last_report_received_age_seconds": receipt_age,
+                    "last_received_sequence": None if activity is None else activity.sequence,
+                    "pulse_loss_latched": run.pulse_loss_active,
                     "pulse_loss": pulse_loss,
                     "recovery_ready": run.recovery_ready,
                     "resume_authorized": run.resume_authorized,
@@ -1885,11 +2013,15 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     capture_active=self._capture_client is not None,
                     session_id=run.session_id,
                     last_sequence=run.last_sequence,
-                    last_pulse_age_seconds=pulse_age,
+                    last_pulse_age_seconds=receipt_age,
                     pulse_loss=pulse_loss,
                     recovery_ready=run.recovery_ready,
                     resume_authorized=run.resume_authorized,
-                    reason="Pulse reports stopped while laser timing expected triggers." if pulse_loss else None,
+                    reason="Pulse reports stopped arriving while laser timing expected triggers." if pulse_loss else None,
+                )
+                health_context = _ReportHealthContext(
+                    run, run.session_id, pulse_expected, startup_grace_deadline, health,
+                    requires_transmission=False,
                 )
             else:
                 self._refresh_cadence_rate(diagnostic=diagnostic)
@@ -1951,6 +2083,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                 cadence_payload = getattr(self, "_last_cadence_payload", None)
             health_payload = health.encode()
             self._last_health_payload = health_payload
+            self._last_health_context = health_context
         finally:
             self._run_lock.release()
         self._publish_health_payload(health_payload)
