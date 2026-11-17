@@ -292,6 +292,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         self._board_status: dict = {}
         self._reader: ExperimentReader | None = None
         self._preinit_pending = False
+        self._pending_preinit = None
         self._start_pending = False
         self._recovery_requests: queue.Queue = queue.Queue()
         self._deferred_finalization_detail: str | None = None
@@ -787,40 +788,64 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
         )
 
     def _on_preinit(self, handle):
+        # This callback runs on the DDS transport thread. Arming the digitizer
+        # takes several seconds; keep DDS free to deliver health and stop events.
         with self._run_lock:
             run = self._require_run()
-            try:
-                self._log("Beginning digitizer capture preinitialization.", event="capture_preinit_started", run_id=str(run.run_id))
-                self._ensure_capture_client(force=True)
-                session_id = uuid.uuid4()
-                started = self._capture_command("start_capture", {"session_id": str(session_id)})
-                session_value = started.get("session")
-                if isinstance(session_value, dict):
-                    capture_session = CaptureSessionManifest.from_dict(session_value)
-                    if capture_session.session_id != session_id:
-                        raise ValueError("Digitizer start response returned the wrong capture session.")
-                    if SourceKey(capture_session.source_kind, capture_session.source_id) != self._source_key:
-                        raise ValueError("Digitizer start response returned a session from another source.")
-                    run.source_kind = capture_session.source_kind
-                    run.source_id = capture_session.source_id
-                self._write_preinit_provenance(session_id, run)
-                self._log("Persisted acquisition calibration and session provenance.", event="capture_provenance_written", run_id=str(run.run_id), session_id=str(session_id))
-            except Exception as exc:
-                self._log(f"Digitizer capture preinitialization failed: {type(exc).__name__}: {exc}", level="ERROR", event="capture_preinit_failed", run_id=str(run.run_id))
-                if self._capture_client is not None:
-                    try:
-                        self._capture_command("stop_capture", {"reason": "Exposure preinit record persistence failed."})
-                    except Exception as stop_exc:
-                        self._log(f"Best-effort digitizer cleanup after preinit failure also failed: {type(stop_exc).__name__}: {stop_exc}", level="ERROR", event="capture_preinit_cleanup_failed", run_id=str(run.run_id))
-                return False, f"Unable to start digitizer capture: {exc}".encode("utf-8")
-            run.session_id = session_id
-            run.cadence.reset(session_id)
-            self._refresh_cadence_rate(run=run)
-            self._open_timing_event_stream(run)
-            self._log("Digitizer capture preinitialization completed.", event="capture_preinit_completed", run_id=str(run.run_id), session_id=str(session_id), source_kind=run.source_kind, source_id=run.source_id)
-            self._preinit_pending = True
+            if getattr(self, "_pending_preinit", None) is not None or run.session_id is not None or run.finalizing:
+                return False, b"Digitizer preinitialization is already pending."
+            self._pending_preinit = (run, handle)
             self._stop_requested = False
         return super()._on_preinit(handle)
+
+    def _process_pending_preinit(self) -> None:
+        pending = getattr(self, "_pending_preinit", None)
+        if pending is None:
+            return
+        run, handle = pending
+        # ExperimentClient installs its lifecycle handle after our callback
+        # returns. Do not race that installation or complete another run's event.
+        if getattr(self, "_ExperimentClient__preinit_handle", None) is not handle:
+            return
+        try:
+            with self._run_lock:
+                self._pending_preinit = None
+                if self._run is not run or run.finalizing:
+                    raise RuntimeError("Exposure was stopped before digitizer arming.")
+                session_id = uuid.uuid4()
+                run.session_id = session_id
+            self._log("Beginning digitizer capture preinitialization.", event="capture_preinit_started", run_id=str(run.run_id))
+            self._ensure_capture_client(force=True)
+            started = self._capture_command("start_capture", {"session_id": str(session_id)})
+            session_value = started.get("session")
+            if isinstance(session_value, dict):
+                capture_session = CaptureSessionManifest.from_dict(session_value)
+                if capture_session.session_id != session_id:
+                    raise ValueError("Digitizer start response returned the wrong capture session.")
+                if SourceKey(capture_session.source_kind, capture_session.source_id) != self._source_key:
+                    raise ValueError("Digitizer start response returned a session from another source.")
+                run.source_kind = capture_session.source_kind
+                run.source_id = capture_session.source_id
+            with self._run_lock:
+                if self._run is not run or run.finalizing:
+                    raise RuntimeError("Exposure was stopped while the digitizer was arming.")
+                self._write_preinit_provenance(session_id, run)
+                self._log("Persisted acquisition calibration and session provenance.", event="capture_provenance_written", run_id=str(run.run_id), session_id=str(session_id))
+                run.cadence.reset(session_id)
+                self._refresh_cadence_rate(run=run)
+                self._open_timing_event_stream(run)
+                self._log("Digitizer capture preinitialization completed.", event="capture_preinit_completed", run_id=str(run.run_id), session_id=str(session_id), source_kind=run.source_kind, source_id=run.source_id)
+                self._preinit_pending = (run, handle)
+        except Exception as exc:
+            self._log(f"Digitizer capture preinitialization failed: {type(exc).__name__}: {exc}", level="ERROR", event="capture_preinit_failed", run_id=str(run.run_id))
+            if run.session_id is not None and self._capture_client is not None:
+                try:
+                    self._capture_command("stop_capture", {"reason": "Exposure preinitialization failed or was cancelled."})
+                except Exception as stop_exc:
+                    self._log(f"Best-effort digitizer cleanup after preinit failure also failed: {type(stop_exc).__name__}: {stop_exc}", level="ERROR", event="capture_preinit_cleanup_failed", run_id=str(run.run_id))
+            if getattr(self, "_ExperimentClient__preinit_handle", None) is handle:
+                handle.fail(f"Unable to start digitizer capture: {exc}".encode("utf-8"))
+                self._ExperimentClient__preinit_handle = None
 
     def _on_start(self, handle):
         with self._run_lock:
@@ -870,6 +895,7 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             while stop_flag.run():
                 try:
                     self._maintain_capture_connection()
+                    self._process_pending_preinit()
                     self._complete_pending_lifecycle_events()
                     self._process_recovery_requests()
                     self._process_control_requests()
@@ -909,8 +935,15 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
 
     def _complete_pending_lifecycle_events(self) -> None:
         if self._preinit_pending:
-            self._preinit_pending = False
-            self._on_did_preinit(b"Digitizer capture is armed.")
+            with self._run_lock:
+                run, handle = self._preinit_pending
+                self._preinit_pending = False
+                if getattr(self, "_ExperimentClient__preinit_handle", None) is handle:
+                    if self._run is run and not run.finalizing:
+                        self._on_did_preinit(b"Digitizer capture is armed.")
+                    else:
+                        handle.fail(b"Exposure stopped before digitizer preinitialization completed.")
+                        self._ExperimentClient__preinit_handle = None
         if self._start_pending:
             self._start_pending = False
             self._on_did_start(b"EUV acquisition is receiving pulse reports.")
@@ -1577,6 +1610,9 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
                     continue
             try:
                 self._import_snapshot(manifest)
+                # Consume newly arrived pulse reports between snapshot imports.
+                # A backlog of artifacts must not monopolize the dose worker.
+                return
             except Exception as exc:
                 with self._run_lock:
                     finalizing = self._run is not None and self._run.finalizing
@@ -1627,7 +1663,10 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             run.imported_snapshot_ids.add(manifest.snapshot_id)
             self._log("Imported and acknowledged digitizer snapshot.", event="snapshot_import_completed", run_id=str(run.run_id), snapshot_id=str(manifest.snapshot_id))
             run.pending_snapshots.pop(manifest.snapshot_id, None)
-            run.report_totals.pop(manifest.final_sequence, None)
+            # Every pulse total in this persisted snapshot is now recoverable
+            # from the artifact and its cumulative timeline point.
+            for sequence in range(manifest.first_sequence, manifest.final_sequence + 1):
+                run.report_totals.pop(sequence, None)
             if self._segment_publisher is not None:
                 self._segment_publisher.value = segment_bytes.encode([run.run_id.bytes, manifest.snapshot_id.bytes])
 
@@ -2242,7 +2281,12 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             capture_client.heartbeat_if_due()
             now = time.monotonic()
             if now >= getattr(self, "_next_board_status_monotonic", 0.0):
-                self._cache_board_status(capture_client.command("status"))
+                capabilities = getattr(self, "_board_status", {}).get("capabilities", {})
+                if capabilities.get("compact_status") is True:
+                    status = capture_client.command("status", {"include_snapshots": False})
+                else:
+                    status = capture_client.command("status")
+                self._cache_board_status(status)
                 self._next_board_status_monotonic = now + self.BOARD_STATUS_UPDATE_SECONDS
         except Exception as exc:
             active_run = self._run is not None and not self._run.finalizing

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import json
 import time
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -522,6 +523,13 @@ class _LiveObservation:
     projected_monotonic_ns: int
 
 
+@dataclass(frozen=True)
+class _RollingCadenceIndex:
+    observation_times: tuple[int, ...]
+    gap_times: tuple[int, ...]
+    cumulative_lost: tuple[int, ...]
+
+
 class CaptureCadenceTracker:
     def __init__(
         self,
@@ -565,7 +573,7 @@ class CaptureCadenceTracker:
         self._captured_count = 0
         self._inferred_lost_count = 0
         self._ambiguous_gap_count = 0
-        self._snapshot_boundaries: set[int] = set()
+        self._snapshot_boundaries: list[int] = []
 
     @property
     def session_id(self) -> UUID | None:
@@ -616,7 +624,11 @@ class CaptureCadenceTracker:
                 self._active_expected_rate_hz,
                 residual_tolerance_fraction=self.residual_tolerance_fraction,
             )
-            if any(gap.sequence_before <= boundary < gap.sequence_after for boundary in self._snapshot_boundaries):
+            boundary_index = bisect_left(self._snapshot_boundaries, gap.sequence_before)
+            if (
+                boundary_index < len(self._snapshot_boundaries)
+                and self._snapshot_boundaries[boundary_index] < gap.sequence_after
+            ):
                 gap = replace(gap, crosses_snapshot_boundary=True)
             live_gap = LiveCadenceGap(gap, projected_ns)
             self._gaps.append(live_gap)
@@ -633,7 +645,13 @@ class CaptureCadenceTracker:
 
     def mark_snapshot_boundary(self, final_sequence: int) -> None:
         boundary = _non_negative_integer("final_sequence", final_sequence)
-        self._snapshot_boundaries.add(boundary)
+        # Older boundaries only annotate existing gaps. They cannot apply to any
+        # future gap and must not accumulate for the duration of the exposure.
+        latest_sequence = self._segment_observations[-1].observation.sequence if self._segment_observations else -1
+        if boundary >= latest_sequence:
+            index = bisect_left(self._snapshot_boundaries, boundary)
+            if index == len(self._snapshot_boundaries) or self._snapshot_boundaries[index] != boundary:
+                self._snapshot_boundaries.insert(index, boundary)
 
         def annotate(items: deque[LiveCadenceGap]) -> deque[LiveCadenceGap]:
             return deque(
@@ -649,9 +667,16 @@ class CaptureCadenceTracker:
     def sample(self, sampled_at_monotonic_ns: int | None = None) -> LiveCadencePoint:
         sampled_ns = time.monotonic_ns() if sampled_at_monotonic_ns is None else sampled_at_monotonic_ns
         _non_negative_integer("sampled_at_monotonic_ns", sampled_ns)
-        self._reconcile_segment_points()
+        # Build one bounded index for the sample and all historical points that
+        # delayed pulse reports may have changed, rather than rescanning every
+        # retained pulse and gap for each point and each rolling window.
+        rolling_index = self._rolling_index()
+        self._reconcile_segment_points(rolling_index)
         provisional = self._provisional_lost_count(sampled_ns)
-        windows = tuple(self._rolling_cadence(sampled_ns, window, provisional) for window in self.rolling_windows_seconds)
+        windows = tuple(
+            self._rolling_cadence(sampled_ns, window, provisional, rolling_index)
+            for window in self.rolling_windows_seconds
+        )
         quality = CadenceQuality.TIMESTAMP_INFERRED if self._expected_rate_hz is not None else CadenceQuality.UNAVAILABLE
         point = LiveCadencePoint(
             sampled_at_monotonic_ns=sampled_ns,
@@ -694,18 +719,35 @@ class CaptureCadenceTracker:
         elapsed_seconds = max(0, sampled_ns - self._segment_observations[-1].projected_monotonic_ns) / 1e9
         return max(0, int(math.floor(elapsed_seconds * self._active_expected_rate_hz - self.residual_tolerance_fraction)))
 
-    def _rolling_cadence(self, sampled_ns: int, window_seconds: float, provisional: int) -> RollingCadence:
+    def _rolling_index(self) -> _RollingCadenceIndex:
+        observation_times = tuple(sorted(item.projected_monotonic_ns for item in self._segment_observations))
+        gaps = sorted((item.projected_monotonic_ns, item.gap.estimated_lost_count) for item in self._segment_gaps)
+        cumulative_lost = [0]
+        for _, lost_count in gaps:
+            cumulative_lost.append(cumulative_lost[-1] + lost_count)
+        return _RollingCadenceIndex(observation_times, tuple(timestamp for timestamp, _ in gaps), tuple(cumulative_lost))
+
+    def _rolling_cadence(
+        self,
+        sampled_ns: int,
+        window_seconds: float,
+        provisional: int,
+        index: _RollingCadenceIndex,
+    ) -> RollingCadence:
         if not self._segment_observations:
             return RollingCadence(window_seconds, None, None, 0, 0)
         segment_start = self._segment_observations[0].projected_monotonic_ns
         window_start = max(segment_start, sampled_ns - int(window_seconds * 1e9))
         duration_seconds = max(0, sampled_ns - window_start) / 1e9
-        captured = sum(window_start < item.projected_monotonic_ns <= sampled_ns for item in self._segment_observations)
-        confirmed_lost = sum(
-            item.gap.estimated_lost_count
-            for item in self._segment_gaps
-            if window_start < item.projected_monotonic_ns <= sampled_ns
+        # The rolling interval is open at its start and closed at its end.
+        # When a sample predates the first observation, both counts are zero.
+        captured = max(
+            0,
+            bisect_right(index.observation_times, sampled_ns) - bisect_right(index.observation_times, window_start),
         )
+        gap_start = bisect_right(index.gap_times, window_start)
+        gap_end = max(gap_start, bisect_right(index.gap_times, sampled_ns))
+        confirmed_lost = index.cumulative_lost[gap_end] - index.cumulative_lost[gap_start]
         lost = confirmed_lost + provisional
         if duration_seconds <= 0:
             return RollingCadence(window_seconds, None, None, captured, lost)
@@ -717,30 +759,34 @@ class CaptureCadenceTracker:
             estimated_lost_count=lost,
         )
 
-    def _reconcile_segment_points(self) -> None:
+    def _reconcile_segment_points(self, index: _RollingCadenceIndex) -> None:
         if not self._points_need_reconciliation or not self._segment_observations:
             return
         segment_start_ns = self._segment_observations[0].projected_monotonic_ns
-        self._points = deque(
-            point
-            if point.sampled_at_monotonic_ns < segment_start_ns
-            else replace(
-                point,
-                windows=tuple(
-                    self._rolling_cadence(
-                        point.sampled_at_monotonic_ns,
-                        window.window_seconds,
-                        self._provisional_lost_count(point.sampled_at_monotonic_ns),
-                    )
-                    for window in point.windows
-                ),
-                provisional_lost_count=self._provisional_lost_count(point.sampled_at_monotonic_ns),
+        reconciled = deque()
+        for point in self._points:
+            if point.sampled_at_monotonic_ns < segment_start_ns:
+                reconciled.append(point)
+                continue
+            provisional = self._provisional_lost_count(point.sampled_at_monotonic_ns)
+            reconciled.append(
+                replace(
+                    point,
+                    windows=tuple(
+                        self._rolling_cadence(point.sampled_at_monotonic_ns, window.window_seconds, provisional, index)
+                        for window in point.windows
+                    ),
+                    provisional_lost_count=provisional,
+                )
             )
-            for point in self._points
-        )
+        self._points = reconciled
         self._points_need_reconciliation = False
 
     def _prune(self, now_ns: int) -> None:
+        if self._segment_observations:
+            # A boundary at the latest sequence can still mark the next gap.
+            latest_sequence = self._segment_observations[-1].observation.sequence
+            del self._snapshot_boundaries[:bisect_left(self._snapshot_boundaries, latest_sequence)]
         cutoff = now_ns - self._retention_ns
         while self._observations and self._observations[0].projected_monotonic_ns < cutoff:
             self._observations.popleft()

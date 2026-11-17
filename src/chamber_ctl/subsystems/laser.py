@@ -252,6 +252,7 @@ class LaserSyncStatus:
 
 class LaserSyncSubsystem(ExperimentClient):
     PHASE_EPSILON = 1e-2
+    WATCHDOG_STOP_TIMEOUT_SECONDS = 5.0
 
     def __init__(self):
         self.__run = True
@@ -300,12 +301,17 @@ class LaserSyncSubsystem(ExperimentClient):
         self.__acquisition_health = None
         self.__acquisition_health_received_at = 0.0
         self.__target_status = None
-        self.__interlock_closed = False
-        self.__interlock_close_pending = False
-        self.__interlock_reopen_pending = False
-        self.__interlock_alarm_context = None
-        self.__interlock_alarm_state = None
-        self.__interlock_alarm_error = None
+        self.__watchdog_stop_event = None
+        self.__watchdog_stop_request = None
+        self.__watchdog_next_stop_attempt = 0.0
+        self.__watchdog_stop_requested_at = 0.0
+        self.__watchdog_stop_error = None
+        self.__watchdog_shutdown_pending = False
+        self.__watchdog_shutdown_ok = False
+        self.__watchdog_next_shutdown_attempt = 0.0
+        self.__watchdog_alarm_context = None
+        self.__watchdog_alarm_state = None
+        self.__watchdog_alarm_error = None
 
         self.__setter_queue = queue.Queue()
 
@@ -606,9 +612,9 @@ class LaserSyncSubsystem(ExperimentClient):
         laser_warming = self.__sync.get_laser_warming_up()
         chopper_starting = provider_status.chopper_starting_up if provider_status is not None else self.__sync.get_chopper_starting_up()
 
-        self.__update_interlock_alarm_status()
-        if self.__interlock_alarm_context is not None:
-            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Acquisition interlock active")
+        self.__update_watchdog_alarm_status()
+        if self.__watchdog_alarm_context is not None:
+            self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Acquisition watchdog active")
         elif laser_warming:
             self.__put_status_item_if_changed(0, StatusItem.STATE_INFO, "Warming up")
         elif chopper_starting:
@@ -726,10 +732,8 @@ class LaserSyncSubsystem(ExperimentClient):
                     self.__execute_do_continuous_exposure()
                 elif job_name == "laser_shut":
                     self.__execute_laser_shut()
-                elif job_name == "interlock_close":
-                    self.__execute_interlock_close()
-                elif job_name == "interlock_reopen":
-                    self.__execute_interlock_reopen()
+                elif job_name == "watchdog_shutdown":
+                    self.__execute_watchdog_shutdown()
             except Exception as exc:
                 self.__logger.log(
                     f"Setter worker error in {job_name}: {exc}",
@@ -776,6 +780,9 @@ class LaserSyncSubsystem(ExperimentClient):
             self.__preinit_setup_pending = False
             return
 
+        if self.__watchdog_alarm_context is not None or self.__stop_handle is not None:
+            self.__preinit_setup_pending = False
+            return
         ok, status = self.__provider_set(handle, "Turning laser on", self.__sync.set_laser_on, True)
         if not ok:
             handle.fail(b"Preinit failed while enabling laser: " + status)
@@ -798,6 +805,9 @@ class LaserSyncSubsystem(ExperimentClient):
     def __execute_exp_start_setters(self):
         handle = self.__start_handle
         if handle is None:
+            self.__start_setup_pending = False
+            return
+        if self.__watchdog_alarm_context is not None or self.__stop_handle is not None:
             self.__start_setup_pending = False
             return
 
@@ -1050,20 +1060,18 @@ class LaserSyncSubsystem(ExperimentClient):
 
         handle.ret(OP_OK + b": " + status)
 
-    def __update_interlock_alarm_status(self):
-        context = self.__interlock_alarm_context
+    def __update_watchdog_alarm_status(self):
+        context = self.__watchdog_alarm_context
         if context is None:
             self.__clear_status_item_if_exists(105)
             return
-        state = self.__interlock_alarm_state
+        state = self.__watchdog_alarm_state
         action = {
-            "close_pending": "sample closure pending",
-            "closed": "sample closed; operator recovery required",
-            "close_failed": "sample closure FAILED",
-            "reopen_pending": "authorized sample reopening pending",
-            "reopen_failed": "sample reopening FAILED; sample remains interlocked",
-        }.get(state, "active")
-        message = f"Acquisition interlock: {action}. {context['reason']}"
+            "shutdown_pending": "exposure stop requested; laser disable pending",
+            "shutdown_accepted": "exposure stop requested; laser disable command accepted",
+            "shutdown_failed": "exposure stop requested; laser disable FAILED",
+        }.get(state, "exposure stop requested")
+        message = f"Acquisition watchdog: {action}. {context['reason']}"
         details = []
         if context["last_pulse_age_seconds"] is not None:
             details.append(f"last pulse {context['last_pulse_age_seconds']:.3f} s ago")
@@ -1073,84 +1081,112 @@ class LaserSyncSubsystem(ExperimentClient):
             details.append(f"session {context['session_id'][:8]}")
         if details:
             message += " (" + "; ".join(details) + ")"
-        if self.__interlock_alarm_error is not None:
-            message += f" Provider error: {self.__interlock_alarm_error}"
+        if self.__watchdog_alarm_error is not None:
+            message += f" Provider error: {self.__watchdog_alarm_error}"
+        if self.__watchdog_stop_error is not None:
+            message += f" Exposure stop request: {self.__watchdog_stop_error}"
         self.__put_status_item_if_changed(105, StatusItem.STATE_ALARM, message)
 
-    def __reset_interlock_alarm(self):
-        self.__interlock_alarm_context = None
-        self.__interlock_alarm_state = None
-        self.__interlock_alarm_error = None
+    def __reset_watchdog_alarm(self):
+        self.__watchdog_alarm_context = None
+        self.__watchdog_alarm_state = None
+        self.__watchdog_alarm_error = None
+        self.__watchdog_stop_request = None
+        self.__watchdog_next_stop_attempt = 0.0
+        self.__watchdog_stop_requested_at = 0.0
+        self.__watchdog_stop_error = None
+        self.__watchdog_shutdown_pending = False
+        self.__watchdog_shutdown_ok = False
+        self.__watchdog_next_shutdown_attempt = 0.0
         self.__clear_status_item_if_exists(105)
 
-    def __interlock_log(self, message: str, *, event: str, level: str, context=None, **data):
+    def __watchdog_log(self, message: str, *, event: str, level: str, context=None, **data):
         # Keep the triggering observation, even if newer healthy data has arrived.
-        context = self.__interlock_alarm_context if context is None else context
+        context = self.__watchdog_alarm_context if context is None else context
         self.__logger.log(
             message, level=level, l_type="CTRL", subsystem="Laser Sync Controller",
             event=event, **(context or {}), **data,
         )
 
-    def __execute_interlock_close(self):
+    def __execute_watchdog_shutdown(self):
+        # Disable the trigger output independently of DDS/coordinator progress.
+        # Provider success acknowledges a command, not measured beam extinction.
         try:
-            ok, status = self.__sync.set_target_phase(self.__preinit_phase)
-            if ok:
-                self.__interlock_closed = True
-                self.__interlock_alarm_state = "closed"
-                self.__interlock_alarm_error = None
-                self.__interlock_log(
-                    "Acquisition interlock closed the sample.",
-                    level="ERROR", event="acquisition_interlock_close",
-                )
-            else:
-                self.__interlock_alarm_state = "close_failed"
-                self.__interlock_alarm_error = self.__to_bytes(status).decode("utf-8", errors="replace")
-                self.__interlock_log(
-                    f"Acquisition interlock could not close the sample: {self.__interlock_alarm_error}",
-                    level="ERROR", event="acquisition_interlock_close_failed",
-                    provider_error=self.__interlock_alarm_error,
-                )
+            ok, status = self.__sync.set_laser_on(False)
+            if not ok:
+                raise RuntimeError(self.__to_bytes(status).decode("utf-8", errors="replace"))
+            self.__watchdog_shutdown_ok = True
+            self.__watchdog_alarm_state = "shutdown_accepted"
+            self.__watchdog_alarm_error = None
+            self.__watchdog_log(
+                "Acquisition watchdog laser disable command accepted; exposure stop requested.",
+                level="ERROR", event="acquisition_watchdog_disable_accepted",
+            )
         except Exception as exc:
-            self.__interlock_alarm_state = "close_failed"
-            self.__interlock_alarm_error = f"{type(exc).__name__}: {exc}"
-            self.__interlock_log(
-                f"Acquisition interlock could not close the sample: {self.__interlock_alarm_error}",
-                level="ERROR", event="acquisition_interlock_close_failed",
-                provider_error=self.__interlock_alarm_error,
+            self.__watchdog_shutdown_ok = False
+            self.__watchdog_alarm_state = "shutdown_failed"
+            self.__watchdog_alarm_error = f"{type(exc).__name__}: {exc}"
+            self.__watchdog_log(
+                f"Acquisition watchdog could not disable laser output: {self.__watchdog_alarm_error}",
+                level="ERROR", event="acquisition_watchdog_disable_failed",
+                provider_error=self.__watchdog_alarm_error,
             )
         finally:
-            self.__interlock_close_pending = False
-            self.__update_interlock_alarm_status()
+            self.__watchdog_next_shutdown_attempt = time.monotonic() + 1.0
+            self.__watchdog_shutdown_pending = False
+            self.__update_watchdog_alarm_status()
 
-    def __execute_interlock_reopen(self):
-        try:
-            ok, status = self.__sync.set_target_phase(self.__target_phase)
-            if ok:
-                self.__interlock_closed = False
-                self.__interlock_log(
-                    "Acquisition interlock reopened the sample after target motion resumed.",
-                    level="INFO", event="acquisition_interlock_reopen",
-                )
-                self.__reset_interlock_alarm()
+    def __request_watchdog_exposure_stop(self):
+        if self.__stop_handle is not None:
+            return
+        now = time.monotonic()
+        request = self.__watchdog_stop_request
+        if request is not None:
+            if request.is_in_progress():
+                if now - self.__watchdog_stop_requested_at < self.WATCHDOG_STOP_TIMEOUT_SECONDS:
+                    return
+                # DDS event handles do not expire automatically. Abandon this
+                # request before retrying if our normal stop callback never arrived.
+                try:
+                    request.abort()
+                except Exception as exc:
+                    self.__watchdog_log(
+                        f"Acquisition watchdog expired stop request cleanup failed: {exc}",
+                        level="ERROR", event="acquisition_watchdog_stop_abort_failed",
+                    )
+                self.__watchdog_stop_error = "delivery timed out before laser stop callback; retrying"
+            elif request.get_state(uuids.UUID_EXPOSURE_CONTROLLER) == magics.EVENT_OK:
+                return
             else:
-                self.__interlock_alarm_state = "reopen_failed"
-                self.__interlock_alarm_error = self.__to_bytes(status).decode("utf-8", errors="replace")
-                self.__interlock_log(
-                    f"Acquisition interlock could not reopen the sample: {self.__interlock_alarm_error}",
-                    level="ERROR", event="acquisition_interlock_reopen_failed",
-                    provider_error=self.__interlock_alarm_error,
-                )
-        except Exception as exc:
-            self.__interlock_alarm_state = "reopen_failed"
-            self.__interlock_alarm_error = f"{type(exc).__name__}: {exc}"
-            self.__interlock_log(
-                f"Acquisition interlock could not reopen the sample: {self.__interlock_alarm_error}",
-                level="ERROR", event="acquisition_interlock_reopen_failed",
-                provider_error=self.__interlock_alarm_error,
+                self.__watchdog_stop_error = "delivery failed; retrying"
+            self.__watchdog_stop_request = None
+            self.__watchdog_next_stop_attempt = now + 1.0
+            self.__watchdog_log(
+                f"Acquisition watchdog exposure stop {self.__watchdog_stop_error}.",
+                level="ERROR", event="acquisition_watchdog_stop_failed",
             )
-        finally:
-            self.__interlock_reopen_pending = False
-            self.__update_interlock_alarm_status()
+        if self.__stop_handle is not None or now < self.__watchdog_next_stop_attempt:
+            return
+        self.__watchdog_next_stop_attempt = now + 1.0
+        try:
+            if self.__watchdog_stop_event is None:
+                raise RuntimeError("Exposure stop event is unavailable.")
+            reason = "Acquisition watchdog: " + self.__watchdog_alarm_context["reason"]
+            self.__watchdog_stop_requested_at = now
+            self.__watchdog_stop_request = self.__watchdog_stop_event.call(
+                reason.encode("utf-8"), [uuids.UUID_EXPOSURE_CONTROLLER],
+            )
+            self.__watchdog_stop_error = None
+            self.__watchdog_log(
+                "Acquisition watchdog requested a coordinated exposure stop.",
+                level="ERROR", event="acquisition_watchdog_stop_requested",
+            )
+        except Exception as exc:
+            self.__watchdog_stop_error = f"{type(exc).__name__}: {exc}"
+            self.__watchdog_log(
+                f"Acquisition watchdog exposure stop request failed: {self.__watchdog_stop_error}",
+                level="ERROR", event="acquisition_watchdog_stop_failed",
+            )
 
     def __phase_at(self, phase: float) -> bool:
         return abs(self.__sync.get_current_phase() - phase) <= self.PHASE_EPSILON
@@ -1172,7 +1208,8 @@ class LaserSyncSubsystem(ExperimentClient):
         while stop_flag.run() and self.__run:
             time.sleep(0.01)
 
-            if self.__preinit_handle is not None and not self.__preinit_setup_pending:
+            if (self.__preinit_handle is not None and not self.__preinit_setup_pending
+                    and self.__watchdog_alarm_context is None):
                 if not self.__sync.get_laser_on() and self.__sync.get_chopper_on():
                     self.__preinit_setup_pending = True
                     self.__enqueue_setter_job("exp_preinit_laser")
@@ -1180,7 +1217,8 @@ class LaserSyncSubsystem(ExperimentClient):
                     self._on_did_preinit(b"Preinit complete.")
                     self.__preinit_handle = None
 
-            if self.__start_handle is not None and not self.__start_setup_pending and self.__init_ready():
+            if (self.__start_handle is not None and not self.__start_setup_pending
+                    and self.__watchdog_alarm_context is None and self.__init_ready()):
                 self._on_did_start(b"Target phase reached.")
                 self.__start_handle = None
 
@@ -1189,7 +1227,7 @@ class LaserSyncSubsystem(ExperimentClient):
                     self._on_did_stop(b"Laser disabled.")
                     self.__stop_handle = None
                     self.__experiment_active = False
-                    self.__reset_interlock_alarm()
+                    # Keep the watchdog cause visible after stopping; a new run resets it.
 
             if self.__test_preinit_handle is not None and not self.__test_preinit_setup_pending:
                 if not self.__sync.get_laser_on() and self.__sync.get_chopper_on():
@@ -1211,7 +1249,7 @@ class LaserSyncSubsystem(ExperimentClient):
 
             if self.__status_publisher is not None and (time.monotonic() - last_status_publish) > 0.1:
                 last_status_publish = time.monotonic()
-                self.__update_acquisition_interlock()
+                self.__update_acquisition_watchdog()
                 self.__status_publisher.value = self.__get_status().encode()
                 if self.__timing_status_publisher is not None:
                     self.__timing_status_publisher.value = self.__get_timing_status(
@@ -1281,65 +1319,50 @@ class LaserSyncSubsystem(ExperimentClient):
     def __target_motion_is_running(self) -> bool:
         return bool(getattr(self.__target_status, "is_running", False))
 
-    def __update_acquisition_interlock(self) -> None:
-        if not self.__experiment_active or self.__stop_handle is not None:
+    def __update_acquisition_watchdog(self) -> None:
+        if not self.__experiment_active:
             return
         health = self.__acquisition_health
+        now = time.monotonic()
         stale = (
             self.__acquisition_health_received_at > 0
-            and time.monotonic() - self.__acquisition_health_received_at > 1.0
+            and now - self.__acquisition_health_received_at > 1.0
         )
-        if stale or (health is not None and health.pulse_loss):
-            if not self.__interlock_closed and not self.__interlock_close_pending:
-                if self.__interlock_alarm_context is None:
-                    health_age = time.monotonic() - self.__acquisition_health_received_at
-                    self.__interlock_alarm_context = {
-                        "reason_code": "stale_health" if stale else "pulse_loss",
-                        "reason": (
-                            f"Acquisition health is stale ({health_age:.3f} s without an update)."
-                            if stale else (health.reason or "Pulse reports stopped while triggers were expected.")
-                        ),
-                        "health_age_seconds": health_age,
-                        "last_pulse_age_seconds": None if health is None else health.last_pulse_age_seconds,
-                        "last_sequence": None if health is None else health.last_sequence,
-                        "session_id": None if health is None or health.session_id is None else str(health.session_id),
-                        "capture_active": None if health is None else health.capture_active,
-                    }
-                if self.__interlock_alarm_state != "close_failed":
-                    self.__interlock_alarm_state = "close_pending"
-                self.__interlock_close_pending = True
-                self.__enqueue_setter_job("interlock_close")
-                self.__update_interlock_alarm_status()
-                self.__interlock_log(
-                    "Acquisition interlock requested sample closure.",
-                    event="acquisition_interlock_close_requested", level="ERROR",
-                )
-            return
-        if (
-            health is not None
-            and health.recovery_ready
-            and health.resume_authorized
-            and self.__interlock_closed
-            and self.__target_motion_is_running()
-            and not self.__interlock_reopen_pending
-        ):
-            if self.__interlock_alarm_state != "reopen_failed":
-                self.__interlock_alarm_state = "reopen_pending"
-            self.__interlock_reopen_pending = True
-            self.__enqueue_setter_job("interlock_reopen")
-            self.__update_interlock_alarm_status()
-            self.__interlock_log(
-                "Acquisition interlock requested reopening after authorized recovery.",
-                event="acquisition_interlock_reopen_requested", level="INFO",
+        if self.__watchdog_alarm_context is None:
+            if self.__stop_handle is not None or not (stale or (health is not None and health.pulse_loss)):
+                return
+            health_age = now - self.__acquisition_health_received_at
+            self.__watchdog_alarm_context = {
+                "reason_code": "stale_health" if stale else "pulse_loss",
+                "reason": (
+                    f"Acquisition health is stale ({health_age:.3f} s without an update)."
+                    if stale else (health.reason or "Pulse reports stopped while triggers were expected.")
+                ),
+                "health_age_seconds": health_age,
+                "last_pulse_age_seconds": None if health is None else health.last_pulse_age_seconds,
+                "last_sequence": None if health is None else health.last_sequence,
+                "session_id": None if health is None or health.session_id is None else str(health.session_id),
+                "capture_active": None if health is None else health.capture_active,
+            }
+            self.__watchdog_alarm_state = "shutdown_pending"
+            self.__watchdog_log(
+                "Acquisition watchdog tripped; disabling laser output and stopping exposure.",
+                event="acquisition_watchdog_tripped", level="ERROR",
             )
+        if (not self.__watchdog_shutdown_ok and not self.__watchdog_shutdown_pending
+                and now >= self.__watchdog_next_shutdown_attempt):
+            self.__watchdog_shutdown_pending = True
+            self.__enqueue_setter_job("watchdog_shutdown")
+        self.__request_watchdog_exposure_stop()
+        self.__update_watchdog_alarm_status()
 
     def _on_preinit(self, handle):
         self.__experiment_active = True
+        # A prior exposure's latched health must not trip this new exposure.
+        # A missing fresh update still trips the ordinary stale-health deadline.
+        self.__acquisition_health = None
         self.__acquisition_health_received_at = time.monotonic()
-        self.__interlock_closed = False
-        self.__interlock_close_pending = False
-        self.__interlock_reopen_pending = False
-        self.__reset_interlock_alarm()
+        self.__reset_watchdog_alarm()
         self.__preinit_handle = handle
         self.__preinit_setup_pending = True
         self.__enqueue_setter_job("exp_preinit")
@@ -1370,6 +1393,11 @@ class LaserSyncSubsystem(ExperimentClient):
         return True, b": init accepted, configuring target phase."
 
     def _on_stop(self, handle):
+        # Cancel queued startup actions before disabling the trigger output.
+        self.__preinit_handle = None
+        self.__start_handle = None
+        self.__preinit_setup_pending = False
+        self.__start_setup_pending = False
         self.__stop_handle = handle
         self.__stop_setup_pending = True
         self.__enqueue_setter_job("exp_stop")
@@ -1382,11 +1410,10 @@ class LaserSyncSubsystem(ExperimentClient):
             event="stop_laser",
         )
 
-        return True, b": stop accepted, disabling laser/chopper."
+        return True, b": stop accepted, disabling laser trigger output."
 
     def _on_continue_state(self):
-        if self.__experiment_active and self.__acquisition_health_received_at and time.monotonic() - self.__acquisition_health_received_at > 1.0:
-            return False, b"Acquisition health is stale."
+        # Watchdog failures use the normal stop event so acquisition can drain.
         if self.__experiment_active or self.__preinit_handle is not None or self.__start_handle is not None or self.__stop_handle is not None:
             return True, self.EXP_IN_PROGRESS
 
@@ -1668,6 +1695,7 @@ class LaserSyncSubsystem(ExperimentClient):
 
     def __on_got_subsystem(self, handle: client._RegisteredSubsystemHandle):
         self.__subsystem = handle
+        self.__watchdog_stop_event = handle.add_event_provider(b"stop_exposure")
 
         handle.add_event_handler(b"laser_test_preinit").on_called(self.__on_test_preinit)
         handle.add_event_handler(b"laser_test_init").on_called(self.__on_test_init)

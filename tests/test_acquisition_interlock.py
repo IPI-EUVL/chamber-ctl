@@ -82,24 +82,29 @@ def test_target_ignores_stale_health_for_motion_pause() -> None:
     assert motion.stops == 0
 
 
-def test_laser_enqueues_close_for_pulse_loss_and_stale_health() -> None:
+def test_laser_requests_shutdown_for_pulse_loss() -> None:
     subsystem = object.__new__(LaserSyncSubsystem)
     jobs = []
     subsystem._LaserSyncSubsystem__experiment_active = True
     subsystem._LaserSyncSubsystem__stop_handle = None
     subsystem._LaserSyncSubsystem__acquisition_health = _health(pulse_loss=True)
     subsystem._LaserSyncSubsystem__acquisition_health_received_at = time.monotonic()
-    subsystem._LaserSyncSubsystem__interlock_closed = False
-    subsystem._LaserSyncSubsystem__interlock_close_pending = False
-    subsystem._LaserSyncSubsystem__interlock_reopen_pending = False
-    subsystem._LaserSyncSubsystem__interlock_alarm_context = None
-    subsystem._LaserSyncSubsystem__interlock_alarm_state = None
-    subsystem._LaserSyncSubsystem__interlock_alarm_error = None
+    subsystem._LaserSyncSubsystem__watchdog_alarm_context = None
+    subsystem._LaserSyncSubsystem__watchdog_alarm_state = None
+    subsystem._LaserSyncSubsystem__watchdog_alarm_error = None
+    subsystem._LaserSyncSubsystem__watchdog_stop_event = None
+    subsystem._LaserSyncSubsystem__watchdog_stop_request = None
+    subsystem._LaserSyncSubsystem__watchdog_stop_error = None
+    subsystem._LaserSyncSubsystem__watchdog_next_stop_attempt = 0.0
+    subsystem._LaserSyncSubsystem__watchdog_stop_requested_at = 0.0
+    subsystem._LaserSyncSubsystem__watchdog_shutdown_pending = False
+    subsystem._LaserSyncSubsystem__watchdog_shutdown_ok = False
+    subsystem._LaserSyncSubsystem__watchdog_next_shutdown_attempt = 0.0
     subsystem._LaserSyncSubsystem__subsystem = None
     subsystem._LaserSyncSubsystem__status_item_cache = {}
     subsystem._LaserSyncSubsystem__logger = _Logger()
     subsystem._LaserSyncSubsystem__enqueue_setter_job = lambda name: jobs.append(name)
 
-    subsystem._LaserSyncSubsystem__update_acquisition_interlock()
+    subsystem._LaserSyncSubsystem__update_acquisition_watchdog()
 
-    assert jobs == ["interlock_close"]
+    assert jobs == ["watchdog_shutdown"]

@@ -133,3 +133,31 @@ chamber-siglent-recorder `
 
 The simulator and physical Siglent service share ports `11762`/`11763`, so only
 one may run at a time. Both expose the same recorder-facing contract.
+
+## Acquisition watchdog and long exposures
+
+The acquisition watchdog in Laser Sync Controller latches an ALARM with the
+original reason, session, and pulse/health ages. Stale acquisition health or a
+reported pulse-loss condition commands laser trigger output off and requests the
+normal coordinated exposure stop. Acquisition then drains and finalizes its data.
+This does not stop the spinning chopper or claim that its beam path has closed.
+Output-off acceptance is command status, not an independent optical measurement.
+
+The watchdog retries failed output-disable and stop-delivery operations. A tripped
+exposure cannot automatically resume when health returns. Its alarm remains after
+stopping and clears at the next exposure preinitialization. The former phase-only
+close/reopen protection is no longer used for acquisition faults.
+
+Digitizer arming runs on the acquisition worker, leaving the DDS callback free
+to deliver health and stop events during startup. Cancellation is checked before
+arming and before reporting successful initialization. A recorded startup took
+5.223 seconds and previously starved health delivery long enough to trip the
+watchdog before arming completed.
+
+Live dose is accumulated once per pulse. Long-exposure improvements use compact
+board polling (acquisition service 0.1.7), discard per-pulse totals after their
+snapshot is persisted, consume new reports between artifact imports, and use
+bounded indexed cadence calculations. Full recovery inventories and final dose
+analysis remain available. Validate with a long 95 Hz diagnostic/exposure after
+updating both the board package and process-computer code; local regression and
+benchmark results do not replace hardware validation.

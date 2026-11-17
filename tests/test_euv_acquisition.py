@@ -502,6 +502,7 @@ def test_snapshot_import_keeps_other_pending_snapshot_report_totals() -> None:
         def __init__(self, snapshot_id, final_sequence):
             self.snapshot_id = snapshot_id
             self.final_sequence = final_sequence
+            self.first_sequence = final_sequence
 
     class _Importer:
         def import_snapshot(self, _record, manifest, *, before_ack, after_persist):
