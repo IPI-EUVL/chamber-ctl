@@ -207,3 +207,17 @@ def test_preview_history_caps_items_and_resets_for_a_new_session() -> None:
     assert history.append(new_session) == 0
     assert len(history) == 1
     assert history.session_id == new_session.session_id
+
+
+def test_diagnostic_actions_allow_source_startup_and_one_shot_completion() -> None:
+    from chamber_ctl.gui.acquisition import AcquisitionGUI
+
+    queued = []
+    gui = object.__new__(AcquisitionGUI)
+    gui._AcquisitionGUI__diagnostic_calibration_payload = lambda: b""
+    gui._AcquisitionGUI__queue_event = lambda *args: queued.append(args)
+
+    gui._AcquisitionGUI__start_continuous()
+    gui._AcquisitionGUI__one_shot()
+
+    assert [(entry[0], entry[-1]) for entry in queued] == [("start", 45.0), ("one_shot", 75.0)]

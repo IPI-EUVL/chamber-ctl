@@ -26,11 +26,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     recover.set_defaults(func=main)
 
     test_start = commands.add_parser("test-start", help="Start continuous diagnostic acquisition.")
-    test_start.add_argument("--timeout-seconds", type=float, default=15.0)
+    test_start.add_argument("--timeout-seconds", type=float, default=45.0)
     test_start.set_defaults(func=main)
 
     one_shot = commands.add_parser("test-one-shot", help="Capture and publish one diagnostic pulse window.")
-    one_shot.add_argument("--timeout-seconds", type=float, default=30.0)
+    one_shot.add_argument("--timeout-seconds", type=float, default=75.0)
     one_shot.set_defaults(func=main)
 
     test_flush = commands.add_parser("test-flush", help="Publish the current continuous diagnostic window.")

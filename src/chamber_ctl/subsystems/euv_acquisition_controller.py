@@ -988,7 +988,8 @@ class EuvAcquisitionSubsystem(exp_client.ExperimentClient):
             mode=mode,
             source_kind=session.source_kind,
             source_id=session.source_id,
-            started_monotonic=started_monotonic,
+            # Source startup must not consume the first-pulse waiting period.
+            started_monotonic=time.monotonic(),
         )
         diagnostic.cadence.reset(session_id)
         self._refresh_cadence_rate(diagnostic=diagnostic)

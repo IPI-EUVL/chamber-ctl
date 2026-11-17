@@ -765,10 +765,10 @@ class AcquisitionGUI:
         self.__work_queue.put(("event", (action, event_name, payload, label, timeout_seconds)))
 
     def __start_continuous(self) -> None:
-        self.__queue_event("start", DIAGNOSTIC_EVENTS["start"], bytes(), "Continuous diagnostic", 20.0)
+        self.__queue_event("start", DIAGNOSTIC_EVENTS["start"], bytes(), "Continuous diagnostic", 45.0)
 
     def __one_shot(self) -> None:
-        self.__queue_event("one_shot", DIAGNOSTIC_EVENTS["one_shot"], bytes(), "One-shot diagnostic", 30.0)
+        self.__queue_event("one_shot", DIAGNOSTIC_EVENTS["one_shot"], bytes(), "One-shot diagnostic", 75.0)
 
     def __flush(self) -> None:
         self.__queue_event("flush", DIAGNOSTIC_EVENTS["flush"], bytes(), "Diagnostic flush", 20.0)

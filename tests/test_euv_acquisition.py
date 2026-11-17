@@ -1391,3 +1391,65 @@ def test_non_primary_final_analysis_preserves_runtime_without_promoting_dose(tmp
     finally:
         subsystem._reader.close()
         library.close()
+
+
+def test_one_shot_first_pulse_timeout_starts_after_source_is_ready(monkeypatch) -> None:
+    import threading
+    from types import SimpleNamespace
+
+    import chamber_ctl.subsystems.euv_acquisition_controller as controller
+    from euv_acquisition.session import CapturePurpose, CaptureSessionManifest, CaptureSessionState
+
+    clock = [50.0]
+    monkeypatch.setattr(controller.time, "monotonic", lambda: clock[0])
+    subsystem = object.__new__(controller.EuvAcquisitionSubsystem)
+    subsystem._run_lock = threading.RLock()
+    subsystem._run = None
+    subsystem._diagnostic = None
+    subsystem._diagnostic_start_pending = True
+    subsystem._ensure_capture_client = lambda **_kwargs: object()
+    subsystem._log = lambda *_args, **_kwargs: None
+    subsystem._refresh_cadence_rate = lambda **_kwargs: None
+
+    def capture_command(command, payload):
+        if command == "status":
+            return {
+                "capabilities": {
+                    "capture_purpose": True,
+                    "purge_snapshot": True,
+                    "discard_diagnostic_session": True,
+                },
+                "session": None,
+            }
+        assert command == "start_capture"
+        clock[0] += 20.0
+        session = CaptureSessionManifest(
+            server_boot_id=uuid.uuid4(),
+            session_id=uuid.UUID(payload["session_id"]),
+            state=CaptureSessionState.ACTIVE,
+            source_kind="simulated",
+            source_id="fixture",
+            started_at_unix_ns=1,
+            purpose=CapturePurpose.DIAGNOSTIC,
+        )
+        return {"session": session.to_dict()}
+
+    subsystem._capture_command = capture_command
+    feedback = []
+    subsystem._start_diagnostic("one_shot", SimpleNamespace(feedback=feedback.append))
+    diagnostic = subsystem._diagnostic
+    assert diagnostic.started_monotonic == 70.0
+    assert feedback == [b"Waiting for the first diagnostic pulse."]
+
+    stopped = []
+    subsystem._stop_diagnostic = stopped.append
+    subsystem._advance_diagnostic()
+    clock[0] = 84.9
+    subsystem._advance_diagnostic()
+    assert stopped == []
+    assert diagnostic.terminal_error is None
+
+    clock[0] = 85.0
+    subsystem._advance_diagnostic()
+    assert stopped == ["One-shot diagnostic timed out before receiving a pulse."]
+    assert diagnostic.terminal_error == "Timed out waiting for the first diagnostic pulse."

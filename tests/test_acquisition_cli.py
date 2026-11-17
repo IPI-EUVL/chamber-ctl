@@ -59,3 +59,12 @@ def test_cli_routes_diagnostics_and_simulator_controls_through_dds(monkeypatch, 
     assert calls[4][2] == 5.0
     assert calls[5] == (b"restore_acquisition_simulator_controls", b"", 6.0)
     assert capsys.readouterr().out == "completed\n" * 6
+
+
+def test_diagnostic_cli_deadlines_allow_source_startup_and_can_be_overridden() -> None:
+    parser = argparse.ArgumentParser()
+    acquisition.add_parser(parser.add_subparsers())
+
+    assert parser.parse_args(["acquisition", "test-start"]).timeout_seconds == 45.0
+    assert parser.parse_args(["acquisition", "test-one-shot"]).timeout_seconds == 75.0
+    assert parser.parse_args(["acquisition", "test-start", "--timeout-seconds", "90"]).timeout_seconds == 90.0
